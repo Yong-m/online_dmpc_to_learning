@@ -72,7 +72,6 @@ parser = argparse.ArgumentParser(description="Online BC (flow-matching) with DMP
 parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument("--num_drones", type=int, default=4)
 parser.add_argument("--task", type=str, default="Isaac-MultiDrone-DMPC-Direct-v0")
-parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--n_rounds", type=int, default=200,
@@ -112,9 +111,10 @@ from isaaclab.app import AppLauncher  # noqa: E402
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+args_cli.enable_cameras = True
 
-if not getattr(args_cli, "headless", False) and not getattr(args_cli, "enable_cameras", False):
-    args_cli.headless = True
+# if not getattr(args_cli, "headless", False) and not getattr(args_cli, "enable_cameras", False):
+#     args_cli.headless = True
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
