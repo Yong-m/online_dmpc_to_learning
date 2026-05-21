@@ -132,12 +132,14 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # Velocity normalisation for the action interface. ``action * v_max`` gives
     # the desired world-frame velocity, and ``ref_pos_w = current_pos +
     # desired_velocity * step_dt`` is the target tracked by the inner P loop.
-    v_max: float = 2.0
+    v_max: float = 5.0 #2.0
 
     # ── position-reference tracker gains ──
-    pos_track_kp: float = 6.0
-    pos_track_kd: float = 4.5
-    track_accel_clip: float = 4.0
+    pos_track_kp: float = 6.0 #6.0
+    pos_track_kd: float = 4.5 #4.5
+    track_accel_clip: float = 4.0 # 4.0
+    att_track_kp: float = 8.0
+    att_track_kd: float = 0.6
 
     # ── reward scales ──
     lin_vel_reward_scale: float = -0.05
@@ -555,8 +557,7 @@ def _acc_to_thrust_moment_action(env: MultiDroneDmpcEnv, accel_w: torch.Tensor) 
     ang_vel_b = torch.stack([r.data.root_ang_vel_b for r in env._robots], dim=1)
     err_b = quat_rotate_inverse(quat_w.reshape(-1, 4), err_w.reshape(-1, 3)).reshape(E, N, 3)
 
-    kp_att, kd_att = 8.0, 0.6
-    moment_cmd = kp_att * err_b - kd_att * ang_vel_b
+    moment_cmd = env.cfg.att_track_kp * err_b - env.cfg.att_track_kd * ang_vel_b
     norm = (moment_cmd / max(env.cfg.moment_scale, 1e-6)).clamp(-1.0, 1.0)
 
     return torch.stack([a0, norm[..., 0], norm[..., 1], norm[..., 2]], dim=-1)

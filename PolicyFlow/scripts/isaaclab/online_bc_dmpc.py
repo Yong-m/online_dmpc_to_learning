@@ -102,6 +102,10 @@ parser.add_argument("--action_clip", type=float, default=0.999,
 parser.add_argument("--save_path", type=str, default="runs/online_bc_dmpc/model.pt")
 parser.add_argument("--save_every_rounds", type=int, default=20)
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument("--dmpc_log_path", type=str, default=None,
+                    help="Optional .npz path for first-env DMPC expert debug logs.")
+parser.add_argument("--dmpc_log_every", type=int, default=1,
+                    help="Log every N collection steps when --dmpc_log_path is set.")
 
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument("--wandb_project", type=str, default="online_bc_dmpc")
@@ -306,6 +310,8 @@ class PerDroneBuffer:
 def expert_action(
     env: MultiDroneDmpcEnv,
     expert: DMPCExpert,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
 ) -> torch.Tensor:
     """Run DMPC for every drone in every env and map its plan to the env action.
 
@@ -326,7 +332,99 @@ def expert_action(
     ref_pos_w, ref_vel_w = expert.plan(
         pos_w=pos_w, vel_w=vel_w, goal_w=goal_w, env_origins=origins,
     )
-    return env.ref_to_action(ref_pos_w, ref_vel_w)
+    action = env.ref_to_action(ref_pos_w, ref_vel_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, action)
+    return action
+
+
+class DmpcExpertLogger:
+    """Collect first-env DMPC expert traces and save them as compressed NumPy arrays."""
+
+    def __init__(self, path: str, env: MultiDroneDmpcEnv, expert: DMPCExpert):
+        self.path = path
+        self.env = env
+        self.expert = expert
+        self.records: list[dict[str, np.ndarray | int]] = []
+
+    def add(
+        self,
+        step: int,
+        states: dict[str, torch.Tensor],
+        ref_pos_w: torch.Tensor,
+        ref_vel_w: torch.Tensor,
+        action_flat: torch.Tensor,
+    ) -> None:
+        env_idx = 0
+        N = self.env.cfg.num_drones
+        K = self.expert.p.k_hor
+        origin = self.env._terrain.env_origins[env_idx].detach().cpu().numpy().astype(np.float64)
+        pos_w = states["pos_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        vel_w = states["lin_vel_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        goal_w = states["goal_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        action_norm = action_flat.view(self.env.num_envs, N, PER_DRONE_ACTION_DIM)[env_idx]
+        action_norm_np = action_norm.detach().cpu().numpy().astype(np.float64)
+        desired_vel_w = action_norm_np * float(self.env.cfg.v_max)
+        desired_pos_w = pos_w + desired_vel_w * float(self.env.step_dt)
+        desired_acc_w = (
+            float(self.env.cfg.pos_track_kp) * (desired_pos_w - pos_w)
+            + float(self.env.cfg.pos_track_kd) * (desired_vel_w - vel_w)
+        )
+        accel_clip = float(self.env.cfg.track_accel_clip)
+        desired_acc_w = np.clip(desired_acc_w, -accel_clip, accel_clip)
+
+        planned_ref_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        planned_ref_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        predicted_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        predicted_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        control_points = np.full((N, self.expert.n_bez), np.nan, dtype=np.float64)
+
+        for i in range(N):
+            st = self.expert._state.get((env_idx, i))
+            if st is None:
+                continue
+            U = st["U"]
+            control_points[i] = U
+            planned_ref_pos_w[i] = (self.expert.M_pos_hor @ U).reshape(K, 3) + origin
+            planned_ref_vel_w[i] = (self.expert.M_vel_hor @ U).reshape(K, 3)
+            x0_local = np.concatenate([pos_w[i] - origin, vel_w[i]])
+            u_samples = self.expert.M_pos_hor @ U
+            pred_stack = self.expert._A0_stack @ x0_local + self.expert._Lam_stack @ u_samples
+            pred_state = pred_stack.reshape(K, 6)
+            predicted_pos_w[i] = pred_state[:, :3] + origin
+            predicted_vel_w[i] = pred_state[:, 3:6]
+
+        self.records.append(
+            {
+                "step": int(step),
+                "pos_w": pos_w.astype(np.float32),
+                "vel_w": vel_w.astype(np.float32),
+                "goal_w": goal_w.astype(np.float32),
+                "ref_pos_w": ref_pos_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "ref_vel_w": ref_vel_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "action_normalized": action_norm_np.astype(np.float32),
+                "desired_pos_cmd_w": desired_pos_w.astype(np.float32),
+                "desired_vel_cmd_w": desired_vel_w.astype(np.float32),
+                "desired_acc_cmd_w": desired_acc_w.astype(np.float32),
+                "planned_ref_pos_w": planned_ref_pos_w.astype(np.float32),
+                "planned_ref_vel_w": planned_ref_vel_w.astype(np.float32),
+                "predicted_pos_w": predicted_pos_w.astype(np.float32),
+                "predicted_vel_w": predicted_vel_w.astype(np.float32),
+                "control_points": control_points.astype(np.float32),
+            }
+        )
+
+    def save(self) -> None:
+        if not self.records:
+            return
+        out_dir = os.path.dirname(self.path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        keys = [k for k in self.records[0] if k != "step"]
+        payload = {"step": np.asarray([r["step"] for r in self.records], dtype=np.int64)}
+        for key in keys:
+            payload[key] = np.stack([r[key] for r in self.records], axis=0)
+        np.savez_compressed(self.path, **payload)
 
 
 def action_to_latent(action: torch.Tensor, clip: float) -> torch.Tensor:
@@ -392,6 +490,14 @@ def main():
         device=device,
     )
 
+    dmpc_logger = (
+        DmpcExpertLogger(args_cli.dmpc_log_path, env, expert)
+        if args_cli.dmpc_log_path is not None
+        else None
+    )
+    if dmpc_logger is not None:
+        print(f"[online_bc_dmpc] logging first-env DMPC traces to {args_cli.dmpc_log_path}")
+
     use_wandb = args_cli.wandb and _WANDB_AVAILABLE
     if use_wandb:
         _wandb.init(
@@ -407,6 +513,7 @@ def main():
     episode_returns = torch.zeros(env.num_envs, device=device)
     round_idx = 0
     total_env_steps = 0
+    expert_collect_step = 0
     n_rounds = args_cli.n_rounds if args_cli.n_rounds > 0 else 10_000_000
 
     save_dir = os.path.dirname(args_cli.save_path)
@@ -421,7 +528,16 @@ def main():
             collect_returns: list[float] = []
             for _ in range(args_cli.steps_per_batch):
                 with torch.no_grad():
-                    action_flat = expert_action(env, expert)  # (E, N*A)
+                    log_this_step = (
+                        dmpc_logger is not None
+                        and args_cli.dmpc_log_every > 0
+                        and expert_collect_step % args_cli.dmpc_log_every == 0
+                    )
+                    action_flat = expert_action(
+                        env, expert,
+                        debug_logger=dmpc_logger if log_this_step else None,
+                        debug_step=expert_collect_step,
+                    )  # (E, N*A)
 
                 action_per_drone = action_flat.view(env.num_envs, N, A)
                 act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
@@ -441,6 +557,7 @@ def main():
                     episode_returns[done] = 0.0
                     expert.reset(done.nonzero(as_tuple=False).flatten())
                 total_env_steps += env.num_envs
+                expert_collect_step += 1
             collect_dt = time.time() - t_collect
             if collect_returns:
                 recent_returns.extend(collect_returns)
@@ -504,6 +621,9 @@ def main():
             round_idx += 1
     finally:
         torch.save(policy.state_dict(), args_cli.save_path)
+        if dmpc_logger is not None:
+            dmpc_logger.save()
+            print(f"[online_bc_dmpc] saved DMPC log to {args_cli.dmpc_log_path}", flush=True)
         env.close()
         simulation_app.close()
 
