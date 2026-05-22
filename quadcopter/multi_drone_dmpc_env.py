@@ -240,7 +240,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
     def _apply_action(self):
         for i, robot in enumerate(self._robots):
             robot.set_external_force_and_torque(
-                self._thrust[:, i], self._moment[:, i], body_ids=self._body_id
+                self._thrust[:, i], self._moment[:, i], body_ids=self._body_id, is_local=True
             )
 
     # ── observation helpers ────────────────────────────────────────────────
