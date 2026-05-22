@@ -35,16 +35,20 @@ cmd_vel = data["desired_vel_cmd_w"][:, args.agent]
 cmd_acc = data["desired_acc_cmd_w"][:, args.agent] if "desired_acc_cmd_w" in data else None
 planned = data["planned_ref_pos_w"][:, args.agent]
 predicted = data["predicted_pos_w"][:, args.agent]
+mpc_replanned = data["mpc_replanned"][:, args.agent].astype(bool) if "mpc_replanned" in data else None
+mpc_reset_mode = data["mpc_reset_mode"][:, args.agent].astype(bool) if "mpc_reset_mode" in data else None
+mpc_fallback = data["mpc_fallback"][:, args.agent].astype(bool) if "mpc_fallback" in data else None
 
 err_goal = np.linalg.norm(goal - pos, axis=-1)
 err_ref = np.linalg.norm(ref_pos - pos, axis=-1)
 
-fig = plt.figure(figsize=(16, 12), constrained_layout=True)
-grid = fig.add_gridspec(3, 2)
+fig = plt.figure(figsize=(16, 14), constrained_layout=True)
+grid = fig.add_gridspec(4, 2)
 ax3d = fig.add_subplot(grid[:, 0], projection="3d")
 ax_pos = fig.add_subplot(grid[0, 1])
 ax_vel = fig.add_subplot(grid[1, 1])
 ax_acc = fig.add_subplot(grid[2, 1])
+ax_ll = fig.add_subplot(grid[3, 1])
 
 ax3d.plot(pos[:, 0], pos[:, 1], pos[:, 2], color="black", lw=2.0, label="actual state")
 ax3d.plot(ref_pos[:, 0], ref_pos[:, 1], ref_pos[:, 2], color="tab:blue", lw=1.5, label="emitted ref sample")
@@ -73,6 +77,16 @@ for dim, (label, color) in enumerate(zip(labels, colors)):
     ax_pos.plot(step, ref_pos[:, dim], color=color, lw=1.2, ls="--", label=f"expert ref {label}")
     ax_pos.plot(step, cmd_pos[:, dim], color=color, lw=1.0, ls="-.", label=f"env cmd pos {label}")
     ax_pos.plot(step, goal[:, dim], color=color, lw=0.9, ls=":", label=f"goal {label}")
+if mpc_replanned is not None:
+    repl_steps = step[mpc_replanned]
+    reset_steps = step[mpc_reset_mode] if mpc_reset_mode is not None else np.asarray([], dtype=step.dtype)
+    fallback_steps = step[mpc_fallback] if mpc_fallback is not None else np.asarray([], dtype=step.dtype)
+    for n, s in enumerate(repl_steps):
+        ax_pos.axvline(s, color="tab:gray", lw=0.7, alpha=0.25, label="MPC replan" if n == 0 else None)
+    for n, s in enumerate(reset_steps):
+        ax_pos.axvline(s, color="tab:red", lw=1.1, alpha=0.5, label="MPC reset-mode" if n == 0 else None)
+    for n, s in enumerate(fallback_steps):
+        ax_pos.axvline(s, color="tab:purple", lw=1.2, alpha=0.55, label="MPC fallback" if n == 0 else None)
 ax_pos_twin = ax_pos.twinx()
 ax_pos_twin.plot(step, err_goal, color="black", lw=1.5, alpha=0.7, label="||goal-pos||")
 ax_pos_twin.plot(step, err_ref, color="tab:gray", lw=1.2, alpha=0.8, label="||ref-pos||")
@@ -106,6 +120,24 @@ ax_acc.set_xlabel("collection step")
 ax_acc.set_ylabel("acceleration [m/s^2]")
 ax_acc.grid(True, alpha=0.3)
 ax_acc.legend(ncols=3, fontsize=8, loc="best")
+
+if "ll_thrust_b_z" in data:
+    thrust = data["ll_thrust_b_z"][:, args.agent]
+    tau = data["ll_tau_des_b"][:, args.agent]
+    e_r = data["ll_e_R"][:, args.agent]
+    ang = data["ll_angvel_b"][:, args.agent]
+    ax_ll.plot(step, thrust, color="black", lw=1.7, label="thrust z [N]")
+    for dim, (label, color) in enumerate(zip(labels, colors)):
+        ax_ll.plot(step, tau[:, dim], color=color, lw=1.3, label=f"tau {label} [Nm]")
+        ax_ll.plot(step, e_r[:, dim], color=color, lw=0.9, ls="--", label=f"e_R {label}")
+        # ax_ll.plot(step, ang[:, dim], color=color, lw=0.8, ls=":", label=f"omega {label}")
+    ax_ll.set_title("Low-level control debug")
+else:
+    ax_ll.text(0.5, 0.5, "low-level debug fields not present in this log", ha="center", va="center")
+    ax_ll.set_title("Low-level control debug")
+ax_ll.set_xlabel("collection step")
+ax_ll.grid(True, alpha=0.3)
+ax_ll.legend(ncols=3, fontsize=7, loc="best")
 
 if args.out is not None:
     args.out.parent.mkdir(parents=True, exist_ok=True)

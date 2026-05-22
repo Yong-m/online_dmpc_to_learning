@@ -123,8 +123,8 @@ class DMPCParams:
     # Workspace + actuation limits
     pmin: tuple[float, float, float] = (-1.5, -1.5, 0.2)
     pmax: tuple[float, float, float] = (1.5, 1.5, 2.2)
-    amin: tuple[float, float, float] = (-1.0, -1.0, -1.0)
-    amax: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    amin: tuple[float, float, float] = (-4.0,-4.0,-4.0) #(-1.0, -1.0, -1.0)
+    amax: tuple[float, float, float] = (4.0, 4.0, 4.0) # (1.0, 1.0, 1.0)
 
     # Cost weights. ``s_free`` / ``spd_f`` weight the *last spd_f* steps when no
     # collision is predicted; ``s_obs`` / ``spd_o`` weight the *last spd_o* steps
@@ -134,7 +134,7 @@ class DMPCParams:
     spd_f: int = 3
     s_obs: float = 100.0
     spd_o: int = 1
-    acc_cost: float = 8e-3
+    acc_cost: float = 8e-3 #10.0 #8e-3
     lin_coll: float = -1.0e5
     quad_coll: float = 1.0
 
@@ -472,6 +472,13 @@ class DMPCExpert:
         ts = self.p.ts
         h_total = (self.p.k_hor - 1) * self.p.h
         for e in env_iter:
+            for i in range(N):
+                st = self._state.get((e, i))
+                if st is not None:
+                    st["last_replanned"] = False
+                    st["last_reset_mode"] = False
+                    st["last_fallback"] = False
+
             # First sweep: replan for any agent whose subsample counter rolled
             # over. We do this in two passes (replan-first, sample-second) so
             # every agent in this env has up-to-date broadcasts when neighbours
@@ -666,6 +673,9 @@ class DMPCExpert:
             )
         except ValueError:
             self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            self._state[(env_idx, agent_idx)]["last_replanned"] = True
+            self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
+            self._state[(env_idx, agent_idx)]["last_fallback"] = True
             return
 
         if prev is not None and prev["U"].shape[0] == n_bez:
@@ -674,6 +684,9 @@ class DMPCExpert:
         res = solver.solve()
         if res.info.status_val not in (1, 2):
             self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            self._state[(env_idx, agent_idx)]["last_replanned"] = True
+            self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
+            self._state[(env_idx, agent_idx)]["last_fallback"] = True
             return
 
         U_sol = res.x[:n_bez]
@@ -687,6 +700,9 @@ class DMPCExpert:
             "u_pred": u_pred,
             "seeds": new_seeds,
             "steps": 0,
+            "last_replanned": True,
+            "last_reset_mode": bool(_reset_mode),
+            "last_fallback": False,
         }
 
     # ───────────────────────────────────────────────────────────────────
@@ -712,6 +728,7 @@ class DMPCExpert:
         """
         zero_higher = [np.zeros(3) for _ in range(self.p.deg_poly)]
         if prev is None:
+            print("No previous plan, using disturbed initialisation.")
             return [pos.copy(), *zero_higher], True
 
         u_prev_at_kt = prev["seeds"][0]
@@ -722,7 +739,12 @@ class DMPCExpert:
         f_vec = (err ** 5) / denom
 
         in_band = bool(np.logical_and(f_vec > self.p.f_min, f_vec < self.p.f_max).all())
+
+        # return [s.copy() for s in prev["seeds"]], False
+    
+
         if in_band:
+            print("In-band, using normal initialisation.")
             return [s.copy() for s in prev["seeds"]], False
         return [pos.copy(), *zero_higher], True
 

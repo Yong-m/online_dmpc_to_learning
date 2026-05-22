@@ -12,8 +12,8 @@ Control for Multi-Robot Motion Planning" (Luis et al., RA-L 2020):
     flow-matching network on its own per-drone slice of the observation. The
     env exposes ``get_per_drone_obs() -> (E, N, P)``; we reshape to
     ``(E*N, P)``, run the shared condition + flow network, and reshape the
-    resulting per-drone action ``(E*N, A)`` (``A = 3`` -- normalised desired
-    velocity per drone) back to ``(E, N*A)`` before sending to the env. The
+    resulting per-drone action ``(E*N, A)`` (``A = 9`` -- normalised
+    ``[delta_p, v_ref, a_ref]`` per drone) back to ``(E, N*A)`` before sending to the env. The
     same weights govern every drone, which is the natural permutation-
     equivariant choice for a homogeneous team.
 
@@ -29,8 +29,8 @@ Pipeline per outer round:
 
   1. *Collect*. Roll out ``--steps_per_batch`` env steps. For every step we
      query the DMPC expert for a **world-frame position + velocity reference**
-     for *every* drone in *every* env, convert it to the env's 3-D normalised
-     velocity action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
+     for *every* drone in *every* env, convert it to the env's 9-D normalised
+     reference action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
      and store ``(per_drone_obs, atanh(per_drone_action))`` for every drone
      (each step contributes ``E * N`` BC samples).
   2. *Train*. ``--bc_epochs_per_round`` flow-matching updates on a uniform
@@ -87,6 +87,18 @@ parser.add_argument("--min_buffer_transitions", type=int, default=4_000,
 
 parser.add_argument("--eval_every_rounds", type=int, default=10)
 parser.add_argument("--eval_steps", type=int, default=200)
+parser.add_argument("--episode_length_s", type=float, default=None,
+                    help="Override env episode length in seconds.")
+parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
+                    help="Start episodes at t=0 instead of randomizing episode_length_buf.")
+parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
+                    help="Disable z-bound termination for fixed-target debug rollouts.")
+parser.add_argument("--action_source", choices=["dmpc", "greedy", "hover"], default="dmpc",
+                    help="Expert command source used during collection.")
+parser.add_argument("--greedy_speed", type=float, default=0.6,
+                    help="Max world-frame speed for --action_source greedy.")
+parser.add_argument("--greedy_pos_gain", type=float, default=1.0,
+                    help="Proportional speed gain toward the goal for --action_source greedy.")
 
 # Flow-matching / model.
 parser.add_argument("--lr", type=float, default=3e-4)
@@ -153,9 +165,9 @@ except Exception:
 
 
 # Per-drone action dimension exposed by ``MultiDroneDmpcEnv``: a normalised
-# desired-velocity command in [-1, 1]^3. The env internally turns it into the
-# 4-D thrust + moment command via its cascaded position controller.
-PER_DRONE_ACTION_DIM = 3
+# [delta_p_w, v_ref_w, a_ref_w] command in [-1, 1]^9. The env
+# unpacks it before the low-level wrench controller.
+PER_DRONE_ACTION_DIM = 9
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -305,8 +317,89 @@ class PerDroneBuffer:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ Expert wrapper: DMPC position + velocity reference → env action          ║
+# ║ Expert wrapper: DMPC position/velocity/acceleration → env action        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+def expert_reference_acceleration(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    ref_pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """Recover the acceleration sample matching the latest DMPC reference.
+
+    ``DMPCExpert.compute`` currently returns position and velocity. It also
+    keeps each agent's Bezier control points, so we sample the second
+    derivative at the same substep used for the returned reference.
+    """
+    ref_acc_w = torch.zeros_like(ref_pos_w)
+    h_total = (expert.p.k_hor - 1) * expert.p.h
+    for e in range(env.num_envs):
+        for i in range(env.cfg.num_drones):
+            st = expert._state.get((e, i))
+            if st is None:
+                continue
+            steps_before_sample = max(int(st["steps"]) - 1, 0)
+            t_sub = ((steps_before_sample % expert.n_substeps) + 1) * expert.p.ts
+            t_sub = min(t_sub, h_total)
+            ref_acc = expert.bezier.sample_matrix(np.array([t_sub]), deriv=2) @ st["U"]
+            ref_acc_w[e, i] = torch.from_numpy(ref_acc.astype(np.float32)).to(env.device)
+    return ref_acc_w
+
+
+def hover_action(
+    env: MultiDroneDmpcEnv,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
+) -> torch.Tensor:
+    """Generate a hold-position command at the reset initial position."""
+    states = env.get_world_states()
+    ref_pos_w = env._init_pos_w.clone()
+    ref_vel_w = torch.zeros_like(ref_pos_w)
+    ref_acc_w = torch.zeros_like(ref_pos_w)
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
+    return action
+
+
+def greedy_action(
+    env: MultiDroneDmpcEnv,
+    speed: float,
+    pos_gain: float,
+    step: int,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
+) -> torch.Tensor:
+    """Generate a smooth minimum-jerk trajectory from reset position to goal.
+
+    The quintic time scaling gives zero velocity and zero acceleration at
+    both endpoints. ``speed`` bounds the peak speed approximately.
+    ``pos_gain`` is kept for CLI compatibility and is not used here.
+    """
+    states = env.get_world_states()
+    init_w = env._init_pos_w
+    goal_w = states["goal_w"]
+    delta_w = goal_w - init_w
+    dist = torch.linalg.norm(delta_w, dim=-1, keepdim=True).clamp(min=1e-6)
+    # For alpha(s)=10s^3-15s^4+6s^5, max alpha_dot is 1.875 at s=0.5.
+    duration = (1.875 * dist / max(speed, 1e-6)).clamp(min=env.step_dt)
+    t = torch.full_like(dist, float(step) * env.step_dt)
+    s = (t / duration).clamp(0.0, 1.0)
+    s2 = s * s
+    s3 = s2 * s
+    s4 = s3 * s
+    s5 = s4 * s
+    alpha = 10.0 * s3 - 15.0 * s4 + 6.0 * s5
+    alpha_dot = (30.0 * s2 - 60.0 * s3 + 30.0 * s4) / duration
+    alpha_ddot = (60.0 * s - 180.0 * s2 + 120.0 * s3) / (duration * duration)
+    ref_pos_w = init_w + alpha * delta_w
+    ref_vel_w = alpha_dot * delta_w
+    ref_acc_w = alpha_ddot * delta_w
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
+    return action
+
+
 def expert_action(
     env: MultiDroneDmpcEnv,
     expert: DMPCExpert,
@@ -315,13 +408,11 @@ def expert_action(
 ) -> torch.Tensor:
     """Run DMPC for every drone in every env and map its plan to the env action.
 
-    DMPC returns the paper's ``u_i`` (a position reference) together with its
-    first derivative as a feed-forward velocity. We pass both into the env's
-    cascaded P/PD position controller (:py:meth:`MultiDroneDmpcEnv.ref_to_action`)
-    which closes the inner loop and lands on the env's 3-D normalised velocity
-    command (the env then turns that into a 4-D thrust+moment internally).
+    DMPC returns the paper's ``u_i`` position-reference sample. We pack
+    that sample, its first derivative, and its second derivative into the
+    env's 9-D normalised ``[delta_p, v_ref, a_ref]`` action.
 
-    Returns ``(num_envs, num_drones * 3)``.
+    Returns ``(num_envs, num_drones * 9)``.
     """
     states = env.get_world_states()
     pos_w = states["pos_w"]
@@ -332,9 +423,10 @@ def expert_action(
     ref_pos_w, ref_vel_w = expert.plan(
         pos_w=pos_w, vel_w=vel_w, goal_w=goal_w, env_origins=origins,
     )
-    action = env.ref_to_action(ref_pos_w, ref_vel_w)
+    ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
     if debug_logger is not None:
-        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, action)
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
     return action
 
 
@@ -353,6 +445,7 @@ class DmpcExpertLogger:
         states: dict[str, torch.Tensor],
         ref_pos_w: torch.Tensor,
         ref_vel_w: torch.Tensor,
+        ref_acc_w: torch.Tensor,
         action_flat: torch.Tensor,
     ) -> None:
         env_idx = 0
@@ -364,29 +457,32 @@ class DmpcExpertLogger:
         goal_w = states["goal_w"][env_idx].detach().cpu().numpy().astype(np.float64)
         action_norm = action_flat.view(self.env.num_envs, N, PER_DRONE_ACTION_DIM)[env_idx]
         action_norm_np = action_norm.detach().cpu().numpy().astype(np.float64)
-        desired_vel_w = action_norm_np * float(self.env.cfg.v_max)
-        desired_pos_w = pos_w + desired_vel_w * float(self.env.step_dt)
-        desired_acc_w = (
-            float(self.env.cfg.pos_track_kp) * (desired_pos_w - pos_w)
-            + float(self.env.cfg.pos_track_kd) * (desired_vel_w - vel_w)
-        )
-        accel_clip = float(self.env.cfg.track_accel_clip)
-        desired_acc_w = np.clip(desired_acc_w, -accel_clip, accel_clip)
+        desired_pos_w = pos_w + action_norm_np[:, 0:3] * float(self.env.cfg.delta_pos_max)
+        desired_vel_w = action_norm_np[:, 3:6] * float(self.env.cfg.v_max)
+        desired_acc_w = action_norm_np[:, 6:9] * float(self.env.cfg.accel_action_max)
 
         planned_ref_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         planned_ref_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        planned_ref_acc_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         predicted_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         predicted_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         control_points = np.full((N, self.expert.n_bez), np.nan, dtype=np.float64)
+        mpc_replanned = np.zeros(N, dtype=np.bool_)
+        mpc_reset_mode = np.zeros(N, dtype=np.bool_)
+        mpc_fallback = np.zeros(N, dtype=np.bool_)
 
         for i in range(N):
             st = self.expert._state.get((env_idx, i))
             if st is None:
                 continue
+            mpc_replanned[i] = bool(st.get("last_replanned", False))
+            mpc_reset_mode[i] = bool(st.get("last_reset_mode", False))
+            mpc_fallback[i] = bool(st.get("last_fallback", False))
             U = st["U"]
             control_points[i] = U
             planned_ref_pos_w[i] = (self.expert.M_pos_hor @ U).reshape(K, 3) + origin
             planned_ref_vel_w[i] = (self.expert.M_vel_hor @ U).reshape(K, 3)
+            planned_ref_acc_w[i] = (self.expert.M_acc_hor @ U).reshape(K, 3)
             x0_local = np.concatenate([pos_w[i] - origin, vel_w[i]])
             u_samples = self.expert.M_pos_hor @ U
             pred_stack = self.expert._A0_stack @ x0_local + self.expert._Lam_stack @ u_samples
@@ -394,23 +490,43 @@ class DmpcExpertLogger:
             predicted_pos_w[i] = pred_state[:, :3] + origin
             predicted_vel_w[i] = pred_state[:, 3:6]
 
+        ll = getattr(self.env, "_last_low_level_debug", {})
+        ll_payload = {}
+        for key in ("acc_cmd_w", "F_des_w", "z_wb", "z_des", "e_R", "angvel_b", "tau_des_b"):
+            value = ll.get(key) if isinstance(ll, dict) else None
+            if value is None:
+                ll_payload["ll_" + key] = np.full((N, 3), np.nan, dtype=np.float32)
+            else:
+                ll_payload["ll_" + key] = value[env_idx].detach().cpu().numpy().astype(np.float32)
+        thrust_value = ll.get("thrust_b_z") if isinstance(ll, dict) else None
+        if thrust_value is None:
+            ll_payload["ll_thrust_b_z"] = np.full((N,), np.nan, dtype=np.float32)
+        else:
+            ll_payload["ll_thrust_b_z"] = thrust_value[env_idx].detach().cpu().numpy().astype(np.float32)
+
         self.records.append(
             {
+                **ll_payload,
                 "step": int(step),
                 "pos_w": pos_w.astype(np.float32),
                 "vel_w": vel_w.astype(np.float32),
                 "goal_w": goal_w.astype(np.float32),
                 "ref_pos_w": ref_pos_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "ref_vel_w": ref_vel_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "ref_acc_w": ref_acc_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "action_normalized": action_norm_np.astype(np.float32),
                 "desired_pos_cmd_w": desired_pos_w.astype(np.float32),
                 "desired_vel_cmd_w": desired_vel_w.astype(np.float32),
                 "desired_acc_cmd_w": desired_acc_w.astype(np.float32),
                 "planned_ref_pos_w": planned_ref_pos_w.astype(np.float32),
                 "planned_ref_vel_w": planned_ref_vel_w.astype(np.float32),
+                "planned_ref_acc_w": planned_ref_acc_w.astype(np.float32),
                 "predicted_pos_w": predicted_pos_w.astype(np.float32),
                 "predicted_vel_w": predicted_vel_w.astype(np.float32),
                 "control_points": control_points.astype(np.float32),
+                "mpc_replanned": mpc_replanned,
+                "mpc_reset_mode": mpc_reset_mode,
+                "mpc_fallback": mpc_fallback,
             }
         )
 
@@ -444,6 +560,12 @@ def main():
     env_cfg = MultiDroneDmpcEnvCfg()
     env_cfg.num_drones = args_cli.num_drones
     env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
+    if args_cli.no_randomize_episode_start:
+        env_cfg.randomize_episode_start = False
+    if args_cli.no_terminate_on_bounds:
+        env_cfg.terminate_on_bounds = False
     env_cfg.__post_init__()
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
@@ -533,11 +655,27 @@ def main():
                         and args_cli.dmpc_log_every > 0
                         and expert_collect_step % args_cli.dmpc_log_every == 0
                     )
-                    action_flat = expert_action(
-                        env, expert,
-                        debug_logger=dmpc_logger if log_this_step else None,
-                        debug_step=expert_collect_step,
-                    )  # (E, N*A)
+                    if args_cli.action_source == "hover":
+                        action_flat = hover_action(
+                            env,
+                            debug_logger=dmpc_logger if log_this_step else None,
+                            debug_step=expert_collect_step,
+                        )
+                    elif args_cli.action_source == "greedy":
+                        action_flat = greedy_action(
+                            env,
+                            speed=args_cli.greedy_speed,
+                            pos_gain=args_cli.greedy_pos_gain,
+                            step=expert_collect_step,
+                            debug_logger=dmpc_logger if log_this_step else None,
+                            debug_step=expert_collect_step,
+                        )
+                    else:
+                        action_flat = expert_action(
+                            env, expert,
+                            debug_logger=dmpc_logger if log_this_step else None,
+                            debug_step=expert_collect_step,
+                        )  # (E, N*A)
 
                 action_per_drone = action_flat.view(env.num_envs, N, A)
                 act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
