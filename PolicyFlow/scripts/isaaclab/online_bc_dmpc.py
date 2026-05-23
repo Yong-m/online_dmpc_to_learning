@@ -88,17 +88,17 @@ parser.add_argument("--min_buffer_transitions", type=int, default=4_000,
 parser.add_argument("--eval_every_rounds", type=int, default=10)
 parser.add_argument("--eval_steps", type=int, default=200)
 parser.add_argument("--episode_length_s", type=float, default=None,
-                    help="Override env episode length in seconds.")
+                    help="Override env episode length in seconds for debug rollouts.")
 parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
                     help="Start episodes at t=0 instead of randomizing episode_length_buf.")
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
                     help="Disable z-bound termination for fixed-target debug rollouts.")
-parser.add_argument("--action_source", choices=["dmpc", "greedy", "hover"], default="dmpc",
-                    help="Expert command source used during collection.")
-parser.add_argument("--greedy_speed", type=float, default=0.6,
-                    help="Max world-frame speed for --action_source greedy.")
-parser.add_argument("--greedy_pos_gain", type=float, default=1.0,
-                    help="Proportional speed gain toward the goal for --action_source greedy.")
+parser.add_argument("--action_source", choices=["dmpc"], default="dmpc",
+                    help="Compatibility flag for run_dmpc_logged_test.sh; master supports DMPC only.")
+parser.add_argument("--dmpc_log_path", type=str, default=None,
+                    help="Optional .npz path for first-env DMPC debug logging.")
+parser.add_argument("--dmpc_log_every", type=int, default=1,
+                    help="Save one DMPC debug sample every N expert steps.")
 
 # Flow-matching / model.
 parser.add_argument("--lr", type=float, default=3e-4)
@@ -114,10 +114,6 @@ parser.add_argument("--action_clip", type=float, default=0.999,
 parser.add_argument("--save_path", type=str, default="runs/online_bc_dmpc/model.pt")
 parser.add_argument("--save_every_rounds", type=int, default=20)
 parser.add_argument("--resume", type=str, default=None)
-parser.add_argument("--dmpc_log_path", type=str, default=None,
-                    help="Optional .npz path for first-env DMPC expert debug logs.")
-parser.add_argument("--dmpc_log_every", type=int, default=1,
-                    help="Log every N collection steps when --dmpc_log_path is set.")
 
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument("--wandb_project", type=str, default="online_bc_dmpc")
@@ -400,6 +396,52 @@ def greedy_action(
     return action
 
 
+def _push_first_env_debug_trajectories(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    states: dict[str, torch.Tensor],
+) -> None:
+    """Push first-env MPC horizons to Isaac Sim debug markers."""
+    if not hasattr(env, "set_debug_trajectories"):
+        return
+    env_idx = 0
+    N = env.cfg.num_drones
+    K = expert.p.k_hor
+    device = env.device
+    origin = env._terrain.env_origins[env_idx].detach().cpu().numpy().astype(np.float64)
+    pos_w = states["pos_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+    vel_w = states["lin_vel_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+    planned_np = np.full((N, K, 3), np.nan, dtype=np.float32)
+    predicted_np = np.full((N, K, 3), np.nan, dtype=np.float32)
+    collision_points: list[np.ndarray] = []
+    for i in range(N):
+        st = expert._state.get((env_idx, i))
+        if st is None:
+            continue
+        U = st["U"]
+        planned_np[i] = ((expert.M_pos_hor @ U).reshape(K, 3) + origin).astype(np.float32)
+        x0_local = np.concatenate([pos_w[i] - origin, vel_w[i]])
+        u_samples = expert.M_pos_hor @ U
+        pred_stack = expert._A0_stack @ x0_local + expert._Lam_stack @ u_samples
+        predicted_np[i] = (pred_stack.reshape(K, 6)[:, :3] + origin).astype(np.float32)
+        for kc in st.get("collision_sample_indices", []):
+            if 0 <= int(kc) < K:
+                collision_points.append(planned_np[i, int(kc)])
+    planned = torch.from_numpy(planned_np).to(device)
+    predicted = torch.from_numpy(predicted_np).to(device)
+    valid_plan = torch.isfinite(planned).all(dim=-1)
+    valid_pred = torch.isfinite(predicted).all(dim=-1)
+    if collision_points:
+        collision = torch.from_numpy(np.stack(collision_points, axis=0).astype(np.float32)).to(device)
+    else:
+        collision = torch.empty(0, 3, device=device)
+    env.set_debug_trajectories(
+        planned[valid_plan].reshape(-1, 1, 3),
+        predicted[valid_pred].reshape(-1, 1, 3),
+        collision,
+    )
+
+
 def expert_action(
     env: MultiDroneDmpcEnv,
     expert: DMPCExpert,
@@ -424,6 +466,7 @@ def expert_action(
         pos_w=pos_w, vel_w=vel_w, goal_w=goal_w, env_origins=origins,
     )
     ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
+    _push_first_env_debug_trajectories(env, expert, states)
     action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
@@ -562,9 +605,9 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.episode_length_s is not None:
         env_cfg.episode_length_s = args_cli.episode_length_s
-    if args_cli.no_randomize_episode_start:
+    if args_cli.no_randomize_episode_start and hasattr(env_cfg, "randomize_episode_start"):
         env_cfg.randomize_episode_start = False
-    if args_cli.no_terminate_on_bounds:
+    if args_cli.no_terminate_on_bounds and hasattr(env_cfg, "terminate_on_bounds"):
         env_cfg.terminate_on_bounds = False
     env_cfg.__post_init__()
     if getattr(args_cli, "device", None):
@@ -629,6 +672,10 @@ def main():
         )
 
     env.reset(seed=args_cli.seed)
+    expert.reset()
+    if hasattr(env, "_last_reset_env_ids"):
+        env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+    last_episode_length_buf = env.episode_length_buf.clone()
     per_drone_obs = env.get_per_drone_obs()  # (E, N, P)
 
     recent_returns: deque[float] = deque(maxlen=20)
@@ -650,32 +697,25 @@ def main():
             collect_returns: list[float] = []
             for _ in range(args_cli.steps_per_batch):
                 with torch.no_grad():
+                    # Keep the DMPC expert in lockstep with IsaacLab resets.
+                    # Normally the done branch below handles this, but this
+                    # also catches full/manual resets or env counters rewound
+                    # before this expert query.
+                    rewound = env.episode_length_buf < last_episode_length_buf
+                    if rewound.any():
+                        expert.reset(rewound.nonzero(as_tuple=False).flatten())
+                    last_episode_length_buf = env.episode_length_buf.clone()
+
                     log_this_step = (
                         dmpc_logger is not None
                         and args_cli.dmpc_log_every > 0
                         and expert_collect_step % args_cli.dmpc_log_every == 0
                     )
-                    if args_cli.action_source == "hover":
-                        action_flat = hover_action(
-                            env,
-                            debug_logger=dmpc_logger if log_this_step else None,
-                            debug_step=expert_collect_step,
-                        )
-                    elif args_cli.action_source == "greedy":
-                        action_flat = greedy_action(
-                            env,
-                            speed=args_cli.greedy_speed,
-                            pos_gain=args_cli.greedy_pos_gain,
-                            step=expert_collect_step,
-                            debug_logger=dmpc_logger if log_this_step else None,
-                            debug_step=expert_collect_step,
-                        )
-                    else:
-                        action_flat = expert_action(
-                            env, expert,
-                            debug_logger=dmpc_logger if log_this_step else None,
-                            debug_step=expert_collect_step,
-                        )  # (E, N*A)
+                    action_flat = expert_action(
+                        env, expert,
+                        debug_logger=dmpc_logger if log_this_step else None,
+                        debug_step=expert_collect_step,
+                    )  # (E, N*A)
 
                 action_per_drone = action_flat.view(env.num_envs, N, A)
                 act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
@@ -689,11 +729,17 @@ def main():
                 per_drone_obs = env.get_per_drone_obs()
                 episode_returns += reward
                 done = terminated | truncated
+                reset_env_ids = getattr(env, "_last_reset_env_ids", None)
+                if reset_env_ids is not None and reset_env_ids.numel() > 0:
+                    expert.reset(reset_env_ids)
+                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                elif done.any():
+                    expert.reset(done.nonzero(as_tuple=False).flatten())
                 if done.any():
                     finished = episode_returns[done].detach().cpu().tolist()
                     collect_returns.extend(finished)
                     episode_returns[done] = 0.0
-                    expert.reset(done.nonzero(as_tuple=False).flatten())
+                last_episode_length_buf = env.episode_length_buf.clone()
                 total_env_steps += env.num_envs
                 expert_collect_step += 1
             collect_dt = time.time() - t_collect
@@ -722,9 +768,12 @@ def main():
             if args_cli.eval_every_rounds > 0 and round_idx % args_cli.eval_every_rounds == 0:
                 eval_metrics = evaluate(env, policy, args_cli.eval_steps, N, A)
                 env.reset()
+                expert.reset()
+                if hasattr(env, "_last_reset_env_ids"):
+                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                last_episode_length_buf = env.episode_length_buf.clone()
                 per_drone_obs = env.get_per_drone_obs()
                 episode_returns.zero_()
-                expert.reset()
 
             # ── 4. Logging + checkpointing ──────────────────────────────
             mean_ret = float(np.mean(recent_returns)) if recent_returns else float("nan")

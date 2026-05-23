@@ -2,16 +2,16 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <num_drones> [steps=300] [log_every=1] [action_source=hover]" >&2
+  echo "Usage: $0 <num_drones> [steps=300] [log_every=1] [action_source=dmpc] [num_envs=1] [episode_length_s=3600]" >&2
   exit 2
 fi
 
 NUM_DRONES="$1"
 STEPS="${2:-300}"
 LOG_EVERY="${3:-1}"
-ACTION_SOURCE="${4:-hover}"
-NUM_ENVS=1
-EPISODE_LENGTH_S=3600
+ACTION_SOURCE="${4:-dmpc}"
+NUM_ENVS="${5:-1}"
+EPISODE_LENGTH_S="${6:-3600}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"

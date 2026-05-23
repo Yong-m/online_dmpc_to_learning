@@ -50,7 +50,7 @@ from isaaclab.utils.math import quat_rotate_inverse, subtract_frame_transforms, 
 # Pre-defined configs
 ##
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
+from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 
 
 # Per-drone observation layout sizes.
@@ -138,8 +138,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
 
     # ── position-reference tracker gains ──
     pos_track_kp: float = 8.0 #5.0 #6.0
-    pos_track_kd: float = 10.0 #4.5
-    track_accel_clip: float = 4.0 # 4.0
+    pos_track_kd: float = 16.0 #4.5
+    track_accel_clip: float = 4.0 # 4.0 #(of no use now)
     att_track_kp: float = 0.002
     att_track_kd: float = 0.001
 
@@ -179,6 +179,13 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._goal_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         # Initial positions saved at reset (handy for diagnostics).
         self._init_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+
+        # First-env live DMPC horizon visualization buffers. Shapes are
+        # (num_drones, horizon, 3); empty until the expert pushes a plan.
+        self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_collision_pos_w = torch.empty(0, 3, device=device)
+        self._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
         # Logging.
         self._episode_sums = {
@@ -381,6 +388,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robots[0]._ALL_INDICES
+        self._last_reset_env_ids = env_ids.detach().clone()
 
         pos_w = torch.stack([r.data.root_pos_w for r in self._robots], dim=1)
         final_dist = torch.linalg.norm(self._goal_pos_w[env_ids] - pos_w[env_ids], dim=-1).mean()
@@ -418,7 +426,9 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         n = len(env_ids)
         device = self.device
         radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
-        theta0 = torch.empty(n, self.N, device=device).uniform_(0.0, 2.0 * torch.pi)
+        theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
+        theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
+        theta0 = theta_base + theta_offsets
         z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
 
         init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
@@ -581,6 +591,33 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # desired_accel = desired_accel.clamp(-clip, clip)
         # return _acc_to_thrust_moment_action(self, desired_accel)
 
+    # ── live MPC debug visualization ───────────────────────────────────────
+    def set_debug_trajectories(
+        self,
+        planned_pos_w: torch.Tensor | None = None,
+        predicted_pos_w: torch.Tensor | None = None,
+        collision_pos_w: torch.Tensor | None = None,
+    ) -> None:
+        """Update first-env MPC horizon markers.
+
+        Args:
+            planned_pos_w: ``(N, K, 3)`` planned reference positions.
+            predicted_pos_w: ``(N, K, 3)`` predicted state positions.
+            collision_pos_w: ``(M, 3)`` predicted collision points.
+        """
+        if planned_pos_w is None:
+            self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_planned_pos_w = planned_pos_w.detach().to(self.device).clone()
+        if predicted_pos_w is None:
+            self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_predicted_pos_w = predicted_pos_w.detach().to(self.device).clone()
+        if collision_pos_w is None:
+            self._debug_collision_pos_w = torch.empty(0, 3, device=self.device)
+        else:
+            self._debug_collision_pos_w = collision_pos_w.detach().to(self.device).clone()
+
     # ── debug viz ──────────────────────────────────────────────────────────
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -590,12 +627,45 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 marker_cfg.prim_path = "/Visuals/Command/multi_drone_goal"
                 self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
             self.goal_pos_visualizer.set_visibility(True)
+            if not hasattr(self, "mpc_plan_visualizer"):
+                plan_cfg = SPHERE_MARKER_CFG.copy()
+                plan_cfg.markers["sphere"].radius = 0.025
+                plan_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.55, 0.0)
+                plan_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_plan"
+                self.mpc_plan_visualizer = VisualizationMarkers(plan_cfg)
+            if not hasattr(self, "mpc_pred_visualizer"):
+                pred_cfg = SPHERE_MARKER_CFG.copy()
+                pred_cfg.markers["sphere"].radius = 0.02
+                pred_cfg.markers["sphere"].visual_material.diffuse_color = (0.55, 0.25, 1.0)
+                pred_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_prediction"
+                self.mpc_pred_visualizer = VisualizationMarkers(pred_cfg)
+            self.mpc_plan_visualizer.set_visibility(True)
+            self.mpc_pred_visualizer.set_visibility(True)
+            if not hasattr(self, "mpc_collision_visualizer"):
+                coll_cfg = SPHERE_MARKER_CFG.copy()
+                coll_cfg.markers["sphere"].radius = 0.04
+                coll_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
+                coll_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_collision"
+                self.mpc_collision_visualizer = VisualizationMarkers(coll_cfg)
+            self.mpc_collision_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_pos_visualizer"):
                 self.goal_pos_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_plan_visualizer"):
+                self.mpc_plan_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_pred_visualizer"):
+                self.mpc_pred_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_collision_visualizer"):
+                self.mpc_collision_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         self.goal_pos_visualizer.visualize(self._goal_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_plan_visualizer") and self._debug_planned_pos_w.numel() > 0:
+            self.mpc_plan_visualizer.visualize(self._debug_planned_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_pred_visualizer") and self._debug_predicted_pos_w.numel() > 0:
+            self.mpc_pred_visualizer.visualize(self._debug_predicted_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_collision_visualizer") and self._debug_collision_pos_w.numel() > 0:
+            self.mpc_collision_visualizer.visualize(self._debug_collision_pos_w.reshape(-1, 3))
 
 
 # ───────────────────────────────────────────────────────────────────────────

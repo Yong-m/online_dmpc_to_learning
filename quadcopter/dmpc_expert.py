@@ -103,7 +103,7 @@ except ImportError as e:  # pragma: no cover
 @dataclass
 class DMPCParams:
     # Horizon / discretisation
-    k_hor: int = 16
+    k_hor: int = 20 #16
     h: float = 0.1          # MPC replanning period (s)
     ts: float = 0.02        # subsample / control period (s)
 
@@ -123,9 +123,8 @@ class DMPCParams:
     # Workspace + actuation limits
     pmin: tuple[float, float, float] = (-1.5, -1.5, 0.2)
     pmax: tuple[float, float, float] = (1.5, 1.5, 2.2)
-    amin: tuple[float, float, float] = (-4.0,-4.0,-4.0) #(-1.0, -1.0, -1.0)
-    amax: tuple[float, float, float] = (4.0, 4.0, 4.0) # (1.0, 1.0, 1.0)
-
+    amin: tuple[float, float, float] = (-2.0, -2.0, -2.0) #(-4.0,-4.0,-4.0) # (-1.0, -1.0, -1.0)
+    amax: tuple[float, float, float] = (2.0, 2.0, 2.0) # (4.0, 4.0, 4.0) # (1.0, 1.0, 1.0)
     # Cost weights. ``s_free`` / ``spd_f`` weight the *last spd_f* steps when no
     # collision is predicted; ``s_obs`` / ``spd_o`` weight the *last spd_o* steps
     # when a collision row is added to the QP (mirrors the C++ free/obs cost
@@ -134,7 +133,7 @@ class DMPCParams:
     spd_f: int = 3
     s_obs: float = 100.0
     spd_o: int = 1
-    acc_cost: float = 8e-3 #10.0 #8e-3
+    acc_cost: float = 1.0 #10.0 #8e-3
     lin_coll: float = -1.0e5
     quad_coll: float = 1.0
 
@@ -151,7 +150,7 @@ class DMPCParams:
     # OSQP options
     osqp_eps_abs: float = 1e-3
     osqp_eps_rel: float = 1e-3
-    osqp_max_iter: int = 200
+    osqp_max_iter: int = 200 #200
     osqp_polish: bool = False
 
 
@@ -576,7 +575,7 @@ class DMPCExpert:
         # ── Collision constraints first: their presence selects the cost mode.
         own_pred_seed = self._seed_input_prediction(prev, seeds[0], goal_local)
         n_slack = n_nbr
-        coll_A, coll_l, coll_u = self._build_collision_constraints(
+        coll_A, coll_l, coll_u, collision_sample_indices = self._build_collision_constraints(
             own_pred=own_pred_seed,
             nbr_pred=nbr_pred,
             n_slack=n_slack,
@@ -683,6 +682,7 @@ class DMPCExpert:
             solver.warm_start(warm)
         res = solver.solve()
         if res.info.status_val not in (1, 2):
+            # print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
             self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
@@ -703,6 +703,7 @@ class DMPCExpert:
             "last_replanned": True,
             "last_reset_mode": bool(_reset_mode),
             "last_fallback": False,
+            "collision_sample_indices": collision_sample_indices,
         }
 
     # ───────────────────────────────────────────────────────────────────
@@ -728,7 +729,7 @@ class DMPCExpert:
         """
         zero_higher = [np.zeros(3) for _ in range(self.p.deg_poly)]
         if prev is None:
-            print("No previous plan, using disturbed initialisation.")
+            # print("No previous plan, using disturbed initialisation.")
             return [pos.copy(), *zero_higher], True
 
         u_prev_at_kt = prev["seeds"][0]
@@ -744,7 +745,7 @@ class DMPCExpert:
     
 
         if in_band:
-            print("In-band, using normal initialisation.")
+            # print("In-band, using normal initialisation.")
             return [s.copy() for s in prev["seeds"]], False
         return [pos.copy(), *zero_higher], True
 
@@ -778,7 +779,7 @@ class DMPCExpert:
         own_pred: np.ndarray,
         nbr_pred: np.ndarray,
         n_slack: int,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[int]]:
         """Construct collision-avoidance inequalities. For each neighbour ``j``
         find the first step ``k_c`` where the predicted (input-space) distance
         is below ``g(rmin)`` and add one linearised cut. The slack variable
@@ -790,11 +791,12 @@ class DMPCExpert:
         Theta_inv = self._Theta_inv
         n_nbr = nbr_pred.shape[0]
         if n_nbr == 0:
-            return None, None, None
+            return None, None, None, []
 
         rows = []
         lbs = []
         ubs = []
+        collision_sample_indices: list[int] = []
         for j in range(n_nbr):
             kc = -1
             for k in range(1, K):
@@ -819,9 +821,10 @@ class DMPCExpert:
             rows.append(row)
             lbs.append(rhs_lower)
             ubs.append(np.inf)
+            collision_sample_indices.append(max(kc - 1, 0))
         if not rows:
-            return None, None, None
-        return np.vstack(rows), np.asarray(lbs), np.asarray(ubs)
+            return None, None, None, []
+        return np.vstack(rows), np.asarray(lbs), np.asarray(ubs), collision_sample_indices
 
     # ───────────────────────────────────────────────────────────────────
     # Fallback (solver failure)
