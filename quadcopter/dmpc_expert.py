@@ -111,8 +111,14 @@ class DMPCParams:
     deg: int = 5            # polynomial degree p
     num_segments: int = 3   # number of concatenated curves l
     deg_poly: int = 3       # continuity order
-    t_segment: float = 0.5  # T_seg (s).  l * T_seg should equal (k_hor-1)*h
+    t_segment: float | None = None  # Auto: ((k_hor - 1) * h) / num_segments    # originally 0.5
     dim: int = 3
+
+    def __post_init__(self):
+        if self.num_segments <= 0:
+            raise ValueError("num_segments must be positive")
+        if self.t_segment is None:
+            self.t_segment = (self.k_hor - 1) * self.h / self.num_segments
 
     # Identified second-order closed-loop tracking dynamics
     zeta_xy: float = 0.6502
@@ -123,8 +129,8 @@ class DMPCParams:
     # Workspace + actuation limits
     pmin: tuple[float, float, float] = (-1.5, -1.5, 0.2)
     pmax: tuple[float, float, float] = (1.5, 1.5, 2.2)
-    amin: tuple[float, float, float] = (-2.0, -2.0, -2.0) #(-4.0,-4.0,-4.0) # (-1.0, -1.0, -1.0)
-    amax: tuple[float, float, float] = (2.0, 2.0, 2.0) # (4.0, 4.0, 4.0) # (1.0, 1.0, 1.0)
+    amin: tuple[float, float, float] = (-1.5, -1.5, -1.5)#(-2.0, -2.0, -2.0) #(-4.0,-4.0,-4.0) # (-1.0, -1.0, -1.0)
+    amax: tuple[float, float, float] = (1.5, 1.5, 1.5)#(2.0, 2.0, 2.0) # (4.0, 4.0, 4.0) # (1.0, 1.0, 1.0)
     # Cost weights. ``s_free`` / ``spd_f`` weight the *last spd_f* steps when no
     # collision is predicted; ``s_obs`` / ``spd_o`` weight the *last spd_o* steps
     # when a collision row is added to the QP (mirrors the C++ free/obs cost
@@ -138,7 +144,7 @@ class DMPCParams:
     quad_coll: float = 1.0
 
     # Collision parameters
-    rmin: float = 0.3
+    rmin: float = 0.5 #0.3
     height_scaling: float = 2.0
     g_factor: float = 2.0
 
@@ -299,6 +305,8 @@ class DMPCExpert:
     def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu"):
         self.N = num_drones
         self.p = params or DMPCParams()
+        if self.p.t_segment is None:
+            self.p.t_segment = (self.p.k_hor - 1) * self.p.h / self.p.num_segments
         self.device = torch.device(device)
 
         # Number of control steps between replanning rounds (Ts samples per h).
@@ -482,11 +490,16 @@ class DMPCExpert:
             # over. We do this in two passes (replan-first, sample-second) so
             # every agent in this env has up-to-date broadcasts when neighbours
             # query ``u_pred``.
+
+            # gather prediction first
+            nbr_preds = [self._gather_neighbour_predictions(e, i, pos_np_local) for i in range(N)]
+            
+            # replan with up-to-date neighbour predictions
             for i in range(N):
                 key = (e, i)
                 st = self._state.get(key)
                 if st is None or st["steps"] % self.n_substeps == 0:
-                    nbr_pred = self._gather_neighbour_predictions(e, i, pos_np_local)
+                    nbr_pred = nbr_preds[i]
                     self._replan_agent(
                         e, i,
                         pos_local=pos_np_local[e, i],
@@ -574,11 +587,9 @@ class DMPCExpert:
 
         # ── Collision constraints first: their presence selects the cost mode.
         own_pred_seed = self._seed_input_prediction(prev, seeds[0], goal_local)
-        n_slack = n_nbr
-        coll_A, coll_l, coll_u, collision_sample_indices = self._build_collision_constraints(
+        coll_A, coll_l, coll_u, collision_timestep, n_slack = self._build_collision_constraints(
             own_pred=own_pred_seed,
             nbr_pred=nbr_pred,
-            n_slack=n_slack,
         )
         collision_mode = coll_A is not None
 
@@ -589,6 +600,7 @@ class DMPCExpert:
         else:
             H_bez_const = self._H_bez_free
             Q_diag = self._Q_diag_free
+            # n_slack = 0 #!!!!
 
         # Variable layout: [U_bez (n_bez), slacks (n_slack)]
         n_total = n_bez + n_slack
@@ -621,6 +633,8 @@ class DMPCExpert:
         # reference signal across replanning rounds, matching C++ generator
         # buildQP. Without this only position is pinned and the QP is free to
         # introduce velocity/acceleration jumps.
+
+
         for r in range(self.p.deg_poly + 1):
             A_eq_rows.append(np.hstack([self._M_deriv_0[r], np.zeros((3, n_slack))]))
             b_eq_rows.append(seeds[r].copy())
@@ -675,6 +689,8 @@ class DMPCExpert:
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
             return
 
         if prev is not None and prev["U"].shape[0] == n_bez:
@@ -687,6 +703,8 @@ class DMPCExpert:
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
             return
 
         U_sol = res.x[:n_bez]
@@ -703,7 +721,8 @@ class DMPCExpert:
             "last_replanned": True,
             "last_reset_mode": bool(_reset_mode),
             "last_fallback": False,
-            "collision_sample_indices": collision_sample_indices,
+            "collision_timestep": int(collision_timestep),
+            "collision_sample_indices": [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else [],
         }
 
     # ───────────────────────────────────────────────────────────────────
@@ -778,8 +797,8 @@ class DMPCExpert:
         self,
         own_pred: np.ndarray,
         nbr_pred: np.ndarray,
-        n_slack: int,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[int]]:
+        # n_slack: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | int]:
         """Construct collision-avoidance inequalities. For each neighbour ``j``
         find the first step ``k_c`` where the predicted (input-space) distance
         is below ``g(rmin)`` and add one linearised cut. The slack variable
@@ -790,42 +809,57 @@ class DMPCExpert:
         g_thresh = self.p.g_factor * rmin
         Theta_inv = self._Theta_inv
         n_nbr = nbr_pred.shape[0]
+        kc = -1
+        n_slack = 0
         if n_nbr == 0:
-            return None, None, None, []
+            return None, None, None, kc, n_slack
 
         rows = []
         lbs = []
         ubs = []
-        collision_sample_indices: list[int] = []
-        for j in range(n_nbr):
-            kc = -1
-            for k in range(1, K):
+        # collision_sample_indices: list[int] = []
+        
+        # Collision detection
+        # 1. Determine k_c,i: the first timestep where there exists a neighbor j s.t. d < rmin
+        # 2. Determine Omega_i: the set of neighbors j s.t. d < g_thresh at k_c,i
+        
+        # 1. Determine k_c,i
+        for k in range(1, K):
+            for j in range(n_nbr):
                 d = Theta_inv @ (own_pred[k - 1] - nbr_pred[j, k])
-                if np.linalg.norm(d) < g_thresh:
+                if np.linalg.norm(d) < rmin:
                     kc = k
                     break
-            if kc < 0:
-                continue
-            d = Theta_inv @ (own_pred[kc - 1] - nbr_pred[j, kc])
-            d_norm = np.linalg.norm(d)
-            if d_norm < 1e-6:
-                eta = np.array([1.0, 0.0, 0.0])
-            else:
-                eta = d / d_norm
-            Phi_kc = self.M_pos_hor[3 * (kc - 1) : 3 * (kc - 1) + 3, :]
-            row = np.zeros(self.n_bez + n_slack)
-            # eta^T Theta^{-1} * (Phi_{k_c-1} @ U) - eps_{ij} >= rmin + eta^T Theta^{-1} nbr_j[k_c]
-            row[: self.n_bez] = eta @ (Theta_inv @ Phi_kc)
-            row[self.n_bez + j] = -1.0
-            rhs_lower = rmin + eta @ (Theta_inv @ nbr_pred[j, kc])
-            rows.append(row)
-            lbs.append(rhs_lower)
-            ubs.append(np.inf)
-            collision_sample_indices.append(max(kc - 1, 0))
-        if not rows:
-            return None, None, None, []
-        return np.vstack(rows), np.asarray(lbs), np.asarray(ubs), collision_sample_indices
+            if kc > 0:
+                break
+        
+        # 2. Determine Omega_i and construct constraint
+        if kc >= 0:
+            for j in range(n_nbr):
+                d = Theta_inv @ (own_pred[kc - 1] - nbr_pred[j, kc])
+                if np.linalg.norm(d) < g_thresh:
+                    # construct collision constraint
+                    Phi_kc = self.M_pos_hor[3 * (kc - 1) : 3 * (kc - 1) + 3, :]
+                    unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
+                    dg_dU = unit_diff.transpose() @ Theta_inv @ Phi_kc
+                    rhs_lower = unit_diff.transpose() @ Theta_inv @ nbr_pred[j, kc] + rmin
 
+                    row = np.zeros(self.n_bez) # + n_slack)
+                    row = dg_dU
+                    # row[: self.n_bez] = dg_dU
+                    # row[self.n_bez + j] = -1
+                    
+                    rows.append(row)
+                    lbs.append(rhs_lower)
+                    ubs.append(np.inf)
+
+                    n_slack += 1
+
+            A_col = np.hstack([np.vstack(rows), -np.eye(n_slack)])
+            return A_col, np.asarray(lbs), np.asarray(ubs), kc, n_slack
+
+        else:
+            return None, None, None, kc, n_slack
     # ───────────────────────────────────────────────────────────────────
     # Fallback (solver failure)
     # ───────────────────────────────────────────────────────────────────
@@ -863,4 +897,6 @@ class DMPCExpert:
             "u_pred": u_pred,
             "seeds": seeds,
             "steps": 0,
+            "collision_timestep": -1,
+            "collision_sample_indices": [],
         }

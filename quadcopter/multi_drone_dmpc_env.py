@@ -83,8 +83,10 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
+    debug_short_horizon_steps: int = 3
     randomize_episode_start: bool = True
     terminate_on_bounds: bool = True
+    collision_free_two_drone_reset: bool = False # For DMPC debugging
 
     ui_window_class_type = MultiDroneDmpcEnvWindow
 
@@ -140,8 +142,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     pos_track_kp: float = 8.0 #5.0 #6.0
     pos_track_kd: float = 16.0 #4.5
     track_accel_clip: float = 4.0 # 4.0 #(of no use now)
-    att_track_kp: float = 0.002
-    att_track_kd: float = 0.001
+    att_track_kp: float = 0.01
+    att_track_kd: float = 0.0008
 
     # ── reward scales ──
     lin_vel_reward_scale: float = -0.05
@@ -184,6 +186,10 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # (num_drones, horizon, 3); empty until the expert pushes a plan.
         self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=device)
         self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_planned_short_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_predicted_short_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_planned_segment_pos_w = []
+        self._debug_predicted_segment_pos_w = []
         self._debug_collision_pos_w = torch.empty(0, 3, device=device)
         self._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
@@ -425,15 +431,21 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # one side of a random circle, goal on the diametrically opposite side.
         n = len(env_ids)
         device = self.device
-        radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
-        theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
-        theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
-        theta0 = theta_base + theta_offsets
-        z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+        if self.N == 2 and self.cfg.collision_free_two_drone_reset:
+            init_xy = torch.tensor([[-1.0, -0.55], [-1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
+            goal_xy = torch.tensor([[1.0, -0.55], [1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
+            z0 = torch.ones(n, self.N, device=device)
+            zg = torch.ones(n, self.N, device=device)
+        else:
+            radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
+            theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
+            theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
+            theta0 = theta_base + theta_offsets
+            z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
 
-        init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
-        goal_xy = -init_xy
-        zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+            init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
+            goal_xy = -init_xy
+            zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
 
         origins = self._terrain.env_origins[env_ids]
         init_pos = torch.cat([init_xy, z0.unsqueeze(-1)], dim=-1)
@@ -596,14 +608,22 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self,
         planned_pos_w: torch.Tensor | None = None,
         predicted_pos_w: torch.Tensor | None = None,
+        planned_short_pos_w: torch.Tensor | None = None,
+        predicted_short_pos_w: torch.Tensor | None = None,
         collision_pos_w: torch.Tensor | None = None,
+        planned_segment_pos_w: list[torch.Tensor] | None = None,
+        predicted_segment_pos_w: list[torch.Tensor] | None = None,
     ) -> None:
         """Update first-env MPC horizon markers.
 
         Args:
             planned_pos_w: ``(N, K, 3)`` planned reference positions.
             predicted_pos_w: ``(N, K, 3)`` predicted state positions.
+            planned_short_pos_w: early planned reference samples to color separately.
+            predicted_short_pos_w: early predicted state samples to color separately.
             collision_pos_w: ``(M, 3)`` predicted collision points.
+            planned_segment_pos_w: planned-reference samples grouped by Bezier segment.
+            predicted_segment_pos_w: predicted-state samples grouped by Bezier segment.
         """
         if planned_pos_w is None:
             self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=self.device)
@@ -613,6 +633,22 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=self.device)
         else:
             self._debug_predicted_pos_w = predicted_pos_w.detach().to(self.device).clone()
+        if planned_short_pos_w is None:
+            self._debug_planned_short_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_planned_short_pos_w = planned_short_pos_w.detach().to(self.device).clone()
+        if predicted_short_pos_w is None:
+            self._debug_predicted_short_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_predicted_short_pos_w = predicted_short_pos_w.detach().to(self.device).clone()
+        if planned_segment_pos_w is None:
+            self._debug_planned_segment_pos_w = []
+        else:
+            self._debug_planned_segment_pos_w = [p.detach().to(self.device).clone() for p in planned_segment_pos_w]
+        if predicted_segment_pos_w is None:
+            self._debug_predicted_segment_pos_w = []
+        else:
+            self._debug_predicted_segment_pos_w = [p.detach().to(self.device).clone() for p in predicted_segment_pos_w]
         if collision_pos_w is None:
             self._debug_collision_pos_w = torch.empty(0, 3, device=self.device)
         else:
@@ -629,21 +665,42 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self.goal_pos_visualizer.set_visibility(True)
             if not hasattr(self, "mpc_plan_visualizer"):
                 plan_cfg = SPHERE_MARKER_CFG.copy()
-                plan_cfg.markers["sphere"].radius = 0.025
+                plan_cfg.markers["sphere"].radius = 0.01
                 plan_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.55, 0.0)
                 plan_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_plan"
                 self.mpc_plan_visualizer = VisualizationMarkers(plan_cfg)
             if not hasattr(self, "mpc_pred_visualizer"):
                 pred_cfg = SPHERE_MARKER_CFG.copy()
-                pred_cfg.markers["sphere"].radius = 0.02
+                pred_cfg.markers["sphere"].radius = 0.008
                 pred_cfg.markers["sphere"].visual_material.diffuse_color = (0.55, 0.25, 1.0)
                 pred_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_prediction"
                 self.mpc_pred_visualizer = VisualizationMarkers(pred_cfg)
+            if not hasattr(self, "mpc_plan_segment_visualizers"):
+                plan_colors = [(0.0, 0.9, 1.0), (1.0, 0.85, 0.0), (1.0, 0.2, 0.75)]
+                pred_colors = [(0.1, 1.0, 0.25), (0.35, 0.65, 1.0), (0.85, 0.45, 1.0)]
+                self.mpc_plan_segment_visualizers = []
+                self.mpc_pred_segment_visualizers = []
+                for seg_idx, color in enumerate(plan_colors):
+                    seg_cfg = SPHERE_MARKER_CFG.copy()
+                    seg_cfg.markers["sphere"].radius = 0.018
+                    seg_cfg.markers["sphere"].visual_material.diffuse_color = color
+                    seg_cfg.prim_path = f"/Visuals/Command/multi_drone_mpc_plan_segment_{seg_idx}"
+                    self.mpc_plan_segment_visualizers.append(VisualizationMarkers(seg_cfg))
+                for seg_idx, color in enumerate(pred_colors):
+                    seg_cfg = SPHERE_MARKER_CFG.copy()
+                    seg_cfg.markers["sphere"].radius = 0.014
+                    seg_cfg.markers["sphere"].visual_material.diffuse_color = color
+                    seg_cfg.prim_path = f"/Visuals/Command/multi_drone_mpc_prediction_segment_{seg_idx}"
+                    self.mpc_pred_segment_visualizers.append(VisualizationMarkers(seg_cfg))
             self.mpc_plan_visualizer.set_visibility(True)
             self.mpc_pred_visualizer.set_visibility(True)
+            for visualizer in self.mpc_plan_segment_visualizers:
+                visualizer.set_visibility(True)
+            for visualizer in self.mpc_pred_segment_visualizers:
+                visualizer.set_visibility(True)
             if not hasattr(self, "mpc_collision_visualizer"):
                 coll_cfg = SPHERE_MARKER_CFG.copy()
-                coll_cfg.markers["sphere"].radius = 0.04
+                coll_cfg.markers["sphere"].radius = 0.012
                 coll_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
                 coll_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_collision"
                 self.mpc_collision_visualizer = VisualizationMarkers(coll_cfg)
@@ -655,6 +712,12 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 self.mpc_plan_visualizer.set_visibility(False)
             if hasattr(self, "mpc_pred_visualizer"):
                 self.mpc_pred_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_plan_segment_visualizers"):
+                for visualizer in self.mpc_plan_segment_visualizers:
+                    visualizer.set_visibility(False)
+            if hasattr(self, "mpc_pred_segment_visualizers"):
+                for visualizer in self.mpc_pred_segment_visualizers:
+                    visualizer.set_visibility(False)
             if hasattr(self, "mpc_collision_visualizer"):
                 self.mpc_collision_visualizer.set_visibility(False)
 
@@ -664,6 +727,14 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self.mpc_plan_visualizer.visualize(self._debug_planned_pos_w.reshape(-1, 3))
         if hasattr(self, "mpc_pred_visualizer") and self._debug_predicted_pos_w.numel() > 0:
             self.mpc_pred_visualizer.visualize(self._debug_predicted_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_plan_segment_visualizers"):
+            for visualizer, points in zip(self.mpc_plan_segment_visualizers, self._debug_planned_segment_pos_w):
+                if points.numel() > 0:
+                    visualizer.visualize(points.reshape(-1, 3))
+        if hasattr(self, "mpc_pred_segment_visualizers"):
+            for visualizer, points in zip(self.mpc_pred_segment_visualizers, self._debug_predicted_segment_pos_w):
+                if points.numel() > 0:
+                    visualizer.visualize(points.reshape(-1, 3))
         if hasattr(self, "mpc_collision_visualizer") and self._debug_collision_pos_w.numel() > 0:
             self.mpc_collision_visualizer.visualize(self._debug_collision_pos_w.reshape(-1, 3))
 

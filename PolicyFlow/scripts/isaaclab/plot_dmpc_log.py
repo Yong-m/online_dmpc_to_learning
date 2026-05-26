@@ -38,6 +38,8 @@ predicted = data["predicted_pos_w"][:, args.agent]
 mpc_replanned = data["mpc_replanned"][:, args.agent].astype(bool) if "mpc_replanned" in data else None
 mpc_reset_mode = data["mpc_reset_mode"][:, args.agent].astype(bool) if "mpc_reset_mode" in data else None
 mpc_fallback = data["mpc_fallback"][:, args.agent].astype(bool) if "mpc_fallback" in data else None
+mpc_collision_timestep = data["mpc_collision_timestep"][:, args.agent].astype(int) if "mpc_collision_timestep" in data else None
+mpc_collision_pos = data["mpc_collision_pos_w"][:, args.agent] if "mpc_collision_pos_w" in data else None
 
 err_goal = np.linalg.norm(goal - pos, axis=-1)
 err_ref = np.linalg.norm(ref_pos - pos, axis=-1)
@@ -64,6 +66,14 @@ for idx in range(0, len(step), stride):
               color="tab:purple", alpha=alpha, lw=1.0, ls="--")
 ax3d.plot([], [], [], color="tab:orange", lw=1.0, label="planned ref horizon")
 ax3d.plot([], [], [], color="tab:purple", lw=1.0, ls="--", label="predicted state horizon")
+if mpc_collision_pos is not None:
+    valid_collision_pos = np.isfinite(mpc_collision_pos).all(axis=-1)
+    if valid_collision_pos.any():
+        ax3d.scatter(mpc_collision_pos[valid_collision_pos, 0],
+                     mpc_collision_pos[valid_collision_pos, 1],
+                     mpc_collision_pos[valid_collision_pos, 2],
+                     marker="x", s=55, color="red", linewidths=1.8,
+                     label="collision-predicted pos")
 ax3d.set_title(f"First env, drone {args.agent}: planning and tracking")
 ax3d.set_xlabel("x [m]")
 ax3d.set_ylabel("y [m]")
@@ -77,6 +87,17 @@ for dim, (label, color) in enumerate(zip(labels, colors)):
     ax_pos.plot(step, ref_pos[:, dim], color=color, lw=1.2, ls="--", label=f"expert ref {label}")
     ax_pos.plot(step, cmd_pos[:, dim], color=color, lw=1.0, ls="-.", label=f"env cmd pos {label}")
     ax_pos.plot(step, goal[:, dim], color=color, lw=0.9, ls=":", label=f"goal {label}")
+if mpc_collision_pos is not None:
+    valid_collision_pos = np.isfinite(mpc_collision_pos).all(axis=-1)
+    if valid_collision_pos.any():
+        collision_markers = ["x", "+", "1"]
+        for dim, (label, color) in enumerate(zip(labels, colors)):
+            ax_pos.scatter(
+                step[valid_collision_pos],
+                mpc_collision_pos[valid_collision_pos, dim],
+                color=color, marker=collision_markers[dim], s=42, linewidths=1.4,
+                label=f"collision pos {label}", zorder=5,
+            )
 if mpc_replanned is not None:
     repl_steps = step[mpc_replanned]
     reset_steps = step[mpc_reset_mode] if mpc_reset_mode is not None else np.asarray([], dtype=step.dtype)
@@ -87,6 +108,16 @@ if mpc_replanned is not None:
         ax_pos.axvline(s, color="tab:red", lw=1.1, alpha=0.5, label="MPC reset-mode" if n == 0 else None)
     for n, s in enumerate(fallback_steps):
         ax_pos.axvline(s, color="tab:purple", lw=1.2, alpha=0.55, label="MPC fallback" if n == 0 else None)
+collision_pos_valid = None
+if mpc_collision_pos is not None:
+    collision_pos_valid = np.isfinite(mpc_collision_pos).all(axis=-1)
+    collision_pos_steps = step[collision_pos_valid]
+    for n, s in enumerate(collision_pos_steps):
+        ax_pos.axvline(s, color="red", lw=1.0, alpha=0.35, label="collision pos logged" if n == 0 else None)
+if mpc_collision_timestep is not None:
+    ca_steps = step[mpc_collision_timestep >= 0]
+    for n, s in enumerate(ca_steps):
+        ax_pos.axvline(s, color="tab:orange", lw=1.0, alpha=0.45, label="CA detected" if n == 0 else None)
 ax_pos_twin = ax_pos.twinx()
 ax_pos_twin.plot(step, err_goal, color="black", lw=1.5, alpha=0.7, label="||goal-pos||")
 ax_pos_twin.plot(step, err_ref, color="tab:gray", lw=1.2, alpha=0.8, label="||ref-pos||")
@@ -135,9 +166,21 @@ if "ll_thrust_b_z" in data:
 else:
     ax_ll.text(0.5, 0.5, "low-level debug fields not present in this log", ha="center", va="center")
     ax_ll.set_title("Low-level control debug")
+if mpc_collision_timestep is not None:
+    ax_kc = ax_ll.twinx()
+    kc_plot = np.where(mpc_collision_timestep >= 0, mpc_collision_timestep, np.nan)
+    ax_kc.step(step, kc_plot, where="post", color="tab:orange", lw=1.6, label="collision kc")
+    ax_kc.scatter(step[mpc_collision_timestep >= 0], mpc_collision_timestep[mpc_collision_timestep >= 0],
+                  color="tab:orange", s=18, zorder=5)
+    ax_kc.set_ylabel("collision horizon kc")
+    lines_kc, names_kc = ax_kc.get_legend_handles_labels()
+    lines_ll, names_ll = ax_ll.get_legend_handles_labels()
+    ax_ll.legend(lines_ll + lines_kc, names_ll + names_kc, ncols=3, fontsize=7, loc="best")
+else:
+    ax_ll.legend(ncols=3, fontsize=7, loc="best")
+
 ax_ll.set_xlabel("collection step")
 ax_ll.grid(True, alpha=0.3)
-ax_ll.legend(ncols=3, fontsize=7, loc="best")
 
 if args.out is not None:
     args.out.parent.mkdir(parents=True, exist_ok=True)

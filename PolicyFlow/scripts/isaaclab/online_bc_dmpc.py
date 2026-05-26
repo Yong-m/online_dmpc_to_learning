@@ -431,6 +431,27 @@ def _push_first_env_debug_trajectories(
     predicted = torch.from_numpy(predicted_np).to(device)
     valid_plan = torch.isfinite(planned).all(dim=-1)
     valid_pred = torch.isfinite(predicted).all(dim=-1)
+    n_short = max(1, min(int(getattr(env.cfg, "debug_short_horizon_steps", 3)), K))
+    planned_short = planned[:, :n_short]
+    predicted_short = predicted[:, :n_short]
+    valid_plan_short = torch.isfinite(planned_short).all(dim=-1)
+    valid_pred_short = torch.isfinite(predicted_short).all(dim=-1)
+    planned_segments = []
+    predicted_segments = []
+    seg_ids = np.minimum((expert._times_hor / expert.bezier.T_seg).astype(np.int64), expert.bezier.l - 1)
+    for seg_idx in range(expert.bezier.l):
+        seg_indices = np.nonzero(seg_ids == seg_idx)[0].tolist()
+        if not seg_indices:
+            planned_segments.append(torch.empty(0, 1, 3, device=device))
+            predicted_segments.append(torch.empty(0, 1, 3, device=device))
+            continue
+        planned_seg = planned[:, seg_indices]
+        predicted_seg = predicted[:, seg_indices]
+        valid_planned_seg = torch.isfinite(planned_seg).all(dim=-1)
+        valid_predicted_seg = torch.isfinite(predicted_seg).all(dim=-1)
+        planned_segments.append(planned_seg[valid_planned_seg].reshape(-1, 1, 3))
+        predicted_segments.append(predicted_seg[valid_predicted_seg].reshape(-1, 1, 3))
+
     if collision_points:
         collision = torch.from_numpy(np.stack(collision_points, axis=0).astype(np.float32)).to(device)
     else:
@@ -438,7 +459,11 @@ def _push_first_env_debug_trajectories(
     env.set_debug_trajectories(
         planned[valid_plan].reshape(-1, 1, 3),
         predicted[valid_pred].reshape(-1, 1, 3),
+        planned_short[valid_plan_short].reshape(-1, 1, 3),
+        predicted_short[valid_pred_short].reshape(-1, 1, 3),
         collision,
+        planned_segment_pos_w=planned_segments,
+        predicted_segment_pos_w=predicted_segments,
     )
 
 
@@ -513,6 +538,8 @@ class DmpcExpertLogger:
         mpc_replanned = np.zeros(N, dtype=np.bool_)
         mpc_reset_mode = np.zeros(N, dtype=np.bool_)
         mpc_fallback = np.zeros(N, dtype=np.bool_)
+        mpc_collision_timestep = np.full(N, -1, dtype=np.int32)
+        mpc_collision_pos_w = np.full((N, 3), np.nan, dtype=np.float64)
 
         for i in range(N):
             st = self.expert._state.get((env_idx, i))
@@ -521,6 +548,7 @@ class DmpcExpertLogger:
             mpc_replanned[i] = bool(st.get("last_replanned", False))
             mpc_reset_mode[i] = bool(st.get("last_reset_mode", False))
             mpc_fallback[i] = bool(st.get("last_fallback", False))
+            mpc_collision_timestep[i] = int(st.get("collision_timestep", -1))
             U = st["U"]
             control_points[i] = U
             planned_ref_pos_w[i] = (self.expert.M_pos_hor @ U).reshape(K, 3) + origin
@@ -532,6 +560,11 @@ class DmpcExpertLogger:
             pred_state = pred_stack.reshape(K, 6)
             predicted_pos_w[i] = pred_state[:, :3] + origin
             predicted_vel_w[i] = pred_state[:, 3:6]
+            collision_indices = st.get("collision_sample_indices", [])
+            if collision_indices:
+                collision_idx = int(collision_indices[0])
+                if 0 <= collision_idx < K:
+                    mpc_collision_pos_w[i] = planned_ref_pos_w[i, collision_idx]
 
         ll = getattr(self.env, "_last_low_level_debug", {})
         ll_payload = {}
@@ -570,6 +603,8 @@ class DmpcExpertLogger:
                 "mpc_replanned": mpc_replanned,
                 "mpc_reset_mode": mpc_reset_mode,
                 "mpc_fallback": mpc_fallback,
+                "mpc_collision_timestep": mpc_collision_timestep,
+                "mpc_collision_pos_w": mpc_collision_pos_w.astype(np.float32),
             }
         )
 
@@ -830,7 +865,7 @@ def evaluate(
     per_drone_obs = env.get_per_drone_obs()
     returns = torch.zeros(env.num_envs, device=device)
     finished_returns: list[float] = []
-
+    print("Evaluation")
     for _ in range(n_steps):
         action_pd = policy.sample_action(per_drone_obs)             # (E, N, A)
         action_flat = action_pd.reshape(env.num_envs, N * A)        # (E, N*A)
