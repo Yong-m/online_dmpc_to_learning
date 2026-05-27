@@ -56,7 +56,7 @@ from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 
 # Per-drone observation layout sizes.
 PER_DRONE_OWN_DIM = 12   # lin_vel_b (3) + ang_vel_b (3) + projected_gravity_b (3) + goal_b (3)
-PER_NEIGHBOUR_DIM = 9    # rel_pos_b (3) + rel_vel_b (3) + neighbour_last_input_b (3)
+PER_NEIGHBOUR_DIM = 10   # rel_pos_b (3) + rel_vel_b (3) + neighbour_last_input_b (3) + r_min (1)
 
 
 def per_drone_obs_dim(num_drones: int) -> int:
@@ -173,6 +173,11 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._goal_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         # Initial positions saved at reset (handy for diagnostics).
         self._init_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+
+        # Per-drone collision radius used in the neighbour observation.
+        # Defaults to cfg.rmin for all drones; set individual entries to model
+        # obstacles as virtual agents with a larger radius.
+        self._drone_rmin = torch.full((self.N,), self.cfg.rmin, device=device)
 
         # Logging.
         self._episode_sums = {
@@ -316,6 +321,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 out[:, i, offset : offset + 3] = rel_pos_b
                 out[:, i, offset + 3 : offset + 6] = rel_vel_b
                 out[:, i, offset + 6 : offset + 9] = neigh_ref_b
+                out[:, i, offset + 9] = self._drone_rmin[j]
                 offset += PER_NEIGHBOUR_DIM
         return out
 
@@ -555,7 +561,12 @@ def _acc_to_thrust_moment_action(env: MultiDroneDmpcEnv, accel_w: torch.Tensor) 
     ang_vel_b = torch.stack([r.data.root_ang_vel_b for r in env._robots], dim=1)
     err_b = quat_rotate_inverse(quat_w.reshape(-1, 4), err_w.reshape(-1, 3)).reshape(E, N, 3)
 
-    kp_att, kd_att = 8.0, 0.6
+    # kp_att tuned so that max moment cmd (err~1 rad) stays within moment_scale:
+    #   moment_cmd_max = kp_att * 1.0  ≤  moment_scale  → kp_att ≤ 0.01
+    # Here we keep kp/kd in physical units [Nm/rad] and divide by moment_scale.
+    # Chosen so err=30° (~0.52 rad) → norm≈1.0 (just saturates at large errors).
+    kp_att = env.cfg.moment_scale * 1.9   # ~0.019 Nm/rad
+    kd_att = env.cfg.moment_scale * 0.15  # ~0.0015 Nm·s/rad
     moment_cmd = kp_att * err_b - kd_att * ang_vel_b
     norm = (moment_cmd / max(env.cfg.moment_scale, 1e-6)).clamp(-1.0, 1.0)
 

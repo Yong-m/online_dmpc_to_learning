@@ -1,4 +1,5 @@
 from .gaussian_network import GaussianNetwork
+from .neighbor_encoder import NeighborEncoder
 from .network import Network
 from .normalizer import (
     EmpiricalNormalization,
@@ -23,6 +24,7 @@ __all__ = [
     "EmpiricalMinMaxNormalizer",
     "StereographicSphereNormalizer",
     "GaussianNetwork",
+    "NeighborEncoder",
     "Network",
     "Transformer",
     "ContinuousNormalizingFlow",

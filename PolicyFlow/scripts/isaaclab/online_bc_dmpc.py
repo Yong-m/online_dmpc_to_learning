@@ -129,6 +129,8 @@ from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     MultiDroneDmpcEnv,
     MultiDroneDmpcEnvCfg,
     per_drone_obs_dim,
+    PER_DRONE_OWN_DIM,
+    PER_NEIGHBOUR_DIM,
 )
 from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
 
@@ -137,6 +139,7 @@ from policyflow_torch.modules import (  # noqa: E402
     ContinuousNormalizingFlow,
     ConditionMlp,
     FlowMlp,
+    NeighborEncoder,
 )
 from policyflow_torch.modules.normalizer import EmpiricalNormalization  # noqa: E402
 
@@ -158,15 +161,18 @@ PER_DRONE_ACTION_DIM = 3
 # ║ Decentralised per-drone flow-matching policy                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 class SharedDronePolicy(nn.Module):
-    """One PolicyFlow rectified-flow network applied independently per-drone.
+    """Per-drone flow-matching policy with a cross-attention neighbor encoder.
 
-    ``forward`` is not used at training time; the BC loop calls
-    :meth:`flow_match_loss` directly, which produces the exact rectified-flow
-    velocity-MSE loss used in ``online_bc_curobo.py``. At inference time
-    :meth:`sample_action` integrates the Heun-style ODE owned by
-    :class:`ContinuousNormalizingFlow` to draw a per-drone action.
+    Architecture:
+        per_drone_obs (P) → [own_norm | neigh_norm] → NeighborEncoder
+                         → [own(OWN_DIM) ‖ neighbor_embed(emb_dim)]
+                         → ConditionMlp → ContinuousNormalizingFlow → action(A=3)
 
-    Per-drone obs (``P``) is empirically-normalised before either branch.
+    Own-state and neighbor observations are normalised with separate
+    EmpiricalNormalization instances (each of fixed dimension), so the policy
+    generalises across different values of N without retraining the normaliser.
+    The NeighborEncoder uses cross-attention (own as query, neighbors as
+    keys/values) to produce a fixed-size embedding regardless of N.
     """
 
     def __init__(
@@ -177,18 +183,33 @@ class SharedDronePolicy(nn.Module):
         emb_dim: int,
         sample_steps: int,
         device: torch.device,
+        own_dim: int = PER_DRONE_OWN_DIM,
+        neighbor_dim: int = PER_NEIGHBOUR_DIM,
+        num_attn_heads: int = 4,
     ):
         super().__init__()
         self.P = per_drone_obs_dim
         self.A = per_drone_action_dim
+        self.own_dim = own_dim
+        self.neighbor_dim = neighbor_dim
         self.device = device
 
-        # Empirical normaliser on the per-drone obs (shape = P).
-        self.obs_norm = EmpiricalNormalization(shape=self.P, until=int(1e8))
+        # Separate normalizers so stats are independent of N.
+        self.own_norm = EmpiricalNormalization(shape=own_dim, until=int(1e8))
+        self.neigh_norm = EmpiricalNormalization(shape=neighbor_dim, until=int(1e8))
 
-        # PolicyFlow building blocks.
+        # Cross-attention: own attends over variable-length neighbor set.
+        self.neighbor_enc = NeighborEncoder(
+            own_dim=own_dim,
+            neighbor_dim=neighbor_dim,
+            emb_dim=emb_dim,
+            num_heads=num_attn_heads,
+        )
+
+        # Condition net receives [own(own_dim) ‖ neighbor_embed(emb_dim)].
+        cond_input_dim = own_dim + emb_dim
         nn_condition = ConditionMlp(
-            cond_dim=self.P,
+            cond_dim=cond_input_dim,
             emb_dim=emb_dim,
             activations=["elu"] * len(hidden_dims) + ["linear"],
             hidden_dims=hidden_dims,
@@ -208,37 +229,64 @@ class SharedDronePolicy(nn.Module):
             interpolation_type="rectified_flow",
             device=device,
         )
-        # ``ContinuousNormalizingFlow`` is not itself an nn.Module -- expose its
-        # ModuleDicts under ``self`` so ``state_dict()`` / ``.to(device)`` /
-        # ``.parameters()`` work transparently.
+        # Expose CNF ModuleDicts so state_dict() / .parameters() see them.
         self.cnf_model = self.cnf.model
         self.cnf_ema = self.cnf.model_ema
         self.cnf_last = self.cnf.model_last
 
+    # ── obs encoding ───────────────────────────────────────────────────────
+    def _encode_obs(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        """Normalize and encode a flat per-drone obs batch.
+
+        Args:
+            obs_flat: ``(B, P)`` raw (un-normalized) per-drone observations.
+
+        Returns:
+            ``(B, own_dim + emb_dim)`` condition input for the flow net.
+        """
+        B = obs_flat.shape[0]
+        own_raw = obs_flat[:, : self.own_dim]
+        neigh_raw = obs_flat[:, self.own_dim :]
+
+        own_n = self.own_norm(own_raw)
+
+        N_neigh = neigh_raw.shape[1] // self.neighbor_dim
+        if N_neigh > 0:
+            neigh_2d = neigh_raw.reshape(B * N_neigh, self.neighbor_dim)
+            neigh_n = self.neigh_norm(neigh_2d).reshape(B, N_neigh, self.neighbor_dim)
+        else:
+            neigh_n = torch.zeros(B, 0, self.neighbor_dim, device=obs_flat.device)
+
+        neighbor_embed = self.neighbor_enc(own_n, neigh_n)
+        return torch.cat([own_n, neighbor_embed], dim=-1)
+
     # ── training-side helpers ──────────────────────────────────────────────
     def update_obs_norm(self, per_drone_obs_flat: torch.Tensor) -> None:
-        self.obs_norm.update(per_drone_obs_flat.detach())
+        """Update running normalizer stats from a flat per-drone obs batch."""
+        own_raw = per_drone_obs_flat[:, : self.own_dim].detach()
+        neigh_raw = per_drone_obs_flat[:, self.own_dim :].detach()
+        self.own_norm.update(own_raw)
+        N_neigh = neigh_raw.shape[1] // self.neighbor_dim
+        if N_neigh > 0:
+            self.neigh_norm.update(neigh_raw.reshape(-1, self.neighbor_dim))
 
     def flow_match_loss(
         self,
-        obs_flat: torch.Tensor,        # (B, P)
-        action_latent: torch.Tensor,   # (B, A) -- atanh'd target
+        obs_flat: torch.Tensor,       # (B, P)
+        action_latent: torch.Tensor,  # (B, A) -- atanh'd target
     ) -> torch.Tensor:
-        """Rectified-flow velocity-MSE on a flat per-drone batch.
-
-        Matches the inner loop of ``run_bc_round`` in ``online_bc_curobo.py``.
-        """
-        obs_n = self.obs_norm(obs_flat)
+        """Rectified-flow velocity-MSE on a flat per-drone batch."""
+        cond_in = self._encode_obs(obs_flat)
         x1 = action_latent
         x0 = torch.randn_like(x1)
         t = torch.rand(x1.shape[0], device=x1.device)
         xt = (1.0 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
-        cond_emb = self.cnf.model["condition"](obs_n)
+        cond_emb = self.cnf.model["condition"](cond_in)
         vel_pred = self.cnf.model["flow"](xt, t, cond_emb)
         vel_target = (x1 - x0).detach()
         return (vel_pred - vel_target).pow(2).mean()
 
-    # ── inference: sample an action conditioned on per-drone obs ───────────
+    # ── inference ─────────────────────────────────────────────────────────
     @torch.no_grad()
     def sample_action(self, per_drone_obs: torch.Tensor) -> torch.Tensor:
         """Integrate the rectified-flow ODE to draw a per-drone action.
@@ -251,19 +299,16 @@ class SharedDronePolicy(nn.Module):
         """
         E, N, P = per_drone_obs.shape
         flat = per_drone_obs.reshape(E * N, P)
-        obs_n = self.obs_norm(flat)
-        x0 = torch.randn(obs_n.shape[0], self.A, device=obs_n.device)
-        latent, _ = self.cnf.sample(x0=x0, condition=obs_n, n_samples=obs_n.shape[0])
+        cond_in = self._encode_obs(flat)
+        x0 = torch.randn(cond_in.shape[0], self.A, device=cond_in.device)
+        latent, _ = self.cnf.sample(x0=x0, condition=cond_in, n_samples=cond_in.shape[0])
         return torch.tanh(latent).reshape(E, N, self.A)
 
-    # ── PolicyFlow bookkeeping mirroring the curobo script ─────────────────
+    # ── PolicyFlow bookkeeping ─────────────────────────────────────────────
     def step_after_optim(self) -> None:
-        """EMA update of the flow weights. Call after each optimiser step."""
         self.cnf.ema_update()
 
     def refresh_behaviour(self) -> None:
-        """Snapshot the current weights into ``model_last`` so the next BC
-        round trains against a fixed behaviour policy reference."""
         self.cnf.update()
 
 
