@@ -22,3 +22,7 @@ matlab/data/
 *.avi
 
 .vscode/
+
+*.pyc
+
+*.etli

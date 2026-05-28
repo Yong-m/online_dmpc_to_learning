@@ -12,8 +12,8 @@ Control for Multi-Robot Motion Planning" (Luis et al., RA-L 2020):
     flow-matching network on its own per-drone slice of the observation. The
     env exposes ``get_per_drone_obs() -> (E, N, P)``; we reshape to
     ``(E*N, P)``, run the shared condition + flow network, and reshape the
-    resulting per-drone action ``(E*N, A)`` (``A = 3`` -- normalised desired
-    velocity per drone) back to ``(E, N*A)`` before sending to the env. The
+    resulting per-drone action ``(E*N, A)`` (``A = 9`` -- normalised
+    ``[delta_p, v_ref, a_ref]`` per drone) back to ``(E, N*A)`` before sending to the env. The
     same weights govern every drone, which is the natural permutation-
     equivariant choice for a homogeneous team.
 
@@ -29,8 +29,8 @@ Pipeline per outer round:
 
   1. *Collect*. Roll out ``--steps_per_batch`` env steps. For every step we
      query the DMPC expert for a **world-frame position + velocity reference**
-     for *every* drone in *every* env, convert it to the env's 3-D normalised
-     velocity action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
+     for *every* drone in *every* env, convert it to the env's 9-D normalised
+     reference action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
      and store ``(per_drone_obs, atanh(per_drone_action))`` for every drone
      (each step contributes ``E * N`` BC samples).
   2. *Train*. ``--bc_epochs_per_round`` flow-matching updates on a uniform
@@ -87,6 +87,18 @@ parser.add_argument("--min_buffer_transitions", type=int, default=4_000,
 
 parser.add_argument("--eval_every_rounds", type=int, default=10)
 parser.add_argument("--eval_steps", type=int, default=200)
+parser.add_argument("--episode_length_s", type=float, default=None,
+                    help="Override env episode length in seconds for debug rollouts.")
+parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
+                    help="Start episodes at t=0 instead of randomizing episode_length_buf.")
+parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
+                    help="Disable z-bound termination for fixed-target debug rollouts.")
+parser.add_argument("--action_source", choices=["dmpc"], default="dmpc",
+                    help="Compatibility flag for run_dmpc_logged_test.sh; master supports DMPC only.")
+parser.add_argument("--dmpc_log_path", type=str, default=None,
+                    help="Optional .npz path for first-env DMPC debug logging.")
+parser.add_argument("--dmpc_log_every", type=int, default=1,
+                    help="Save one DMPC debug sample every N expert steps.")
 
 # Flow-matching / model.
 parser.add_argument("--lr", type=float, default=3e-4)
@@ -152,9 +164,9 @@ except Exception:
 
 
 # Per-drone action dimension exposed by ``MultiDroneDmpcEnv``: a normalised
-# desired-velocity command in [-1, 1]^3. The env internally turns it into the
-# 4-D thrust + moment command via its cascaded position controller.
-PER_DRONE_ACTION_DIM = 3
+# [delta_p_w, v_ref_w, a_ref_w] command in [-1, 1]^9. The env
+# unpacks it before the low-level wrench controller.
+PER_DRONE_ACTION_DIM = 9
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -346,21 +358,173 @@ class PerDroneBuffer:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ Expert wrapper: DMPC position + velocity reference → env action          ║
+# ║ Expert wrapper: DMPC position/velocity/acceleration → env action        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+def expert_reference_acceleration(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    ref_pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """Recover the acceleration sample matching the latest DMPC reference.
+
+    ``DMPCExpert.compute`` currently returns position and velocity. It also
+    keeps each agent's Bezier control points, so we sample the second
+    derivative at the same substep used for the returned reference.
+    """
+    ref_acc_w = torch.zeros_like(ref_pos_w)
+    h_total = (expert.p.k_hor - 1) * expert.p.h
+    for e in range(env.num_envs):
+        for i in range(env.cfg.num_drones):
+            st = expert._state.get((e, i))
+            if st is None:
+                continue
+            steps_before_sample = max(int(st["steps"]) - 1, 0)
+            t_sub = ((steps_before_sample % expert.n_substeps) + 1) * expert.p.ts
+            t_sub = min(t_sub, h_total)
+            ref_acc = expert.bezier.sample_matrix(np.array([t_sub]), deriv=2) @ st["U"]
+            ref_acc_w[e, i] = torch.from_numpy(ref_acc.astype(np.float32)).to(env.device)
+    return ref_acc_w
+
+
+def hover_action(
+    env: MultiDroneDmpcEnv,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
+) -> torch.Tensor:
+    """Generate a hold-position command at the reset initial position."""
+    states = env.get_world_states()
+    ref_pos_w = env._init_pos_w.clone()
+    ref_vel_w = torch.zeros_like(ref_pos_w)
+    ref_acc_w = torch.zeros_like(ref_pos_w)
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
+    return action
+
+
+def greedy_action(
+    env: MultiDroneDmpcEnv,
+    speed: float,
+    pos_gain: float,
+    step: int,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
+) -> torch.Tensor:
+    """Generate a smooth minimum-jerk trajectory from reset position to goal.
+
+    The quintic time scaling gives zero velocity and zero acceleration at
+    both endpoints. ``speed`` bounds the peak speed approximately.
+    ``pos_gain`` is kept for CLI compatibility and is not used here.
+    """
+    states = env.get_world_states()
+    init_w = env._init_pos_w
+    goal_w = states["goal_w"]
+    delta_w = goal_w - init_w
+    dist = torch.linalg.norm(delta_w, dim=-1, keepdim=True).clamp(min=1e-6)
+    # For alpha(s)=10s^3-15s^4+6s^5, max alpha_dot is 1.875 at s=0.5.
+    duration = (1.875 * dist / max(speed, 1e-6)).clamp(min=env.step_dt)
+    t = torch.full_like(dist, float(step) * env.step_dt)
+    s = (t / duration).clamp(0.0, 1.0)
+    s2 = s * s
+    s3 = s2 * s
+    s4 = s3 * s
+    s5 = s4 * s
+    alpha = 10.0 * s3 - 15.0 * s4 + 6.0 * s5
+    alpha_dot = (30.0 * s2 - 60.0 * s3 + 30.0 * s4) / duration
+    alpha_ddot = (60.0 * s - 180.0 * s2 + 120.0 * s3) / (duration * duration)
+    ref_pos_w = init_w + alpha * delta_w
+    ref_vel_w = alpha_dot * delta_w
+    ref_acc_w = alpha_ddot * delta_w
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
+    return action
+
+
+def _push_first_env_debug_trajectories(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    states: dict[str, torch.Tensor],
+) -> None:
+    """Push first-env MPC horizons to Isaac Sim debug markers."""
+    if not hasattr(env, "set_debug_trajectories"):
+        return
+    env_idx = 0
+    N = env.cfg.num_drones
+    K = expert.p.k_hor
+    device = env.device
+    origin = env._terrain.env_origins[env_idx].detach().cpu().numpy().astype(np.float64)
+    pos_w = states["pos_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+    vel_w = states["lin_vel_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+    planned_np = np.full((N, K, 3), np.nan, dtype=np.float32)
+    predicted_np = np.full((N, K, 3), np.nan, dtype=np.float32)
+    collision_points: list[np.ndarray] = []
+    for i in range(N):
+        st = expert._state.get((env_idx, i))
+        if st is None:
+            continue
+        U = st["U"]
+        planned_np[i] = ((expert.M_pos_hor @ U).reshape(K, 3) + origin).astype(np.float32)
+        x0_local = np.concatenate([pos_w[i] - origin, vel_w[i]])
+        u_samples = expert.M_pos_hor @ U
+        pred_stack = expert._A0_stack @ x0_local + expert._Lam_stack @ u_samples
+        predicted_np[i] = (pred_stack.reshape(K, 6)[:, :3] + origin).astype(np.float32)
+        for kc in st.get("collision_sample_indices", []):
+            if 0 <= int(kc) < K:
+                collision_points.append(planned_np[i, int(kc)])
+    planned = torch.from_numpy(planned_np).to(device)
+    predicted = torch.from_numpy(predicted_np).to(device)
+    valid_plan = torch.isfinite(planned).all(dim=-1)
+    valid_pred = torch.isfinite(predicted).all(dim=-1)
+    n_short = max(1, min(int(getattr(env.cfg, "debug_short_horizon_steps", 3)), K))
+    planned_short = planned[:, :n_short]
+    predicted_short = predicted[:, :n_short]
+    valid_plan_short = torch.isfinite(planned_short).all(dim=-1)
+    valid_pred_short = torch.isfinite(predicted_short).all(dim=-1)
+    planned_segments = []
+    predicted_segments = []
+    seg_ids = np.minimum((expert._times_hor / expert.bezier.T_seg).astype(np.int64), expert.bezier.l - 1)
+    for seg_idx in range(expert.bezier.l):
+        seg_indices = np.nonzero(seg_ids == seg_idx)[0].tolist()
+        if not seg_indices:
+            planned_segments.append(torch.empty(0, 1, 3, device=device))
+            predicted_segments.append(torch.empty(0, 1, 3, device=device))
+            continue
+        planned_seg = planned[:, seg_indices]
+        predicted_seg = predicted[:, seg_indices]
+        valid_planned_seg = torch.isfinite(planned_seg).all(dim=-1)
+        valid_predicted_seg = torch.isfinite(predicted_seg).all(dim=-1)
+        planned_segments.append(planned_seg[valid_planned_seg].reshape(-1, 1, 3))
+        predicted_segments.append(predicted_seg[valid_predicted_seg].reshape(-1, 1, 3))
+
+    if collision_points:
+        collision = torch.from_numpy(np.stack(collision_points, axis=0).astype(np.float32)).to(device)
+    else:
+        collision = torch.empty(0, 3, device=device)
+    env.set_debug_trajectories(
+        planned[valid_plan].reshape(-1, 1, 3),
+        predicted[valid_pred].reshape(-1, 1, 3),
+        planned_short[valid_plan_short].reshape(-1, 1, 3),
+        predicted_short[valid_pred_short].reshape(-1, 1, 3),
+        collision,
+        planned_segment_pos_w=planned_segments,
+        predicted_segment_pos_w=predicted_segments,
+    )
+
+
 def expert_action(
     env: MultiDroneDmpcEnv,
     expert: DMPCExpert,
+    debug_logger: "DmpcExpertLogger | None" = None,
+    debug_step: int = 0,
 ) -> torch.Tensor:
     """Run DMPC for every drone in every env and map its plan to the env action.
 
-    DMPC returns the paper's ``u_i`` (a position reference) together with its
-    first derivative as a feed-forward velocity. We pass both into the env's
-    cascaded P/PD position controller (:py:meth:`MultiDroneDmpcEnv.ref_to_action`)
-    which closes the inner loop and lands on the env's 3-D normalised velocity
-    command (the env then turns that into a 4-D thrust+moment internally).
+    DMPC returns the paper's ``u_i`` position-reference sample. We pack
+    that sample, its first derivative, and its second derivative into the
+    env's 9-D normalised ``[delta_p, v_ref, a_ref]`` action.
 
-    Returns ``(num_envs, num_drones * 3)``.
+    Returns ``(num_envs, num_drones * 9)``.
     """
     states = env.get_world_states()
     pos_w = states["pos_w"]
@@ -371,7 +535,135 @@ def expert_action(
     ref_pos_w, ref_vel_w = expert.plan(
         pos_w=pos_w, vel_w=vel_w, goal_w=goal_w, env_origins=origins,
     )
-    return env.ref_to_action(ref_pos_w, ref_vel_w)
+    ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
+    _push_first_env_debug_trajectories(env, expert, states)
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    if debug_logger is not None:
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
+    return action
+
+
+class DmpcExpertLogger:
+    """Collect first-env DMPC expert traces and save them as compressed NumPy arrays."""
+
+    def __init__(self, path: str, env: MultiDroneDmpcEnv, expert: DMPCExpert):
+        self.path = path
+        self.env = env
+        self.expert = expert
+        self.records: list[dict[str, np.ndarray | int]] = []
+
+    def add(
+        self,
+        step: int,
+        states: dict[str, torch.Tensor],
+        ref_pos_w: torch.Tensor,
+        ref_vel_w: torch.Tensor,
+        ref_acc_w: torch.Tensor,
+        action_flat: torch.Tensor,
+    ) -> None:
+        env_idx = 0
+        N = self.env.cfg.num_drones
+        K = self.expert.p.k_hor
+        origin = self.env._terrain.env_origins[env_idx].detach().cpu().numpy().astype(np.float64)
+        pos_w = states["pos_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        vel_w = states["lin_vel_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        goal_w = states["goal_w"][env_idx].detach().cpu().numpy().astype(np.float64)
+        action_norm = action_flat.view(self.env.num_envs, N, PER_DRONE_ACTION_DIM)[env_idx]
+        action_norm_np = action_norm.detach().cpu().numpy().astype(np.float64)
+        desired_pos_w = pos_w + action_norm_np[:, 0:3] * float(self.env.cfg.delta_pos_max)
+        desired_vel_w = action_norm_np[:, 3:6] * float(self.env.cfg.v_max)
+        desired_acc_w = action_norm_np[:, 6:9] * float(self.env.cfg.accel_action_max)
+
+        planned_ref_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        planned_ref_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        planned_ref_acc_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        predicted_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        predicted_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
+        control_points = np.full((N, self.expert.n_bez), np.nan, dtype=np.float64)
+        mpc_replanned = np.zeros(N, dtype=np.bool_)
+        mpc_reset_mode = np.zeros(N, dtype=np.bool_)
+        mpc_fallback = np.zeros(N, dtype=np.bool_)
+        mpc_collision_timestep = np.full(N, -1, dtype=np.int32)
+        mpc_collision_pos_w = np.full((N, 3), np.nan, dtype=np.float64)
+
+        for i in range(N):
+            st = self.expert._state.get((env_idx, i))
+            if st is None:
+                continue
+            mpc_replanned[i] = bool(st.get("last_replanned", False))
+            mpc_reset_mode[i] = bool(st.get("last_reset_mode", False))
+            mpc_fallback[i] = bool(st.get("last_fallback", False))
+            mpc_collision_timestep[i] = int(st.get("collision_timestep", -1))
+            U = st["U"]
+            control_points[i] = U
+            planned_ref_pos_w[i] = (self.expert.M_pos_hor @ U).reshape(K, 3) + origin
+            planned_ref_vel_w[i] = (self.expert.M_vel_hor @ U).reshape(K, 3)
+            planned_ref_acc_w[i] = (self.expert.M_acc_hor @ U).reshape(K, 3)
+            x0_local = np.concatenate([pos_w[i] - origin, vel_w[i]])
+            u_samples = self.expert.M_pos_hor @ U
+            pred_stack = self.expert._A0_stack @ x0_local + self.expert._Lam_stack @ u_samples
+            pred_state = pred_stack.reshape(K, 6)
+            predicted_pos_w[i] = pred_state[:, :3] + origin
+            predicted_vel_w[i] = pred_state[:, 3:6]
+            collision_indices = st.get("collision_sample_indices", [])
+            if collision_indices:
+                collision_idx = int(collision_indices[0])
+                if 0 <= collision_idx < K:
+                    mpc_collision_pos_w[i] = planned_ref_pos_w[i, collision_idx]
+
+        ll = getattr(self.env, "_last_low_level_debug", {})
+        ll_payload = {}
+        for key in ("acc_cmd_w", "F_des_w", "z_wb", "z_des", "e_R", "angvel_b", "tau_des_b"):
+            value = ll.get(key) if isinstance(ll, dict) else None
+            if value is None:
+                ll_payload["ll_" + key] = np.full((N, 3), np.nan, dtype=np.float32)
+            else:
+                ll_payload["ll_" + key] = value[env_idx].detach().cpu().numpy().astype(np.float32)
+        thrust_value = ll.get("thrust_b_z") if isinstance(ll, dict) else None
+        if thrust_value is None:
+            ll_payload["ll_thrust_b_z"] = np.full((N,), np.nan, dtype=np.float32)
+        else:
+            ll_payload["ll_thrust_b_z"] = thrust_value[env_idx].detach().cpu().numpy().astype(np.float32)
+
+        self.records.append(
+            {
+                **ll_payload,
+                "step": int(step),
+                "pos_w": pos_w.astype(np.float32),
+                "vel_w": vel_w.astype(np.float32),
+                "goal_w": goal_w.astype(np.float32),
+                "ref_pos_w": ref_pos_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "ref_vel_w": ref_vel_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "ref_acc_w": ref_acc_w[env_idx].detach().cpu().numpy().astype(np.float32),
+                "action_normalized": action_norm_np.astype(np.float32),
+                "desired_pos_cmd_w": desired_pos_w.astype(np.float32),
+                "desired_vel_cmd_w": desired_vel_w.astype(np.float32),
+                "desired_acc_cmd_w": desired_acc_w.astype(np.float32),
+                "planned_ref_pos_w": planned_ref_pos_w.astype(np.float32),
+                "planned_ref_vel_w": planned_ref_vel_w.astype(np.float32),
+                "planned_ref_acc_w": planned_ref_acc_w.astype(np.float32),
+                "predicted_pos_w": predicted_pos_w.astype(np.float32),
+                "predicted_vel_w": predicted_vel_w.astype(np.float32),
+                "control_points": control_points.astype(np.float32),
+                "mpc_replanned": mpc_replanned,
+                "mpc_reset_mode": mpc_reset_mode,
+                "mpc_fallback": mpc_fallback,
+                "mpc_collision_timestep": mpc_collision_timestep,
+                "mpc_collision_pos_w": mpc_collision_pos_w.astype(np.float32),
+            }
+        )
+
+    def save(self) -> None:
+        if not self.records:
+            return
+        out_dir = os.path.dirname(self.path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        keys = [k for k in self.records[0] if k != "step"]
+        payload = {"step": np.asarray([r["step"] for r in self.records], dtype=np.int64)}
+        for key in keys:
+            payload[key] = np.stack([r[key] for r in self.records], axis=0)
+        np.savez_compressed(self.path, **payload)
 
 
 def action_to_latent(action: torch.Tensor, clip: float) -> torch.Tensor:
@@ -391,6 +683,12 @@ def main():
     env_cfg = MultiDroneDmpcEnvCfg()
     env_cfg.num_drones = args_cli.num_drones
     env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
+    if args_cli.no_randomize_episode_start and hasattr(env_cfg, "randomize_episode_start"):
+        env_cfg.randomize_episode_start = False
+    if args_cli.no_terminate_on_bounds and hasattr(env_cfg, "terminate_on_bounds"):
+        env_cfg.terminate_on_bounds = False
     env_cfg.__post_init__()
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
@@ -437,6 +735,14 @@ def main():
         device=device,
     )
 
+    dmpc_logger = (
+        DmpcExpertLogger(args_cli.dmpc_log_path, env, expert)
+        if args_cli.dmpc_log_path is not None
+        else None
+    )
+    if dmpc_logger is not None:
+        print(f"[online_bc_dmpc] logging first-env DMPC traces to {args_cli.dmpc_log_path}")
+
     use_wandb = args_cli.wandb and _WANDB_AVAILABLE
     if use_wandb:
         _wandb.init(
@@ -446,12 +752,17 @@ def main():
         )
 
     env.reset(seed=args_cli.seed)
+    expert.reset()
+    if hasattr(env, "_last_reset_env_ids"):
+        env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+    last_episode_length_buf = env.episode_length_buf.clone()
     per_drone_obs = env.get_per_drone_obs()  # (E, N, P)
 
     recent_returns: deque[float] = deque(maxlen=20)
     episode_returns = torch.zeros(env.num_envs, device=device)
     round_idx = 0
     total_env_steps = 0
+    expert_collect_step = 0
     n_rounds = args_cli.n_rounds if args_cli.n_rounds > 0 else 10_000_000
 
     save_dir = os.path.dirname(args_cli.save_path)
@@ -466,7 +777,25 @@ def main():
             collect_returns: list[float] = []
             for _ in range(args_cli.steps_per_batch):
                 with torch.no_grad():
-                    action_flat = expert_action(env, expert)  # (E, N*A)
+                    # Keep the DMPC expert in lockstep with IsaacLab resets.
+                    # Normally the done branch below handles this, but this
+                    # also catches full/manual resets or env counters rewound
+                    # before this expert query.
+                    rewound = env.episode_length_buf < last_episode_length_buf
+                    if rewound.any():
+                        expert.reset(rewound.nonzero(as_tuple=False).flatten())
+                    last_episode_length_buf = env.episode_length_buf.clone()
+
+                    log_this_step = (
+                        dmpc_logger is not None
+                        and args_cli.dmpc_log_every > 0
+                        and expert_collect_step % args_cli.dmpc_log_every == 0
+                    )
+                    action_flat = expert_action(
+                        env, expert,
+                        debug_logger=dmpc_logger if log_this_step else None,
+                        debug_step=expert_collect_step,
+                    )  # (E, N*A)
 
                 action_per_drone = action_flat.view(env.num_envs, N, A)
                 act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
@@ -480,12 +809,19 @@ def main():
                 per_drone_obs = env.get_per_drone_obs()
                 episode_returns += reward
                 done = terminated | truncated
+                reset_env_ids = getattr(env, "_last_reset_env_ids", None)
+                if reset_env_ids is not None and reset_env_ids.numel() > 0:
+                    expert.reset(reset_env_ids)
+                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                elif done.any():
+                    expert.reset(done.nonzero(as_tuple=False).flatten())
                 if done.any():
                     finished = episode_returns[done].detach().cpu().tolist()
                     collect_returns.extend(finished)
                     episode_returns[done] = 0.0
-                    expert.reset(done.nonzero(as_tuple=False).flatten())
+                last_episode_length_buf = env.episode_length_buf.clone()
                 total_env_steps += env.num_envs
+                expert_collect_step += 1
             collect_dt = time.time() - t_collect
             if collect_returns:
                 recent_returns.extend(collect_returns)
@@ -512,9 +848,12 @@ def main():
             if args_cli.eval_every_rounds > 0 and round_idx % args_cli.eval_every_rounds == 0:
                 eval_metrics = evaluate(env, policy, args_cli.eval_steps, N, A)
                 env.reset()
+                expert.reset()
+                if hasattr(env, "_last_reset_env_ids"):
+                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                last_episode_length_buf = env.episode_length_buf.clone()
                 per_drone_obs = env.get_per_drone_obs()
                 episode_returns.zero_()
-                expert.reset()
 
             # ── 4. Logging + checkpointing ──────────────────────────────
             mean_ret = float(np.mean(recent_returns)) if recent_returns else float("nan")
@@ -549,6 +888,9 @@ def main():
             round_idx += 1
     finally:
         torch.save(policy.state_dict(), args_cli.save_path)
+        if dmpc_logger is not None:
+            dmpc_logger.save()
+            print(f"[online_bc_dmpc] saved DMPC log to {args_cli.dmpc_log_path}", flush=True)
         env.close()
         simulation_app.close()
 
@@ -568,7 +910,7 @@ def evaluate(
     per_drone_obs = env.get_per_drone_obs()
     returns = torch.zeros(env.num_envs, device=device)
     finished_returns: list[float] = []
-
+    print("Evaluation")
     for _ in range(n_steps):
         action_pd = policy.sample_action(per_drone_obs)             # (E, N, A)
         action_flat = action_pd.reshape(env.num_envs, N * A)        # (E, N*A)

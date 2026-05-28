@@ -10,12 +10,11 @@ env, goal-reaching) but instantiates *N* Crazyflies and aligns the action /
 observation interface with the multi-robot motion-planning setting of the
 ``online_dmpc`` paper. Design choices:
 
-* **Action = 3-D desired velocity per drone** (paper's ``u_i`` is a position
-  reference; we expose it as a normalised velocity command, which yields a
-  per-step position-reference delta of ``v_cmd * ts``). Total env action
-  dimension is ``3 * num_drones``. The env internally turns the 3-D command
-  into the standard 4-D Crazyflie thrust + moment via a cascaded P-controller
-  + differential flatness (`ref_to_action`).
+* **Action = 9-D reference command per drone**: normalised ``[delta_p_w, v_ref_w, a_ref_w]``.
+  The first three components are a world-frame position-reference delta from
+  the current position, followed by world-frame velocity and acceleration
+  feed-forward terms. Total env action dimension is ``9 * num_drones``. The
+  env unpacks this command before the low-level wrench controller.
 
 * **Per-drone observation including neighbour inputs.** ``get_per_drone_obs()``
   returns ``(num_envs, num_drones, per_drone_obs_dim)``. Each slice contains
@@ -45,13 +44,13 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_rotate_inverse, subtract_frame_transforms
+from isaaclab.utils.math import quat_rotate_inverse, subtract_frame_transforms, matrix_from_quat
 
 ##
 # Pre-defined configs
 ##
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
-from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
+from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 
 
 # Per-drone observation layout sizes.
@@ -80,10 +79,14 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     num_drones: int = 4
     episode_length_s: float = 10.0
     decimation: int = 2
-    action_space: int = 3 * 4   # 3 per drone, overwritten in __post_init__
+    action_space: int = 9 * 4   # 9 per drone, overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
+    debug_short_horizon_steps: int = 3
+    randomize_episode_start: bool = True
+    terminate_on_bounds: bool = True
+    collision_free_two_drone_reset: bool = False # For DMPC debugging
 
     ui_window_class_type = MultiDroneDmpcEnvWindow
 
@@ -129,15 +132,18 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     pos_min: tuple[float, float, float] = (-1.5, -1.5, 0.2)
     pos_max: tuple[float, float, float] = (1.5, 1.5, 2.2)
     rmin: float = 0.3
-    # Velocity normalisation for the action interface. ``action * v_max`` gives
-    # the desired world-frame velocity, and ``ref_pos_w = current_pos +
-    # desired_velocity * step_dt`` is the target tracked by the inner P loop.
-    v_max: float = 2.0
+    # Action normalisation for the reference-command interface. The per-drone
+    # action is [delta_p_w, v_ref_w, a_ref_w] in normalised [-1, 1] units.
+    delta_pos_max: float = 10.0 # 0.2
+    v_max: float = 5.0 #2.0
+    accel_action_max: float = 2.0 #1.0
 
     # ── position-reference tracker gains ──
-    pos_track_kp: float = 6.0
-    pos_track_kd: float = 4.5
-    track_accel_clip: float = 4.0
+    pos_track_kp: float = 8.0 #5.0 #6.0
+    pos_track_kd: float = 16.0 #4.5
+    track_accel_clip: float = 4.0 # 4.0 #(of no use now)
+    att_track_kp: float = 0.01
+    att_track_kd: float = 0.0008
 
     # ── reward scales ──
     lin_vel_reward_scale: float = -0.05
@@ -148,7 +154,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     z_max: float = 2.5
 
     def __post_init__(self):
-        self.action_space = 3 * self.num_drones
+        self.action_space = 9 * self.num_drones
         self.observation_space = self.num_drones * per_drone_obs_dim(self.num_drones)
 
 
@@ -161,10 +167,12 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self.per_drone_obs_dim = per_drone_obs_dim(self.N)
         device = self.device
 
-        # Per-drone normalised desired velocity action and a buffer of the
-        # most-recent reference velocity ``v_cmd_w`` actually applied.
-        self._actions = torch.zeros(self.num_envs, self.N, 3, device=device)
+        # Per-drone normalised [delta_p_w, v_ref_w, a_ref_w] action and
+        # buffers of the most-recent unpacked reference command.
+        self._actions = torch.zeros(self.num_envs, self.N, 9, device=device)
+        self._last_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_vel_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        self._last_ref_acc_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         # Per-drone thrust / moment buffers ultimately applied to PhysX.
         self._thrust = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
         self._moment = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
@@ -178,6 +186,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # Defaults to cfg.rmin for all drones; set individual entries to model
         # obstacles as virtual agents with a larger radius.
         self._drone_rmin = torch.full((self.N,), self.cfg.rmin, device=device)
+
+        # First-env live DMPC horizon visualization buffers. Shapes are
+        # (num_drones, horizon, 3); empty until the expert pushes a plan.
+        self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_planned_short_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_predicted_short_pos_w = torch.empty(0, self.N, 3, device=device)
+        self._debug_planned_segment_pos_w = []
+        self._debug_predicted_segment_pos_w = []
+        self._debug_collision_pos_w = torch.empty(0, 3, device=device)
+        self._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
         # Logging.
         self._episode_sums = {
@@ -220,32 +239,35 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
     # ── physics step ───────────────────────────────────────────────────────
     def _pre_physics_step(self, actions: torch.Tensor):
-        """``actions`` is ``(num_envs, 3 * num_drones)`` of normalised desired
-        velocities in ``[-1, 1]^3`` per drone. We turn it into a position
-        reference one ``step_dt`` ahead of the current state, run the cascaded
-        P-controller in :py:meth:`ref_to_action`, and stash the world-frame
-        reference velocity so neighbours can observe it next step."""
-        a = actions.view(self.num_envs, self.N, 3).clamp(-1.0, 1.0)
-        self._actions = a.clone()
-        v_cmd_w = a * self.cfg.v_max                          # (E, N, 3)
-        self._last_ref_vel_w = v_cmd_w.detach().clone()
+        """Unpack normalised ``[delta_p_w, v_ref_w, a_ref_w]`` commands.
 
-        # Convert to a 4-D thrust + moment command via the position-tracking
-        # cascade. ref_pos_w is one control step ahead of the current state.
+        The low-level wrench controller consumes the resulting world-frame
+        position, velocity, and acceleration references. The acceleration term
+        is currently passed through for the controller implementation work.
+        """
+        a = actions.view(self.num_envs, self.N, 9).clamp(-1.0, 1.0)
+        self._actions = a.clone()
+
         st = self._stack_drone_state()
         pos_w = st["pos_w"]
-        ref_pos_w = pos_w + v_cmd_w * self.step_dt
-        thrust_moment = self._ref_to_thrust_moment(ref_pos_w, v_cmd_w)
-        a4 = thrust_moment  # (E, N, 4)
-        self._thrust[:, :, 0, 2] = (
-            self.cfg.thrust_to_weight * self._robot_weight * (a4[:, :, 0] + 1.0) / 2.0
-        )
-        self._moment[:, :, 0, :] = self.cfg.moment_scale * a4[:, :, 1:]
+        delta_pos_w = a[..., 0:3] * self.cfg.delta_pos_max
+        ref_vel_w = a[..., 3:6] * self.cfg.v_max
+        ref_acc_w = a[..., 6:9] * self.cfg.accel_action_max
+        ref_pos_w = pos_w + delta_pos_w
+
+        self._last_ref_pos_w = ref_pos_w.detach().clone()
+        self._last_ref_vel_w = ref_vel_w.detach().clone()
+        self._last_ref_acc_w = ref_acc_w.detach().clone()
+
+        ### Low-level controller
+        wrench_b = self._ref_to_thrust_moment(ref_pos_w, ref_vel_w, ref_acc_w)  # physical [N, N*m]
+        self._thrust[:, :, 0, 2] = wrench_b[:, :, 0]
+        self._moment[:, :, 0, :] = wrench_b[:, :, 1:]
 
     def _apply_action(self):
         for i, robot in enumerate(self._robots):
             robot.set_external_force_and_torque(
-                self._thrust[:, i], self._moment[:, i], body_ids=self._body_id, is_local=True
+                self._thrust[:, i], self._moment[:, i], body_ids=self._body_id, is_global=False
             )
 
     # ── observation helpers ────────────────────────────────────────────────
@@ -368,13 +390,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         pos_w = torch.stack([r.data.root_pos_w for r in self._robots], dim=1)
         z = pos_w[..., 2]
-        died = ((z < self.cfg.z_min) | (z > self.cfg.z_max)).any(dim=-1)
+        if self.cfg.terminate_on_bounds:
+            died = ((z < self.cfg.z_min) | (z > self.cfg.z_max)).any(dim=-1)
+        else:
+            died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         return died, time_out
 
     # ── resets ─────────────────────────────────────────────────────────────
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robots[0]._ALL_INDICES
+        self._last_reset_env_ids = env_ids.detach().clone()
 
         pos_w = torch.stack([r.data.root_pos_w for r in self._robots], dim=1)
         final_dist = torch.linalg.norm(self._goal_pos_w[env_ids] - pos_w[env_ids], dim=-1).mean()
@@ -397,25 +423,35 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         for robot in self._robots:
             robot.reset(env_ids)
         super()._reset_idx(env_ids)
-        if len(env_ids) == self.num_envs:
+        if len(env_ids) == self.num_envs and self.cfg.randomize_episode_start:
             self.episode_length_buf = torch.randint_like(
                 self.episode_length_buf, high=int(self.max_episode_length)
             )
 
         self._actions[env_ids] = 0.0
+        self._last_ref_pos_w[env_ids] = 0.0
         self._last_ref_vel_w[env_ids] = 0.0
+        self._last_ref_acc_w[env_ids] = 0.0
 
         # Random-exchange scenario (DMPC paper Section IV/VI): each drone on
         # one side of a random circle, goal on the diametrically opposite side.
         n = len(env_ids)
         device = self.device
-        radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
-        theta0 = torch.empty(n, self.N, device=device).uniform_(0.0, 2.0 * torch.pi)
-        z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+        if self.N == 2 and self.cfg.collision_free_two_drone_reset:
+            init_xy = torch.tensor([[-1.0, -0.55], [-1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
+            goal_xy = torch.tensor([[1.0, -0.55], [1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
+            z0 = torch.ones(n, self.N, device=device)
+            zg = torch.ones(n, self.N, device=device)
+        else:
+            radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
+            theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
+            theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
+            theta0 = theta_base + theta_offsets
+            z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
 
-        init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
-        goal_xy = -init_xy
-        zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+            init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
+            goal_xy = -init_xy
+            zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
 
         origins = self._terrain.env_origins[env_ids]
         init_pos = torch.cat([init_xy, z0.unsqueeze(-1)], dim=-1)
@@ -431,6 +467,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             default_root[:, :3] = init_pos[:, i]
             joint_pos = robot.data.default_joint_pos[env_ids]
             joint_vel = robot.data.default_joint_vel[env_ids]
+            # joint_vel = torch.zeros_like(robot.data.default_joint_vel[env_ids])
             robot.write_root_pose_to_sim(default_root[:, :7], env_ids)
             robot.write_root_velocity_to_sim(default_root[:, 7:], env_ids)
             robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -440,76 +477,188 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         """World-frame states + goals used by :class:`DMPCExpert`."""
         st = self._stack_drone_state()
         st["goal_w"] = self._goal_pos_w
+        st["last_ref_pos_w"] = self._last_ref_pos_w
         st["last_ref_vel_w"] = self._last_ref_vel_w
+        st["last_ref_acc_w"] = self._last_ref_acc_w
         return st
 
-    def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
-        """Convert a desired *world-frame velocity command* into the env's
-        normalised 3-D action ``[-1, 1]^3`` per drone.
+    def reference_to_action(
+        self,
+        ref_pos_w: torch.Tensor,
+        ref_vel_w: torch.Tensor | None = None,
+        ref_acc_w: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Pack world-frame ``[delta_p, v_ref, a_ref]`` into normalised action.
 
         Args:
-            v_cmd_w: ``(num_envs, num_drones, 3)`` in m/s.
+            ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions.
+            ref_vel_w: optional desired velocities in m/s.
+            ref_acc_w: optional desired accelerations in m/s^2.
 
         Returns:
-            ``(num_envs, num_drones * 3)`` action tensor in ``[-1, 1]``.
+            ``(num_envs, num_drones * 9)`` action tensor in ``[-1, 1]``.
         """
-        E, N = v_cmd_w.shape[0], v_cmd_w.shape[1]
-        norm = (v_cmd_w / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
-        return norm.reshape(E, N * 3)
+        st = self._stack_drone_state()
+        pos_w = st["pos_w"]
+        if ref_vel_w is None:
+            ref_vel_w = torch.zeros_like(ref_pos_w)
+        if ref_acc_w is None:
+            ref_acc_w = torch.zeros_like(ref_pos_w)
+        E, N = ref_pos_w.shape[0], ref_pos_w.shape[1]
+        delta_norm = ((ref_pos_w - pos_w) / max(self.cfg.delta_pos_max, 1e-6)).clamp(-1.0, 1.0)
+        vel_norm = (ref_vel_w / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
+        acc_norm = (ref_acc_w / max(self.cfg.accel_action_max, 1e-6)).clamp(-1.0, 1.0)
+        return torch.cat([delta_norm, vel_norm, acc_norm], dim=-1).reshape(E, N * 9)
+
+    def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
+        """Compatibility helper: pack velocity-only commands with zero acceleration."""
+        st = self._stack_drone_state()
+        ref_pos_w = st["pos_w"] + v_cmd_w * self.step_dt
+        return self.reference_to_action(ref_pos_w, v_cmd_w, torch.zeros_like(v_cmd_w))
 
     def ref_to_action(
         self,
         ref_pos_w: torch.Tensor,
         ref_vel_w: torch.Tensor | None = None,
+        ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Convert a *world-frame position reference* (and optional velocity
-        reference) into the env's normalised 3-D velocity action.
-
-        The env's pre-physics step interprets the action as ``v_cmd_w = a *
-        v_max`` and sets ``ref_pos_internal = pos_w + v_cmd_w * step_dt``. The
-        natural inverse is therefore ``v_cmd_w = (ref_pos_w - pos_w) / step_dt``;
-        if ``ref_vel_w`` is supplied we blend the two so the inner P-controller
-        also receives a non-trivial feed-forward velocity. This is the function
-        the DMPC expert calls to drop its position-reference plan into the env.
-
-        Args:
-            ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions.
-            ref_vel_w: ``(num_envs, num_drones, 3)`` optional feed-forward
-                velocity. When given, the command is the average of the
-                position-based command and ``ref_vel_w`` so that fast straight-
-                line tracking still works when the position error is small.
-
-        Returns:
-            ``(num_envs, num_drones * 3)`` action tensor in ``[-1, 1]``.
-        """
-        st = self._stack_drone_state()
-        pos_w = st["pos_w"]
-        step_dt = self.step_dt
-        v_from_pos = (ref_pos_w - pos_w) / max(step_dt, 1e-6)
-        if ref_vel_w is None:
-            v_cmd_w = v_from_pos
-        else:
-            v_cmd_w = 0.5 * (v_from_pos + ref_vel_w)
-        return self.velocity_to_action(v_cmd_w)
+        """Alias for :meth:`reference_to_action` used by the DMPC expert."""
+        return self.reference_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
 
     # ── internal: cascaded position controller -> thrust/moment ────────────
     def _ref_to_thrust_moment(
-        self, ref_pos_w: torch.Tensor, ref_vel_w: torch.Tensor | None = None
+        self,
+        ref_pos_w: torch.Tensor,
+        ref_vel_w: torch.Tensor | None = None,
+        ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Cascaded P-controller (paper Fig. 2 inner loop) + differential
-        flatness. Returns ``(E, N, 4)`` normalised thrust + moment commands."""
+        flatness. Returns physical body-frame ``[force_z_N, tau_x, tau_y, tau_z]``."""
         st = self._stack_drone_state()
         pos_w = st["pos_w"]
         vel_w = st["lin_vel_w"]
+        quat_w = st["quat_w"]
+        angvel_b = st["ang_vel_b"]
+
         if ref_vel_w is None:
             ref_vel_w = torch.zeros_like(ref_pos_w)
-        desired_accel = (
+        if ref_acc_w is None:
+            ref_acc_w = torch.zeros_like(ref_pos_w)
+        rot_wb = matrix_from_quat(quat_w)  # (E, N, 3, 3)
+
+        # yaw_des = torch.atan2(ref_vel_w[..., 1], ref_vel_w[..., 0])
+        yaw_des = torch.zeros_like(ref_vel_w[..., 0])
+    
+        # Simplified geometric controller (Mellinger & Kumar 2011)
+        # thrust
+        acc_cmd_w = (
             self.cfg.pos_track_kp * (ref_pos_w - pos_w)
             + self.cfg.pos_track_kd * (ref_vel_w - vel_w)
+            + ref_acc_w
         )
-        clip = self.cfg.track_accel_clip
-        desired_accel = desired_accel.clamp(-clip, clip)
-        return _acc_to_thrust_moment_action(self, desired_accel)
+        F_des_w = self._robot_mass * (
+            acc_cmd_w + self._gravity_magnitude * torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        ) # (E, N, 3)
+        z_wb = rot_wb[:, :, :, 2]  # (E, N, 3)
+        f = torch.einsum("...i,...i->...", F_des_w, z_wb)  # (E, N), desired thrust magnitude
+        # max_thrust = self.cfg.thrust_to_weight * self._robot_weight
+        # f = f.clamp(0.0, max_thrust)
+        # Temporarily leave thrust unclipped while debugging the ideal wrench controller.
+
+        # attitude
+        z_des = F_des_w / torch.norm(F_des_w, dim=-1, keepdim=True).clamp(min=1e-6)  # (E, N, 3)
+        x_c = torch.stack([torch.cos(yaw_des), torch.sin(yaw_des), torch.zeros_like(yaw_des)], dim=-1)  # (E, N, 3)
+        y_c = torch.cross(z_des, x_c, dim=-1)  # (E, N, 3)
+        y_des = y_c / torch.norm(y_c, dim=-1, keepdim=True).clamp(min=1e-6)  # (E, N, 3)
+        x_des = torch.cross(y_des, z_des, dim=-1)  # (E, N, 3)
+        rot_des = torch.stack([x_des, y_des, z_des], dim=-1)  # (E, N, 3, 3)
+
+        def vee(S: torch.Tensor) -> torch.Tensor:
+            return torch.stack(
+                [S[..., 2, 1], S[..., 0, 2], S[..., 1, 0]],
+                dim=-1,
+            )
+
+        e_R = vee(0.5 * (torch.einsum("...ij,...ik->...jk", rot_des, rot_wb) - torch.einsum("...ij,...ik->...jk", rot_wb, rot_des))) # (E, N, 3)
+        e_w = angvel_b # set desired angular velocity to zero for now
+
+        tau_des_b = -self.cfg.att_track_kp * e_R - self.cfg.att_track_kd * e_w  # (E, N, 3)
+        # tau_des_b = - self.cfg.att_track_kp * e_R
+        # tau_des_b = torch.zeros_like(e_R)  # placeholder while we iterate on the controller implementation
+        self._last_low_level_debug = {
+            "acc_cmd_w": acc_cmd_w.detach().clone(),
+            "F_des_w": F_des_w.detach().clone(),
+            "thrust_b_z": f.detach().clone(),
+            "z_wb": z_wb.detach().clone(),
+            "z_des": z_des.detach().clone(),
+            "e_R": e_R.detach().clone(),
+            "angvel_b": angvel_b.detach().clone(),
+            "tau_des_b": tau_des_b.detach().clone(),
+        }
+        return torch.cat([f.unsqueeze(-1), tau_des_b], dim=-1)  # (E, N, 4)
+
+        # #########
+
+        # # ref_acc_w is intentionally accepted but not yet used here; this is
+        # # the hook for the physical wrench controller update.
+        # desired_accel = (
+        #     self.cfg.pos_track_kp * (ref_pos_w - pos_w)
+        #     + self.cfg.pos_track_kd * (ref_vel_w - vel_w)
+        # )
+        # clip = self.cfg.track_accel_clip
+        # desired_accel = desired_accel.clamp(-clip, clip)
+        # return _acc_to_thrust_moment_action(self, desired_accel)
+
+    # ── live MPC debug visualization ───────────────────────────────────────
+    def set_debug_trajectories(
+        self,
+        planned_pos_w: torch.Tensor | None = None,
+        predicted_pos_w: torch.Tensor | None = None,
+        planned_short_pos_w: torch.Tensor | None = None,
+        predicted_short_pos_w: torch.Tensor | None = None,
+        collision_pos_w: torch.Tensor | None = None,
+        planned_segment_pos_w: list[torch.Tensor] | None = None,
+        predicted_segment_pos_w: list[torch.Tensor] | None = None,
+    ) -> None:
+        """Update first-env MPC horizon markers.
+
+        Args:
+            planned_pos_w: ``(N, K, 3)`` planned reference positions.
+            predicted_pos_w: ``(N, K, 3)`` predicted state positions.
+            planned_short_pos_w: early planned reference samples to color separately.
+            predicted_short_pos_w: early predicted state samples to color separately.
+            collision_pos_w: ``(M, 3)`` predicted collision points.
+            planned_segment_pos_w: planned-reference samples grouped by Bezier segment.
+            predicted_segment_pos_w: predicted-state samples grouped by Bezier segment.
+        """
+        if planned_pos_w is None:
+            self._debug_planned_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_planned_pos_w = planned_pos_w.detach().to(self.device).clone()
+        if predicted_pos_w is None:
+            self._debug_predicted_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_predicted_pos_w = predicted_pos_w.detach().to(self.device).clone()
+        if planned_short_pos_w is None:
+            self._debug_planned_short_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_planned_short_pos_w = planned_short_pos_w.detach().to(self.device).clone()
+        if predicted_short_pos_w is None:
+            self._debug_predicted_short_pos_w = torch.empty(0, self.N, 3, device=self.device)
+        else:
+            self._debug_predicted_short_pos_w = predicted_short_pos_w.detach().to(self.device).clone()
+        if planned_segment_pos_w is None:
+            self._debug_planned_segment_pos_w = []
+        else:
+            self._debug_planned_segment_pos_w = [p.detach().to(self.device).clone() for p in planned_segment_pos_w]
+        if predicted_segment_pos_w is None:
+            self._debug_predicted_segment_pos_w = []
+        else:
+            self._debug_predicted_segment_pos_w = [p.detach().to(self.device).clone() for p in predicted_segment_pos_w]
+        if collision_pos_w is None:
+            self._debug_collision_pos_w = torch.empty(0, 3, device=self.device)
+        else:
+            self._debug_collision_pos_w = collision_pos_w.detach().to(self.device).clone()
 
     # ── debug viz ──────────────────────────────────────────────────────────
     def _set_debug_vis_impl(self, debug_vis: bool):
@@ -520,12 +669,80 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 marker_cfg.prim_path = "/Visuals/Command/multi_drone_goal"
                 self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
             self.goal_pos_visualizer.set_visibility(True)
+            if not hasattr(self, "mpc_plan_visualizer"):
+                plan_cfg = SPHERE_MARKER_CFG.copy()
+                plan_cfg.markers["sphere"].radius = 0.01
+                plan_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.55, 0.0)
+                plan_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_plan"
+                self.mpc_plan_visualizer = VisualizationMarkers(plan_cfg)
+            if not hasattr(self, "mpc_pred_visualizer"):
+                pred_cfg = SPHERE_MARKER_CFG.copy()
+                pred_cfg.markers["sphere"].radius = 0.008
+                pred_cfg.markers["sphere"].visual_material.diffuse_color = (0.55, 0.25, 1.0)
+                pred_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_prediction"
+                self.mpc_pred_visualizer = VisualizationMarkers(pred_cfg)
+            if not hasattr(self, "mpc_plan_segment_visualizers"):
+                plan_colors = [(0.0, 0.9, 1.0), (1.0, 0.85, 0.0), (1.0, 0.2, 0.75)]
+                pred_colors = [(0.1, 1.0, 0.25), (0.35, 0.65, 1.0), (0.85, 0.45, 1.0)]
+                self.mpc_plan_segment_visualizers = []
+                self.mpc_pred_segment_visualizers = []
+                for seg_idx, color in enumerate(plan_colors):
+                    seg_cfg = SPHERE_MARKER_CFG.copy()
+                    seg_cfg.markers["sphere"].radius = 0.018
+                    seg_cfg.markers["sphere"].visual_material.diffuse_color = color
+                    seg_cfg.prim_path = f"/Visuals/Command/multi_drone_mpc_plan_segment_{seg_idx}"
+                    self.mpc_plan_segment_visualizers.append(VisualizationMarkers(seg_cfg))
+                for seg_idx, color in enumerate(pred_colors):
+                    seg_cfg = SPHERE_MARKER_CFG.copy()
+                    seg_cfg.markers["sphere"].radius = 0.014
+                    seg_cfg.markers["sphere"].visual_material.diffuse_color = color
+                    seg_cfg.prim_path = f"/Visuals/Command/multi_drone_mpc_prediction_segment_{seg_idx}"
+                    self.mpc_pred_segment_visualizers.append(VisualizationMarkers(seg_cfg))
+            self.mpc_plan_visualizer.set_visibility(True)
+            self.mpc_pred_visualizer.set_visibility(True)
+            for visualizer in self.mpc_plan_segment_visualizers:
+                visualizer.set_visibility(True)
+            for visualizer in self.mpc_pred_segment_visualizers:
+                visualizer.set_visibility(True)
+            if not hasattr(self, "mpc_collision_visualizer"):
+                coll_cfg = SPHERE_MARKER_CFG.copy()
+                coll_cfg.markers["sphere"].radius = 0.012
+                coll_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
+                coll_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_collision"
+                self.mpc_collision_visualizer = VisualizationMarkers(coll_cfg)
+            self.mpc_collision_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_pos_visualizer"):
                 self.goal_pos_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_plan_visualizer"):
+                self.mpc_plan_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_pred_visualizer"):
+                self.mpc_pred_visualizer.set_visibility(False)
+            if hasattr(self, "mpc_plan_segment_visualizers"):
+                for visualizer in self.mpc_plan_segment_visualizers:
+                    visualizer.set_visibility(False)
+            if hasattr(self, "mpc_pred_segment_visualizers"):
+                for visualizer in self.mpc_pred_segment_visualizers:
+                    visualizer.set_visibility(False)
+            if hasattr(self, "mpc_collision_visualizer"):
+                self.mpc_collision_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         self.goal_pos_visualizer.visualize(self._goal_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_plan_visualizer") and self._debug_planned_pos_w.numel() > 0:
+            self.mpc_plan_visualizer.visualize(self._debug_planned_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_pred_visualizer") and self._debug_predicted_pos_w.numel() > 0:
+            self.mpc_pred_visualizer.visualize(self._debug_predicted_pos_w.reshape(-1, 3))
+        if hasattr(self, "mpc_plan_segment_visualizers"):
+            for visualizer, points in zip(self.mpc_plan_segment_visualizers, self._debug_planned_segment_pos_w):
+                if points.numel() > 0:
+                    visualizer.visualize(points.reshape(-1, 3))
+        if hasattr(self, "mpc_pred_segment_visualizers"):
+            for visualizer, points in zip(self.mpc_pred_segment_visualizers, self._debug_predicted_segment_pos_w):
+                if points.numel() > 0:
+                    visualizer.visualize(points.reshape(-1, 3))
+        if hasattr(self, "mpc_collision_visualizer") and self._debug_collision_pos_w.numel() > 0:
+            self.mpc_collision_visualizer.visualize(self._debug_collision_pos_w.reshape(-1, 3))
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -561,13 +778,7 @@ def _acc_to_thrust_moment_action(env: MultiDroneDmpcEnv, accel_w: torch.Tensor) 
     ang_vel_b = torch.stack([r.data.root_ang_vel_b for r in env._robots], dim=1)
     err_b = quat_rotate_inverse(quat_w.reshape(-1, 4), err_w.reshape(-1, 3)).reshape(E, N, 3)
 
-    # kp_att tuned so that max moment cmd (err~1 rad) stays within moment_scale:
-    #   moment_cmd_max = kp_att * 1.0  ≤  moment_scale  → kp_att ≤ 0.01
-    # Here we keep kp/kd in physical units [Nm/rad] and divide by moment_scale.
-    # Chosen so err=30° (~0.52 rad) → norm≈1.0 (just saturates at large errors).
-    kp_att = env.cfg.moment_scale * 1.9   # ~0.019 Nm/rad
-    kd_att = env.cfg.moment_scale * 0.15  # ~0.0015 Nm·s/rad
-    moment_cmd = kp_att * err_b - kd_att * ang_vel_b
+    moment_cmd = env.cfg.att_track_kp * err_b - env.cfg.att_track_kd * ang_vel_b
     norm = (moment_cmd / max(env.cfg.moment_scale, 1e-6)).clamp(-1.0, 1.0)
 
     return torch.stack([a0, norm[..., 0], norm[..., 1], norm[..., 2]], dim=-1)

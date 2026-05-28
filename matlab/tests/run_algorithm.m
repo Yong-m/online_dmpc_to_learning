@@ -164,21 +164,21 @@ for k = 2:K
         u = x(1:size(mat_f_x0_free, 2));
      
         % Apply input to model starting form our previous init condition
-        pos_i = vec2mat(Phi*u + A0.pos*X0(:,i),3)';
-        vel_i = vec2mat(Phi_vel*u + A0.vel*X0(:,i),3)';
+        pos_i = reshape(Phi*u + A0.pos*X0(:,i),3,[]);
+        vel_i = reshape(Phi_vel*u + A0.vel*X0(:,i),3,[]);
         
         % Sample at a higher frequency the interval 0:Ts:h-Ts
         % This tells us what should be the value of our state after
         % sending the optimal commands if the model was perfect
-        pos_i_sample = vec2mat(Phi_sample*u + A0_s.pos*X0(:,i),3)';
-        vel_i_sample = vec2mat(Phi_vel_sample*u + A0_s.vel*X0(:,i),3)';
+        pos_i_sample = reshape(Phi_sample*u + A0_s.pos*X0(:,i),3,[]);
+        vel_i_sample = reshape(Phi_vel_sample*u + A0_s.vel*X0(:,i),3,[]);
         
         % Sample the resulting reference Bezier curves at 1/h and 1/Ts
         % Get the next input to be applied 'X0_ref'
         cols = 2 + (k-2)*(h/Ts):1 + (k-1)*(h/Ts);
         for r = 1:d+1
-            rth_ref(:,:,r) = vec2mat(Der_h{r}*u, 3)';
-            rth_ref_sample(:,:,r) = vec2mat(Der_ts{r}*u, 3)';
+            rth_ref(:,:,r) = reshape(Der_h{r}*u, 3,[]);
+            rth_ref_sample(:,:,r) = reshape(Der_ts{r}*u, 3,[]);
             X0_ref(:,r,i) = rth_ref(:,2,r);
             ref(:,k,r,i) = rth_ref(:,2,r);
             ref_sample(:,cols,r,i) = rth_ref_sample(:,:,r);
