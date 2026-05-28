@@ -91,6 +91,8 @@ import scipy.sparse as sp
 import torch
 from scipy.special import comb, factorial
 
+from typing import Dict, List
+
 try:
     import osqp
 except ImportError as e:  # pragma: no cover
@@ -140,13 +142,14 @@ class DMPCParams:
     s_obs: float = 100.0
     spd_o: int = 1
     acc_cost: float = 1.0 #10.0 #8e-3
-    lin_coll: float = -1.0e5
-    quad_coll: float = 1.0
+    lin_coll: float = -1.0e2 #-1.0e5
+    quad_coll: float = 1.0 #1.0
 
     # Collision parameters
     rmin: float = 0.5 #0.3
     height_scaling: float = 2.0
     g_factor: float = 2.0
+    # height_scaling_obs: float = 4.0
 
     # Event-triggered replanning
     f_min: float = -0.01
@@ -154,9 +157,9 @@ class DMPCParams:
     eps_velocity: float = 0.01
 
     # OSQP options
-    osqp_eps_abs: float = 1e-3
-    osqp_eps_rel: float = 1e-3
-    osqp_max_iter: int = 200 #200
+    osqp_eps_abs: float = 1e-2 # 1e-3
+    osqp_eps_rel: float = 1e-2 # 1e-3
+    osqp_max_iter: int = 400 #200
     osqp_polish: bool = False
 
 
@@ -302,8 +305,9 @@ class DMPCExpert:
     multiple agents, plus a method to evaluate the trajectory at the env
     control rate via :py:meth:`compute`."""
 
-    def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu"):
+    def __init__(self, num_drones: int, num_envs: int, params: DMPCParams | None = None, device="cpu"):
         self.N = num_drones
+        self.E = num_envs
         self.p = params or DMPCParams()
         if self.p.t_segment is None:
             self.p.t_segment = (self.p.k_hor - 1) * self.p.h / self.p.num_segments
@@ -426,6 +430,67 @@ class DMPCExpert:
             c = s * self.bezier.n_per_seg
             H[c : c + self.bezier.n_per_seg, c : c + self.bezier.n_per_seg] = seg_H
         return H
+    
+    def _precompute_static_obstacle_coeffs(self, obstacle_info: Dict | None):
+        # Precompute coefficients (e.g., covering ellipsoid) as obstacle support grows.
+        self._obstacle_info = obstacle_info
+        self._num_static_obstacles = 0
+        self._obstacle_pos_w = None
+        self._obstacle_pos_local = None
+
+        if obstacle_info is None:
+            return
+
+        obstacle_pos_w = obstacle_info.get("ellipsoid_pos_w", obstacle_info.get("pos_w"))
+        if obstacle_pos_w is None:
+            return
+
+        self._num_static_obstacles = int(obstacle_pos_w.shape[1])
+        self._obstacle_pos_w = obstacle_pos_w.detach().cpu().numpy()
+
+        params = obstacle_info.get("params", {})
+        ellipsoid_axes = params.get("ellipsoid_axes")
+        if ellipsoid_axes is not None:
+            ellipsoid_axes = np.asarray(ellipsoid_axes, dtype=np.float64)
+            if ellipsoid_axes.ndim == 1:
+                ellipsoid_axes = np.tile(ellipsoid_axes[None, :], (self._num_static_obstacles, 1))
+            if ellipsoid_axes.shape[0] != self._num_static_obstacles:
+                repeats = int(np.ceil(self._num_static_obstacles / max(ellipsoid_axes.shape[0], 1)))
+                ellipsoid_axes = np.tile(ellipsoid_axes, (repeats, 1))[: self._num_static_obstacles]
+            theta_inv = np.zeros((self.E, self._num_static_obstacles, 3, 3), dtype=np.float64)
+            for j in range(self._num_static_obstacles):
+                theta_inv[:, j, :, :] = np.diag(1.0 / np.maximum(ellipsoid_axes[j], 1e-6))
+            self._obs_theta_inv = theta_inv
+            self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
+            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+            return
+
+        shape_name = obstacle_info.get("shape_name")
+        if shape_name == "SphereCfg":
+            # TODO: set heterogeneous obstacles & parse info.
+            self._obs_theta_inv = np.asarray(
+                [[np.eye(3) for _ in range(self._num_static_obstacles)] for _ in range(self.E)]
+            )
+            self._obs_rmin = np.asarray(
+                [[params.get("radius") + 0.25 for _ in range(self._num_static_obstacles)] for _ in range(self.E)]
+            )
+            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+        elif shape_name == "CuboidCfg":
+            size = np.asarray(params.get("size"), dtype=np.float64)
+            # Fallback: cover each cuboid by one ellipsoid. Prefer the split
+            # ellipsoid set above for narrow passages.
+            margin = float(params.get("ellipsoid_margin", 0.25))
+            semi_axes = np.sqrt(3.0) * 0.5 * size + margin
+            theta_inv = np.diag(1.0 / np.maximum(semi_axes, 1e-6))
+            self._obs_theta_inv = np.tile(
+                theta_inv[None, None, :, :],
+                (self.E, self._num_static_obstacles, 1, 1),
+            )
+            self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
+            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+        else:
+            # TODO: support other shapes
+            raise NotImplementedError(f"Unsupported obstacle type: {shape_name}")
 
     # ───────────────────────────────────────────────────────────────────
     # Public API
@@ -471,10 +536,13 @@ class DMPCExpert:
             origins_np = env_origins.detach().cpu().numpy().astype(np.float64)
             pos_np_local = pos_np - origins_np[:, None, :]
             goal_np_local = goal_np - origins_np[:, None, :]
+            if self._obstacle_pos_w is not None:
+                self._obstacle_pos_local = self._obstacle_pos_w - origins_np[:, None, :]
         else:
             origins_np = None
             pos_np_local = pos_np
             goal_np_local = goal_np
+            self._obstacle_pos_local = self._obstacle_pos_w
 
         ts = self.p.ts
         h_total = (self.p.k_hor - 1) * self.p.h
@@ -535,8 +603,9 @@ class DMPCExpert:
         notation prefer "plan" -- semantically identical."""
         return self.compute(*args, **kwargs)
 
-    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+    def reset(self, obstacle_info: Dict | None = None, env_ids: torch.Tensor | None = None) -> None:
         """Drop per-agent cached state for the given envs (all by default)."""
+        self._precompute_static_obstacle_coeffs(obstacle_info)
         if env_ids is None:
             self._state.clear()
             return
@@ -587,10 +656,16 @@ class DMPCExpert:
 
         # ── Collision constraints first: their presence selects the cost mode.
         own_pred_seed = self._seed_input_prediction(prev, seeds[0], goal_local)
-        coll_A, coll_l, coll_u, collision_timestep, n_slack = self._build_collision_constraints(
+        coll_A, coll_l, coll_u, inter_agent_col_t, static_collision_timesteps, n_slack = self._build_collision_constraints(
+            env_idx=env_idx,
             own_pred=own_pred_seed,
             nbr_pred=nbr_pred,
         )
+        collision_sample_indices = [max(int(inter_agent_col_t) - 1, 0)] if inter_agent_col_t >= 0 else []
+        for kc_o in static_collision_timesteps:
+            for kc in kc_o:
+                collision_sample_indices.append(max(int(kc) - 1, 0))
+        collision_sample_indices = sorted(set(collision_sample_indices))
         collision_mode = coll_A is not None
 
         # Pick free / obs cost mode (mirrors C++ generator.cpp::buildQP).
@@ -689,8 +764,8 @@ class DMPCExpert:
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
-            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
-            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
             return
 
         if prev is not None and prev["U"].shape[0] == n_bez:
@@ -698,13 +773,13 @@ class DMPCExpert:
             solver.warm_start(warm)
         res = solver.solve()
         if res.info.status_val not in (1, 2):
-            # print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
+            print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
             self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
-            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
-            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
             return
 
         U_sol = res.x[:n_bez]
@@ -721,8 +796,8 @@ class DMPCExpert:
             "last_replanned": True,
             "last_reset_mode": bool(_reset_mode),
             "last_fallback": False,
-            "collision_timestep": int(collision_timestep),
-            "collision_sample_indices": [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else [],
+            "collision_timestep": int(inter_agent_col_t),
+            "collision_sample_indices": collision_sample_indices,
         }
 
     # ───────────────────────────────────────────────────────────────────
@@ -795,10 +870,11 @@ class DMPCExpert:
     # ───────────────────────────────────────────────────────────────────
     def _build_collision_constraints(
         self,
+        env_idx: int,
         own_pred: np.ndarray,
         nbr_pred: np.ndarray,
         # n_slack: int,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | int]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | List[List[int]] | int]:
         """Construct collision-avoidance inequalities. For each neighbour ``j``
         find the first step ``k_c`` where the predicted (input-space) distance
         is below ``g(rmin)`` and add one linearised cut. The slack variable
@@ -807,12 +883,15 @@ class DMPCExpert:
         K = self.p.k_hor
         rmin = self.p.rmin
         g_thresh = self.p.g_factor * rmin
-        Theta_inv = self._Theta_inv
+        Theta_inv = self._Theta_inv # for inter-agent CA
         n_nbr = nbr_pred.shape[0]
-        kc = -1
+        n_obs = self._num_static_obstacles
+
+        inter_agent_kc = -1
+        l_obs_kc = []
         n_slack = 0
-        if n_nbr == 0:
-            return None, None, None, kc, n_slack
+        if n_nbr + n_obs == 0:
+            return None, None, None, inter_agent_kc, l_obs_kc, n_slack
 
         rows = []
         lbs = []
@@ -822,27 +901,39 @@ class DMPCExpert:
         # Collision detection
         # 1. Determine k_c,i: the first timestep where there exists a neighbor j s.t. d < rmin
         # 2. Determine Omega_i: the set of neighbors j s.t. d < g_thresh at k_c,i
-        
+
         # 1. Determine k_c,i
         for k in range(1, K):
+            # Inter-agent
             for j in range(n_nbr):
                 d = Theta_inv @ (own_pred[k - 1] - nbr_pred[j, k])
                 if np.linalg.norm(d) < rmin:
-                    kc = k
+                    inter_agent_kc = k
                     break
-            if kc > 0:
+            if inter_agent_kc > 0:
                 break
         
+        # Static obstacle
+        for o in range(n_obs):
+            obs_kc_o = []
+            for k in range(1, K):
+                Theta_inv_o = self._obs_theta_inv[env_idx, o]
+                d = Theta_inv_o @ (own_pred[k - 1] - self._obstacle_pos_local[env_idx, o])
+                if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]: # more conservative collision checking for static obstacles #self._obs_rmin[env_idx, o]:
+                    obs_kc_o.append(k)
+            l_obs_kc.append(obs_kc_o)
+        
         # 2. Determine Omega_i and construct constraint
-        if kc >= 0:
+        if inter_agent_kc >= 0:
+            Phi_kc = self.M_pos_hor[3 * (inter_agent_kc - 1) : 3 * (inter_agent_kc - 1) + 3, :]
+            # Inter-agent
             for j in range(n_nbr):
-                d = Theta_inv @ (own_pred[kc - 1] - nbr_pred[j, kc])
+                d = Theta_inv @ (own_pred[inter_agent_kc - 1] - nbr_pred[j, inter_agent_kc])
                 if np.linalg.norm(d) < g_thresh:
                     # construct collision constraint
-                    Phi_kc = self.M_pos_hor[3 * (kc - 1) : 3 * (kc - 1) + 3, :]
                     unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
                     dg_dU = unit_diff.transpose() @ Theta_inv @ Phi_kc
-                    rhs_lower = unit_diff.transpose() @ Theta_inv @ nbr_pred[j, kc] + rmin
+                    rhs_lower = unit_diff.transpose() @ Theta_inv @ nbr_pred[j, inter_agent_kc] + rmin
 
                     row = np.zeros(self.n_bez) # + n_slack)
                     row = dg_dU
@@ -855,11 +946,31 @@ class DMPCExpert:
 
                     n_slack += 1
 
-            A_col = np.hstack([np.vstack(rows), -np.eye(n_slack)])
-            return A_col, np.asarray(lbs), np.asarray(ubs), kc, n_slack
+        # static obstacle
+        for (o, obs_kc_o) in enumerate(l_obs_kc):
+            Theta_inv_o = self._obs_theta_inv[env_idx, o]
+            obstacle_pos = self._obstacle_pos_local[env_idx, o]
+            for kc_oi in obs_kc_o:
+                Phi_kc_oi = self.M_pos_hor[3 * (kc_oi - 1) : 3 * (kc_oi - 1) + 3, :]
+                d = Theta_inv_o @ (own_pred[kc_oi - 1] - obstacle_pos)
+                if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]:
+                    unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
+                    dg_dU = unit_diff.transpose() @ Theta_inv_o @ Phi_kc_oi
+                    rhs_lower = unit_diff.transpose() @ Theta_inv_o @ obstacle_pos + self._obs_rmin[env_idx, o]
 
+                    row = np.zeros(self.n_bez) # + n_slack)
+                    row = dg_dU
+
+                    rows.append(row)
+                    lbs.append(rhs_lower)
+                    ubs.append(np.inf)
+                    n_slack += 1 
+
+        if rows:
+            A_col = np.hstack([np.vstack(rows), -np.eye(n_slack)])
+            return A_col, np.asarray(lbs), np.asarray(ubs), inter_agent_kc, l_obs_kc, n_slack
         else:
-            return None, None, None, kc, n_slack
+            return None, None, None, inter_agent_kc, l_obs_kc, n_slack
     # ───────────────────────────────────────────────────────────────────
     # Fallback (solver failure)
     # ───────────────────────────────────────────────────────────────────
