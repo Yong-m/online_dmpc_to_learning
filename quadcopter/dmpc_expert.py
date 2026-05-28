@@ -83,6 +83,8 @@ Public entry point::
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -140,7 +142,7 @@ class DMPCParams:
     s_obs: float = 100.0
     spd_o: int = 1
     acc_cost: float = 1.0 #10.0 #8e-3
-    lin_coll: float = -1.0e5
+    lin_coll: float = -1.0e3
     quad_coll: float = 1.0
 
     # Collision parameters
@@ -302,7 +304,8 @@ class DMPCExpert:
     multiple agents, plus a method to evaluate the trajectory at the env
     control rate via :py:meth:`compute`."""
 
-    def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu"):
+    def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu",
+                 num_workers: int | None = None):
         self.N = num_drones
         self.p = params or DMPCParams()
         if self.p.t_segment is None:
@@ -311,6 +314,10 @@ class DMPCExpert:
 
         # Number of control steps between replanning rounds (Ts samples per h).
         self.n_substeps = max(1, int(round(self.p.h / self.p.ts)))
+
+        # Thread pool for parallel env processing (one thread per env).
+        _nw = num_workers if num_workers is not None else min(os.cpu_count() or 4, 16)
+        self._pool = ThreadPoolExecutor(max_workers=_nw) if _nw > 1 else None
 
         # ── Bezier basis + sampling matrices ──────────────────────────────
         self.bezier = BezierBasis(
@@ -457,7 +464,7 @@ class DMPCExpert:
         Returns:
             ``(ref_pos_w, ref_vel_w)`` each ``(E, N, 3)``.
         """
-        E, N = pos_w.shape[0], pos_w.shape[1]
+        E = pos_w.shape[0]
         device = self.device
         ref_pos = pos_w.clone()
         ref_vel = torch.zeros_like(vel_w)
@@ -478,56 +485,64 @@ class DMPCExpert:
 
         ts = self.p.ts
         h_total = (self.p.k_hor - 1) * self.p.h
-        for e in env_iter:
+        N = self.N
+        env_list = list(env_iter)
+
+        # ── Phase 1: flag reset + gather all neighbour predictions ────────
+        # Sequential: gather reads _state[(e,j)] which replan (Phase 2) writes.
+        # Must complete for all (e,i) before any replan starts.
+        nbr_preds: dict[tuple[int, int], np.ndarray] = {}
+        for e in env_list:
             for i in range(N):
                 st = self._state.get((e, i))
                 if st is not None:
                     st["last_replanned"] = False
                     st["last_reset_mode"] = False
                     st["last_fallback"] = False
+                nbr_preds[(e, i)] = self._gather_neighbour_predictions(e, i, pos_np_local)
 
-            # First sweep: replan for any agent whose subsample counter rolled
-            # over. We do this in two passes (replan-first, sample-second) so
-            # every agent in this env has up-to-date broadcasts when neighbours
-            # query ``u_pred``.
+        # ── Phase 2: replan — all (e, i) pairs are independent ───────────
+        # Each _replan_agent writes only _state[(e, i)] for its own key.
+        # OSQP releases the GIL during solve(), so threads run concurrently.
+        replan_tasks = [
+            (e, i) for e in env_list for i in range(N)
+            if (self._state.get((e, i)) is None
+                or self._state[(e, i)]["steps"] % self.n_substeps == 0)
+        ]
 
-            # gather prediction first
-            nbr_preds = [self._gather_neighbour_predictions(e, i, pos_np_local) for i in range(N)]
-            
-            # replan with up-to-date neighbour predictions
+        def _do_replan(ei: tuple[int, int]) -> None:
+            e, i = ei
+            self._replan_agent(
+                e, i,
+                pos_local=pos_np_local[e, i],
+                vel=vel_np[e, i],
+                goal_local=goal_np_local[e, i],
+                nbr_pred=nbr_preds[(e, i)],
+            )
+
+        if self._pool is not None and len(replan_tasks) > 1:
+            list(self._pool.map(_do_replan, replan_tasks))
+        else:
+            for task in replan_tasks:
+                _do_replan(task)
+
+        # ── Phase 3: sample references ────────────────────────────────────
+        for e in env_list:
+            origin_e = origins_np[e] if origins_np is not None else np.zeros(3, dtype=np.float64)
             for i in range(N):
-                key = (e, i)
-                st = self._state.get(key)
-                if st is None or st["steps"] % self.n_substeps == 0:
-                    nbr_pred = nbr_preds[i]
-                    self._replan_agent(
-                        e, i,
-                        pos_local=pos_np_local[e, i],
-                        vel=vel_np[e, i],
-                        goal_local=goal_np_local[e, i],
-                        nbr_pred=nbr_pred,
-                    )
-
-            for i in range(N):
-                key = (e, i)
-                st = self._state[key]
+                st = self._state[(e, i)]
                 t_sub = ((st["steps"] % self.n_substeps) + 1) * ts
                 t_sub = min(t_sub, h_total)
-                ref_pos_local = (
-                    self.bezier.sample_matrix(np.array([t_sub]), deriv=0) @ st["U"]
-                )
-                ref_vel_local = (
-                    self.bezier.sample_matrix(np.array([t_sub]), deriv=1) @ st["U"]
-                )
-
-                origin_e = origins_np[e] if origins_np is not None else np.zeros(3)
                 ref_pos[e, i] = torch.from_numpy(
-                    (ref_pos_local + origin_e).astype(np.float32)
+                    (self.bezier.sample_matrix(np.array([t_sub]), deriv=0) @ st["U"]
+                     + origin_e).astype(np.float32)
                 ).to(device)
                 ref_vel[e, i] = torch.from_numpy(
-                    ref_vel_local.astype(np.float32)
+                    (self.bezier.sample_matrix(np.array([t_sub]), deriv=1) @ st["U"]
+                     ).astype(np.float32)
                 ).to(device)
                 st["steps"] += 1
+
         return ref_pos, ref_vel
 
     def plan(self, *args, **kwargs):

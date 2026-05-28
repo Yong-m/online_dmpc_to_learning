@@ -76,9 +76,9 @@ parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--n_rounds", type=int, default=200,
                     help="Total outer iterations (0 = run forever).")
-parser.add_argument("--steps_per_batch", type=int, default=64,
+parser.add_argument("--steps_per_batch", type=int, default=200,
                     help="Env steps per collection batch.")
-parser.add_argument("--bc_epochs_per_round", type=int, default=4)
+parser.add_argument("--bc_epochs_per_round", type=int, default=10)
 parser.add_argument("--batch_size", type=int, default=512)
 parser.add_argument("--buffer_capacity", type=int, default=400_000,
                     help="Max per-drone (obs, action_latent) transitions in the rolling buffer.")
@@ -118,6 +118,19 @@ parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument("--wandb_project", type=str, default="online_bc_dmpc")
 parser.add_argument("--wandb_run_name", type=str, default=None)
+
+parser.add_argument("--video", action="store_true", default=False,
+                    help="Record collection videos (one mp4 per round).")
+parser.add_argument("--video_length", type=int, default=0,
+                    help="Video clip length in steps (0 = steps_per_batch).")
+parser.add_argument("--video_root", type=str, default="runs/online_bc_dmpc/videos",
+                    help="Output directory for videos.")
+parser.add_argument("--video_resolution", type=int, nargs=2, default=[1280, 720],
+                    help="Recording resolution (W H).")
+parser.add_argument("--cam_eye", type=float, nargs=3, default=[8.0, 8.0, 6.0],
+                    help="Viewer camera position (m), world frame.")
+parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.0, 0.0, 1.0],
+                    help="Viewer camera lookat (m), world frame.")
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
@@ -693,15 +706,35 @@ def main():
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
 
-    env = gym.make(args_cli.task, cfg=env_cfg).unwrapped  # type: MultiDroneDmpcEnv
-    device = env.device
-    N = env.cfg.num_drones
+    if args_cli.video:
+        env_cfg.viewer.eye = tuple(args_cli.cam_eye)
+        env_cfg.viewer.lookat = tuple(args_cli.cam_lookat)
+        env_cfg.viewer.origin_type = "world"
+        env_cfg.viewer.resolution = tuple(args_cli.video_resolution)
+
+    env = gym.make(args_cli.task, cfg=env_cfg,
+                   render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.video:
+        os.makedirs(args_cli.video_root, exist_ok=True)
+        _vid_len = int(args_cli.video_length) if args_cli.video_length > 0 else args_cli.steps_per_batch
+        _sps = args_cli.steps_per_batch
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=args_cli.video_root,
+            step_trigger=lambda step, _sps=_sps: step % _sps == 0,
+            video_length=_vid_len,
+            disable_logger=True,
+            name_prefix="dmpc_collect",
+        )
+    env_raw = env.unwrapped  # type: MultiDroneDmpcEnv
+    device = env_raw.device
+    N = env_raw.cfg.num_drones
     P = per_drone_obs_dim(N)
     A = PER_DRONE_ACTION_DIM
     print(
-        f"[online_bc_dmpc] num_envs={env.num_envs}  num_drones={N}  "
+        f"[online_bc_dmpc] num_envs={env_raw.num_envs}  num_drones={N}  "
         f"per_drone_obs={P}  per_drone_action={A}  "
-        f"obs_total={env.cfg.observation_space}  action_total={env.cfg.action_space}"
+        f"obs_total={env_raw.cfg.observation_space}  action_total={env_raw.cfg.action_space}"
     )
 
     policy = SharedDronePolicy(
@@ -727,16 +760,16 @@ def main():
     expert = DMPCExpert(
         num_drones=N,
         params=DMPCParams(
-            pmin=env.cfg.pos_min,
-            pmax=env.cfg.pos_max,
-            rmin=env.cfg.rmin,
-            ts=env.cfg.sim.dt * env.cfg.decimation,
+            pmin=env_raw.cfg.pos_min,
+            pmax=env_raw.cfg.pos_max,
+            rmin=env_raw.cfg.rmin,
+            ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
         ),
         device=device,
     )
 
     dmpc_logger = (
-        DmpcExpertLogger(args_cli.dmpc_log_path, env, expert)
+        DmpcExpertLogger(args_cli.dmpc_log_path, env_raw, expert)
         if args_cli.dmpc_log_path is not None
         else None
     )
@@ -753,13 +786,15 @@ def main():
 
     env.reset(seed=args_cli.seed)
     expert.reset()
-    if hasattr(env, "_last_reset_env_ids"):
-        env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
-    last_episode_length_buf = env.episode_length_buf.clone()
-    per_drone_obs = env.get_per_drone_obs()  # (E, N, P)
+    if hasattr(env_raw, "_last_reset_env_ids"):
+        env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+    last_episode_length_buf = env_raw.episode_length_buf.clone()
+    per_drone_obs = env_raw.get_per_drone_obs()  # (E, N, P)
 
     recent_returns: deque[float] = deque(maxlen=20)
-    episode_returns = torch.zeros(env.num_envs, device=device)
+    episode_returns = torch.zeros(env_raw.num_envs, device=device)
+    collect_success_count = 0
+    collect_episode_count = 0
     round_idx = 0
     total_env_steps = 0
     expert_collect_step = 0
@@ -775,16 +810,20 @@ def main():
             t_collect = time.time()
 
             collect_returns: list[float] = []
-            for _ in range(args_cli.steps_per_batch):
+            for _collect_step in range(args_cli.steps_per_batch):
+                print(
+                    f"  [collect {_collect_step + 1:>4d}/{args_cli.steps_per_batch}]",
+                    end="\r", flush=True,
+                )
                 with torch.no_grad():
                     # Keep the DMPC expert in lockstep with IsaacLab resets.
                     # Normally the done branch below handles this, but this
                     # also catches full/manual resets or env counters rewound
                     # before this expert query.
-                    rewound = env.episode_length_buf < last_episode_length_buf
+                    rewound = env_raw.episode_length_buf < last_episode_length_buf
                     if rewound.any():
                         expert.reset(rewound.nonzero(as_tuple=False).flatten())
-                    last_episode_length_buf = env.episode_length_buf.clone()
+                    last_episode_length_buf = env_raw.episode_length_buf.clone()
 
                     log_this_step = (
                         dmpc_logger is not None
@@ -792,12 +831,12 @@ def main():
                         and expert_collect_step % args_cli.dmpc_log_every == 0
                     )
                     action_flat = expert_action(
-                        env, expert,
+                        env_raw, expert,
                         debug_logger=dmpc_logger if log_this_step else None,
                         debug_step=expert_collect_step,
                     )  # (E, N*A)
 
-                action_per_drone = action_flat.view(env.num_envs, N, A)
+                action_per_drone = action_flat.view(env_raw.num_envs, N, A)
                 act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
 
                 # Update obs stats from the live rollout distribution and add to
@@ -806,22 +845,28 @@ def main():
                 buffer.add(per_drone_obs.detach(), act_latent.detach())
 
                 _, reward, terminated, truncated, _ = env.step(action_flat)
-                per_drone_obs = env.get_per_drone_obs()
+                per_drone_obs = env_raw.get_per_drone_obs()
                 episode_returns += reward
                 done = terminated | truncated
-                reset_env_ids = getattr(env, "_last_reset_env_ids", None)
+                reset_env_ids = getattr(env_raw, "_last_reset_env_ids", None)
                 if reset_env_ids is not None and reset_env_ids.numel() > 0:
                     expert.reset(reset_env_ids)
-                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
-                elif done.any():
+                    env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                if done.any():
                     expert.reset(done.nonzero(as_tuple=False).flatten())
                 if done.any():
+                    # _just_succeeded is set by _get_dones inside env.step() and
+                    # cleared at the start of the NEXT _get_dones call, so it is
+                    # safe to read here: True iff the env hit the success criterion.
+                    collect_success_count += int(env_raw._just_succeeded[done].sum().item())
+                    collect_episode_count += int(done.sum().item())
                     finished = episode_returns[done].detach().cpu().tolist()
                     collect_returns.extend(finished)
                     episode_returns[done] = 0.0
-                last_episode_length_buf = env.episode_length_buf.clone()
-                total_env_steps += env.num_envs
+                last_episode_length_buf = env_raw.episode_length_buf.clone()
+                total_env_steps += env_raw.num_envs
                 expert_collect_step += 1
+            print()  # end \r overwrite
             collect_dt = time.time() - t_collect
             if collect_returns:
                 recent_returns.extend(collect_returns)
@@ -830,7 +875,7 @@ def main():
             bc_loss = float("nan")
             if buffer.size >= max(args_cli.min_buffer_transitions, args_cli.batch_size):
                 losses = []
-                for _ in range(args_cli.bc_epochs_per_round):
+                for epoch_i in range(args_cli.bc_epochs_per_round):
                     b_obs, b_lat = buffer.sample(args_cli.batch_size)
                     loss = policy.flow_match_loss(b_obs, b_lat)
                     optimizer.zero_grad()
@@ -840,27 +885,37 @@ def main():
                     optimizer.step()
                     policy.step_after_optim()
                     losses.append(loss.item())
+                    print(
+                        f"  [BC epoch {epoch_i + 1}/{args_cli.bc_epochs_per_round}] "
+                        f"loss={loss.item():.5f}",
+                        flush=True,
+                    )
                 policy.refresh_behaviour()
                 bc_loss = float(np.mean(losses))
 
             # ── 3. Eval ─────────────────────────────────────────────────
             eval_metrics: dict[str, float] = {}
             if args_cli.eval_every_rounds > 0 and round_idx % args_cli.eval_every_rounds == 0:
-                eval_metrics = evaluate(env, policy, args_cli.eval_steps, N, A)
+                eval_metrics = evaluate(env_raw, policy, args_cli.eval_steps, N, A)
                 env.reset()
                 expert.reset()
-                if hasattr(env, "_last_reset_env_ids"):
-                    env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
-                last_episode_length_buf = env.episode_length_buf.clone()
-                per_drone_obs = env.get_per_drone_obs()
+                if hasattr(env_raw, "_last_reset_env_ids"):
+                    env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                last_episode_length_buf = env_raw.episode_length_buf.clone()
+                per_drone_obs = env_raw.get_per_drone_obs()
                 episode_returns.zero_()
 
             # ── 4. Logging + checkpointing ──────────────────────────────
+            expert_success_rate = collect_success_count / max(collect_episode_count, 1)
+            collect_success_count = 0
+            collect_episode_count = 0
+
             mean_ret = float(np.mean(recent_returns)) if recent_returns else float("nan")
             msg = (
                 f"[round {round_idx:04d}] "
                 f"buf={buffer.size:>7d}  "
                 f"bc_loss={bc_loss:.4f}  "
+                f"expert_succ={expert_success_rate:.2f}  "
                 f"mean_collect_ret={mean_ret:.2f}  "
                 f"collect_dt={collect_dt:.1f}s  "
                 f"steps={total_env_steps}"
@@ -875,6 +930,7 @@ def main():
                     "round": round_idx,
                     "buffer_size": buffer.size,
                     "bc_loss": bc_loss,
+                    "expert/success_rate": expert_success_rate,
                     "mean_collect_return": mean_ret,
                     "total_env_steps": total_env_steps,
                     "collect_dt_s": collect_dt,
