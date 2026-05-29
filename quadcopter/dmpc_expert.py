@@ -84,6 +84,7 @@ Public entry point::
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -331,6 +332,11 @@ class DMPCExpert:
         self.M_pos_hor = self.bezier.sample_matrix(self._times_hor, deriv=0)
         self.M_vel_hor = self.bezier.sample_matrix(self._times_hor, deriv=1)
         self.M_acc_hor = self.bezier.sample_matrix(self._times_hor, deriv=2)
+        # Velocity sampling at each sub-step within one h-window: used by
+        # get_vref_ctrl_pts() to fit Bezier control points for BC supervision.
+        self._sub_times = np.array([(k + 1) * self.p.ts for k in range(self.n_substeps)])
+        self.M_vel_sub = self.bezier.sample_matrix(self._sub_times, deriv=1)  # (3*n_sub, n_bez)
+        self._vref_ctrl_cache: dict[int, np.ndarray] = {}  # K → Phi_pinv (K, n_sub)
         # Sampling matrices for derivatives 0..deg_poly at t = 0 (used to pin
         # the new Bezier's initial state to seeds from the previous solve, so
         # the reference signal stays C^{deg_poly}-continuous across replans,
@@ -557,6 +563,51 @@ class DMPCExpert:
             return
         ids = set(int(i) for i in env_ids.detach().cpu().tolist())
         self._state = {k: v for k, v in self._state.items() if k[0] not in ids}
+
+    def get_vref_ctrl_pts(
+        self,
+        env_list: "Iterable[int]",
+        K: int = 4,
+    ) -> torch.Tensor:
+        """Fit K-point Bezier control points to the velocity profile of each agent.
+
+        Must be called right after :py:meth:`compute`/plan().  For each (e, i),
+        evaluates v_ref at ``n_substeps`` time points within the current h-window
+        and fits a degree-(K-1) Bezier via least-squares.
+
+        Args:
+            env_list: iterable of env indices to process.
+            K: number of control points (degree = K-1). Default 4 (cubic).
+
+        Returns:
+            Float32 tensor of shape ``(E_max, N, K, 3)`` on ``self.device``,
+            where ``E_max = max(env_list) + 1``.  Agents with no DMPC state
+            (just reset) are left as zero.
+        """
+        n_sub = self.n_substeps
+        if K not in self._vref_ctrl_cache:
+            taus = np.arange(1, n_sub + 1, dtype=np.float64) / n_sub  # (n_sub,)
+            Phi = np.column_stack([
+                comb(K - 1, j, exact=True) * (taus ** j) * ((1 - taus) ** (K - 1 - j))
+                for j in range(K)
+            ]).astype(np.float32)  # (n_sub, K)
+            self._vref_ctrl_cache[K] = np.linalg.pinv(Phi).astype(np.float32)  # (K, n_sub)
+        Phi_pinv = self._vref_ctrl_cache[K]  # (K, n_sub)
+
+        env_list = list(env_list)
+        E_max = max(env_list) + 1
+        ctrl_pts = np.zeros((E_max, self.N, K, 3), dtype=np.float32)
+
+        # M_vel_sub: (3*n_sub, n_bez); reshape output to (n_sub, 3).
+        for e in env_list:
+            for i in range(self.N):
+                st = self._state.get((e, i))
+                if st is None:
+                    continue
+                v_refs = (self.M_vel_sub @ st["U"]).reshape(n_sub, 3).astype(np.float32)  # (n_sub, 3)
+                ctrl_pts[e, i] = Phi_pinv @ v_refs  # (K, 3)
+
+        return torch.from_numpy(ctrl_pts).to(self.device)
 
     # ───────────────────────────────────────────────────────────────────
     # Neighbour broadcast retrieval
