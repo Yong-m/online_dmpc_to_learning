@@ -92,7 +92,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # Static obstacles
     enable_static_obstacles: bool = True
     randomize_static_obstacles: bool = False
-    show_static_obstacle_ellipsoid_vis: bool = False
+    show_static_obstacle_ellipsoid_vis: bool = True
     num_static_obstacles: int = 2
     static_obstacle_radius: float = 0.15
     static_obstacle_size: tuple[float, float, float] = (0.25, 1.2, 2.5)
@@ -209,6 +209,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_vel_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_acc_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        self._vel_action_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        self._vel_action_ref_initialized = torch.zeros(self.num_envs, self.N, dtype=torch.bool, device=device)
         # Per-drone thrust / moment buffers ultimately applied to PhysX.
         self._thrust = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
         self._moment = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
@@ -482,6 +484,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_pos_w[env_ids] = 0.0
         self._last_ref_vel_w[env_ids] = 0.0
         self._last_ref_acc_w[env_ids] = 0.0
+        self._vel_action_ref_pos_w[env_ids] = 0.0
+        self._vel_action_ref_initialized[env_ids] = False
 
         # Random-exchange scenario (DMPC paper Section IV/VI): each drone on
         # one side of a random circle, goal on the diametrically opposite side.
@@ -685,9 +689,21 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         return torch.cat([delta_norm, vel_norm, acc_norm], dim=-1).reshape(E, N * 9)
 
     def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper: pack velocity-only commands with zero acceleration."""
+        """Compatibility helper: integrate velocity-only commands with zero acceleration."""
         st = self._stack_drone_state()
-        ref_pos_w = st["pos_w"] + v_cmd_w * self.step_dt
+        pos_w = st["pos_w"]
+
+        init_mask = ~self._vel_action_ref_initialized
+        if init_mask.any():
+            self._vel_action_ref_pos_w[init_mask] = pos_w[init_mask]
+            self._vel_action_ref_initialized[init_mask] = True
+
+        self._vel_action_ref_pos_w = self._vel_action_ref_pos_w + v_cmd_w * self.step_dt
+        ref_pos_w = self._vel_action_ref_pos_w
+
+        # Previous reconstruction used the current state every step, which makes
+        # the reference position discontinuous when tracking error exists:
+        # ref_pos_w = pos_w + v_cmd_w * self.step_dt
         return self.reference_to_action(ref_pos_w, v_cmd_w, torch.zeros_like(v_cmd_w))
 
     def ref_to_action(

@@ -91,7 +91,9 @@ parser.add_argument("--expert_test_only", action="store_true", default=False,
                     help="Run DMPC expert only, skip replay-buffer collection and BC training.")
 parser.add_argument("--expert_test_steps", type=int, default=None,
                     help="Expert-only rollout length. Defaults to 3 full episodes per env.")
-parser.add_argument("--success_goal_tol", type=float, default=0.01,
+parser.add_argument("--expert_test_progress_every", type=int, default=100,
+                    help="Print expert-test progress every N env steps (0 disables progress prints).")
+parser.add_argument("--success_goal_tol", type=float, default=0.05,
                     help="Per-drone goal distance threshold for env-level success.")
 parser.add_argument("--success_dwell_steps", type=int, default=10,
                     help="Consecutive steps all drones must stay within goal tolerance.")
@@ -500,7 +502,8 @@ def expert_action(
     )
     ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     _push_first_env_debug_trajectories(env, expert, states)
-    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    # action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)   # i) Full trajectory command
+    action = env.velocity_to_action(ref_vel_w)                      # ii) Recon from velocity command
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
     return action
@@ -658,6 +661,7 @@ def run_expert_test(
     dwell_steps: int,
     debug_logger: DmpcExpertLogger | None = None,
     log_every: int = 1,
+    progress_every: int = 100,
 ) -> dict[str, float]:
     """Run repeated DMPC-only episodes and aggregate env-level success metrics."""
     device = env.device
@@ -792,6 +796,27 @@ def run_expert_test(
             episode_bounds_failure[ids] = False
             episode_success_step[ids] = -1
             episode_start_step[ids] = step + 1
+
+        if progress_every > 0 and ((step + 1) % progress_every == 0 or step == 0 or step + 1 == n_steps):
+            denom_now = max(total_episodes, 1)
+            active_incomplete = int((~episode_success & ~episode_drone_collision & ~episode_obstacle_collision & ~episode_bounds_failure).sum().item())
+            current_goal_max = goal_dist.max(dim=-1).values
+            elapsed = time.time() - t0
+            print(
+                "[expert_test] progress "
+                f"step={step + 1}/{n_steps} "
+                f"sim_t={(step + 1) * env.step_dt:.2f}s "
+                f"episodes={total_episodes} "
+                f"success={total_success / denom_now:.3f} "
+                f"clean={total_clean_success / denom_now:.3f} "
+                f"drone_col={total_drone_collision / denom_now:.3f} "
+                f"obs_col={total_obstacle_collision / denom_now:.3f} "
+                f"active_incomplete={active_incomplete} "
+                f"goal_dist_mean={current_goal_max.mean().item():.3f} "
+                f"goal_dist_max={current_goal_max.max().item():.3f} "
+                f"wall={elapsed:.1f}s",
+                flush=True,
+            )
 
         last_episode_length_buf = env.episode_length_buf.clone()
 
@@ -929,6 +954,7 @@ def main():
                 dwell_steps=args_cli.success_dwell_steps,
                 debug_logger=dmpc_logger,
                 log_every=args_cli.dmpc_log_every,
+                progress_every=args_cli.expert_test_progress_every,
             )
         finally:
             if dmpc_logger is not None:

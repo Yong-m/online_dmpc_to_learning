@@ -148,7 +148,8 @@ class DMPCParams:
     # Collision parameters
     rmin: float = 0.5 #0.3
     height_scaling: float = 2.0
-    g_factor: float = 2.0
+    agent_g_factor: float = 2.0
+    obs_g_factor: float = 1.2
     # height_scaling_obs: float = 4.0
 
     # Event-triggered replanning
@@ -462,7 +463,7 @@ class DMPCExpert:
                 theta_inv[:, j, :, :] = np.diag(1.0 / np.maximum(ellipsoid_axes[j], 1e-6))
             self._obs_theta_inv = theta_inv
             self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
-            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
             return
 
         shape_name = obstacle_info.get("shape_name")
@@ -474,7 +475,7 @@ class DMPCExpert:
             self._obs_rmin = np.asarray(
                 [[params.get("radius") + 0.25 for _ in range(self._num_static_obstacles)] for _ in range(self.E)]
             )
-            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
         elif shape_name == "CuboidCfg":
             size = np.asarray(params.get("size"), dtype=np.float64)
             # Fallback: cover each cuboid by one ellipsoid. Prefer the split
@@ -487,7 +488,7 @@ class DMPCExpert:
                 (self.E, self._num_static_obstacles, 1, 1),
             )
             self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
-            self._obs_g_thres = self.p.g_factor * self._obs_rmin
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
         else:
             # TODO: support other shapes
             raise NotImplementedError(f"Unsupported obstacle type: {shape_name}")
@@ -882,7 +883,7 @@ class DMPCExpert:
         collision is predicted, no row is added and the slack stays at zero."""
         K = self.p.k_hor
         rmin = self.p.rmin
-        g_thresh = self.p.g_factor * rmin
+        g_thresh = self.p.agent_g_factor * rmin
         Theta_inv = self._Theta_inv # for inter-agent CA
         n_nbr = nbr_pred.shape[0]
         n_obs = self._num_static_obstacles
