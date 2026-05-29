@@ -12,27 +12,23 @@ Control for Multi-Robot Motion Planning" (Luis et al., RA-L 2020):
     flow-matching network on its own per-drone slice of the observation. The
     env exposes ``get_per_drone_obs() -> (E, N, P)``; we reshape to
     ``(E*N, P)``, run the shared condition + flow network, and reshape the
-    resulting per-drone action ``(E*N, A)`` (``A = 9`` -- normalised
-    ``[delta_p, v_ref, a_ref]`` per drone) back to ``(E, N*A)`` before sending to the env. The
-    same weights govern every drone, which is the natural permutation-
-    equivariant choice for a homogeneous team.
+    resulting per-drone action ``(E*N, A)`` (``A = 4`` -- wrench
+    ``[f_z, τ_x, τ_y, τ_z]`` in body frame) back to ``(E, N*A)`` before
+    sending to the env.  The same weights govern every drone.
 
-2.  **Full PolicyFlow flow-matching head.** Action targets are ``atanh``-mapped
-    to the latent unit cube, paired with Gaussian ``x0``, and the model
-    regresses the rectified-flow velocity ``(x1 - x0)`` -- the same loss used
-    throughout PolicyFlow. Sampling at rollout time is the Heun-style ODE
-    integration of ``ContinuousNormalizingFlow.sample``. EMA / behaviour /
-    proximal copies of the flow weights are kept around (matches the curobo
-    script), making it easy to plug in PPO-EWMA / decoupled objectives later.
+2.  **Full PolicyFlow flow-matching head.** Action targets are z-score
+    normalised (``EmpiricalNormalization``), paired with Gaussian ``x0``, and
+    the model regresses the rectified-flow velocity ``(x1 - x0)``.  Sampling
+    at rollout time is the Heun-style ODE integration of
+    ``ContinuousNormalizingFlow.sample``.  EMA / behaviour / proximal copies of
+    the flow weights are kept (matches the curobo script).
 
 Pipeline per outer round:
 
-  1. *Collect*. Roll out ``--steps_per_batch`` env steps. For every step we
-     query the DMPC expert for a **world-frame position + velocity reference**
-     for *every* drone in *every* env, convert it to the env's 9-D normalised
-     reference action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
-     and store ``(per_drone_obs, atanh(per_drone_action))`` for every drone
-     (each step contributes ``E * N`` BC samples).
+  1. *Collect*. Roll out ``--steps_per_batch`` env steps. DMPC computes a
+     position+velocity reference; ``_ref_to_thrust_moment`` converts it to
+     wrench ``[f_z, τ_x, τ_y, τ_z]``.  The wrench is applied directly to the
+     env (4-D dispatch) and stored as the BC supervision target.
   2. *Train*. ``--bc_epochs_per_round`` flow-matching updates on a uniform
      sample from the rolling per-drone buffer; loss is rectified-flow
      velocity-MSE.
@@ -188,7 +184,7 @@ except Exception:
 
 
 # Per-drone action dimension: wrench [f_z, tau_x, tau_y, tau_z] in body frame.
-PER_DRONE_ACTION_DIM = 3  # goal-aligned v_ref [vx, vy, vz] normalised to [-1, 1]
+PER_DRONE_ACTION_DIM = 4
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -200,7 +196,7 @@ class SharedDronePolicy(nn.Module):
     Architecture:
         per_drone_obs (P) → [own_norm | neigh_norm] → NeighborEncoder
                          → [own(OWN_DIM) ‖ neighbor_embed(emb_dim)]
-                         → ConditionMlp → ContinuousNormalizingFlow → v_ref(A=3)
+                         → ConditionMlp → ContinuousNormalizingFlow → wrench(A=4)
 
     Own-state and neighbor observations are normalised with separate
     EmpiricalNormalization instances (each of fixed dimension), so the policy
@@ -231,7 +227,7 @@ class SharedDronePolicy(nn.Module):
         # Separate normalizers so stats are independent of N.
         self.own_norm = EmpiricalNormalization(shape=own_dim, until=int(1e8))
         self.neigh_norm = EmpiricalNormalization(shape=neighbor_dim, until=int(1e8))
-        # Wrench action normalizer: empirical z-score for [f_z, tau_x, tau_y, tau_z].
+        # Action normalizer: empirical z-score for wrench [f_z, tau_x, tau_y, tau_z].
         self.act_norm = EmpiricalNormalization(shape=per_drone_action_dim, until=int(1e8))
 
         # Cross-attention: own attends over variable-length neighbor set.
@@ -326,11 +322,7 @@ class SharedDronePolicy(nn.Module):
         obs_flat: torch.Tensor,    # (B, P) raw per-drone obs
         action_raw: torch.Tensor,  # (B, A=4) raw wrench [f_z, tau_x, tau_y, tau_z]
     ) -> torch.Tensor:
-        """Rectified-flow velocity-MSE loss for wrench prediction.
-
-        Wrench is z-score normalized before being used as the flow target x1,
-        so x1 is approximately N(0,1) — ideal for rectified flow.
-        """
+        """Rectified-flow velocity-MSE loss for wrench prediction."""
         self.cnf.model["condition"].train()
         self.cnf.model["flow"].train()
         cond_in = self._encode_obs(obs_flat)
@@ -346,14 +338,7 @@ class SharedDronePolicy(nn.Module):
     # ── inference ─────────────────────────────────────────────────────────
     @torch.no_grad()
     def sample_action(self, per_drone_obs: torch.Tensor) -> torch.Tensor:
-        """Integrate the rectified-flow ODE and decode to raw wrench.
-
-        Args:
-            per_drone_obs: ``(E, N, P)`` raw observations.
-
-        Returns:
-            ``(E, N, A=4)`` raw wrench ``[f_z, tau_x, tau_y, tau_z]`` (body frame).
-        """
+        """Integrate the rectified-flow ODE and return raw wrench (E, N, A=4)."""
         E, N, P = per_drone_obs.shape
         flat = per_drone_obs.reshape(E * N, P)
         self.cnf.eval()
@@ -660,13 +645,12 @@ def expert_action(
     debug_logger: "DmpcExpertLogger | None" = None,
     debug_step: int = 0,
 ) -> torch.Tensor:
-    """Run DMPC for every drone in every env and map its plan to the env action.
+    """Run DMPC and extract the cascade wrench as the expert action.
 
-    DMPC returns the paper's ``u_i`` position-reference sample. We pack
-    that sample, its first derivative, and its second derivative into the
-    env's 9-D normalised ``[delta_p, v_ref, a_ref]`` action.
-
-    Returns ``(num_envs, num_drones * 9)``.
+    The DMPC position/velocity reference is fed through ``_ref_to_thrust_moment``
+    to compute wrench ``[f_z, τ_x, τ_y, τ_z]`` (body frame).  The returned
+    tensor is ``(num_envs, num_drones * 4)`` and is applied directly by the
+    env's wrench-direct dispatch path (4D actions in ``_pre_physics_step``).
     """
     states = env.get_world_states()
     pos_w = states["pos_w"]
@@ -679,8 +663,9 @@ def expert_action(
     )
     ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     _push_first_env_debug_trajectories(env, expert, states)
-    # Convert world-frame v_ref to goal-aligned 3D action for the v_ref cascade.
-    action = env.vref_to_action(ref_vel_w)
+    # Compute cascade wrench from reference — this is the BC supervision target.
+    wrench_b = env._ref_to_thrust_moment(ref_pos_w, ref_vel_w, ref_acc_w)   # (E, N, 4)
+    action = wrench_b.reshape(env.num_envs, env.cfg.num_drones * PER_DRONE_ACTION_DIM)
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
     return action
@@ -713,7 +698,8 @@ class DmpcExpertLogger:
         goal_w = states["goal_w"][env_idx].detach().cpu().numpy().astype(np.float64)
         action_norm = action_flat.view(self.env.num_envs, N, PER_DRONE_ACTION_DIM)[env_idx]
         action_norm_np = action_norm.detach().cpu().numpy().astype(np.float64)
-        desired_vel_w = action_norm_np[:, 0:3] * float(self.env.cfg.v_max)
+        # wrench columns: [thrust_z, tau_x, tau_y, tau_z] in body frame
+        thrust_cmd = action_norm_np[:, 0].astype(np.float32)   # (N,)
 
         planned_ref_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         planned_ref_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
@@ -777,7 +763,7 @@ class DmpcExpertLogger:
                 "ref_vel_w": ref_vel_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "ref_acc_w": ref_acc_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "action_normalized": action_norm_np.astype(np.float32),
-                "desired_vel_cmd_w": desired_vel_w.astype(np.float32),
+                "thrust_cmd": thrust_cmd,
                 "planned_ref_pos_w": planned_ref_pos_w.astype(np.float32),
                 "planned_ref_vel_w": planned_ref_vel_w.astype(np.float32),
                 "planned_ref_acc_w": planned_ref_acc_w.astype(np.float32),
@@ -1322,7 +1308,7 @@ def main():
 
                 _, reward, terminated, truncated, _ = env.step(action_flat)
 
-                # action_flat is goal-aligned v_ref ∈ [-1,1]^3 per drone.
+                # action_flat is raw wrench [f_z, tau_x, tau_y, tau_z] per drone.
                 action_per_drone = action_flat.view(env_raw.num_envs, N, A).detach()
                 policy.update_act_norm(action_per_drone.reshape(-1, A))
                 ep_buf.push(obs_before.detach(), action_per_drone)
