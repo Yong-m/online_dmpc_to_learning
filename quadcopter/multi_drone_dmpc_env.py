@@ -10,22 +10,20 @@ env, goal-reaching) but instantiates *N* Crazyflies and aligns the action /
 observation interface with the multi-robot motion-planning setting of the
 ``online_dmpc`` paper. Design choices:
 
-* **Action = 9-D reference command per drone**: normalised ``[delta_p_w, v_ref_w, a_ref_w]``.
-  The first three components are a world-frame position-reference delta from
-  the current position, followed by world-frame velocity and acceleration
-  feed-forward terms. Total env action dimension is ``9 * num_drones``. The
-  env unpacks this command before the low-level wrench controller.
+* **Action = 3-D velocity reference per drone**: normalised ``v_ref_w`` in
+  ``[-1, 1]^3``.  The env integrates one step ahead to produce the position
+  reference ``ref_pos_w = pos_w + v_ref_w * v_max * dt`` and drives the
+  cascade controller with ``(ref_pos, ref_vel, ref_acc=0)``.  Total env
+  action dimension is ``3 * num_drones``.
 
 * **Per-drone observation including neighbour inputs.** ``get_per_drone_obs()``
-  returns ``(num_envs, num_drones, per_drone_obs_dim)``. Each slice contains
-  the drone's own body-frame state + goal, and for every neighbour ``j``: its
-  body-frame relative position, relative velocity, **and the neighbour's most
-  recent applied input (velocity reference)**. The DMPC paper (Section III.E)
-  finds input-space avoidance superior to state-space because the input is
-  forward-looking; we surface that same signal to the student.
+  returns ``(num_envs, num_drones, per_drone_obs_dim)``.  Each slice contains
+  the drone's own body-frame state + goal + previous v_ref + sinusoidal
+  episode-progress embedding, and for every neighbour ``j``: its body-frame
+  relative position, relative velocity, and previous v_ref.
 
 * **Decentralised policy ready.** The flat observation in ``"policy"`` is a
-  concatenation of the per-drone slices in fixed drone order. The BC script
+  concatenation of the per-drone slices in fixed drone order.  The BC script
   reshapes it to ``(num_envs * num_drones, per_drone_obs_dim)`` and applies a
   *single shared MLP* to every drone in parallel.
 """
@@ -44,7 +42,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms, matrix_from_quat
+from isaaclab.utils.math import quat_apply_inverse, matrix_from_quat
 
 ##
 # Pre-defined configs
@@ -54,9 +52,11 @@ from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 
 
 # Per-drone observation layout sizes.
-PER_DRONE_OWN_DIM = 21   # lin_vel_b (3) + ang_vel_b (3) + projected_gravity_b (3) + goal_b (3)
-                         # + prev_delta_p_b (3) + prev_v_ref_b (3) + prev_a_ref_b (3)
-PER_NEIGHBOUR_DIM = 10   # rel_pos_b (3) + rel_vel_b (3) + neighbour_last_input_b (3) + r_min (1)
+HISTORY_STEPS = 5        # own position history length (steps)
+TIME_EMB_DIM = 4         # sinusoidal episode-progress embedding
+PER_DRONE_OWN_DIM = 37   # goal_rel_w(3) + lin_vel_w(3) + R_wb(9) + ang_vel_b(3)
+                          # + past_rel_pos_w(HISTORY_STEPS*3) + time_emb(TIME_EMB_DIM)
+PER_NEIGHBOUR_DIM = 9    # rel_pos_w(3) + rel_vel_w(3) + neigh_goal_dir_w(3)
 
 
 def per_drone_obs_dim(num_drones: int) -> int:
@@ -80,16 +80,17 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     num_drones: int = 4
     episode_length_s: float = 10.0
     decimation: int = 5
-    action_space: int = 9 * 4   # 9 per drone, overwritten in __post_init__
+    action_space: int = 3 * 4   # 3 (v_ref) per drone, overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
     debug_short_horizon_steps: int = 3
-    randomize_episode_start: bool = True
+    randomize_episode_start: bool = False
     terminate_on_bounds: bool = True
     collision_free_two_drone_reset: bool = False # For DMPC debugging
     success_dist_threshold: float = 0.05   # metres; all drones must be within this
     success_hold_s: float = 1.0            # seconds all drones must hold the threshold
+    goal_blend_radius: float = 0.5         # metres; blend ref_pos→goal within this radius
 
     ui_window_class_type = MultiDroneDmpcEnvWindow
 
@@ -139,7 +140,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # action is [delta_p_w, v_ref_w, a_ref_w] in normalised [-1, 1] units.
     delta_pos_max: float = 0.3
     v_max: float = 2.0
-    accel_action_max: float = 2.0 #1.0
+    accel_action_max: float = 1.5  # matches DMPC QP hard constraint: amin/amax = ±1.5 m/s²
 
     # ── position-reference tracker gains ──
     pos_track_kp: float = 8.0 #5.0 #6.0
@@ -157,7 +158,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     z_max: float = 2.5
 
     def __post_init__(self):
-        self.action_space = 9 * self.num_drones
+        self.action_space = 3 * self.num_drones
         self.observation_space = self.num_drones * per_drone_obs_dim(self.num_drones)
 
 
@@ -170,9 +171,15 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self.per_drone_obs_dim = per_drone_obs_dim(self.N)
         device = self.device
 
-        # Per-drone normalised [delta_p_w, v_ref_w, a_ref_w] action and
-        # buffers of the most-recent unpacked reference command.
-        self._actions = torch.zeros(self.num_envs, self.N, 9, device=device)
+        # Per-drone action buffer (v_ref 3D or wrench 4D depending on call site).
+        self._actions = torch.zeros(self.num_envs, self.N, 3, device=device)
+        # Position history for own-motion feature: (E, N, HISTORY_STEPS, 3), world frame.
+        self._pos_history = torch.zeros(self.num_envs, self.N, HISTORY_STEPS, 3, device=device)
+        # Last valid goal-aligned rotation matrix per drone, used as fallback when the
+        # drone is horizontally co-located with its goal (degenerate frame).
+        self._prev_R = torch.eye(3, device=device) \
+            .unsqueeze(0).unsqueeze(0) \
+            .expand(self.num_envs, self.N, 3, 3).clone()
         self._last_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_vel_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_acc_w = torch.zeros(self.num_envs, self.N, 3, device=device)
@@ -190,11 +197,20 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # obstacles as virtual agents with a larger radius.
         self._drone_rmin = torch.full((self.N,), self.cfg.rmin, device=device)
 
+        # One-shot override for _reset_idx: maps env_id (int) →
+        # {"init_pos": (N,3), "goal": (N,3)} in WORLD frame.
+        # Set before a reset call; consumed (popped) inside _reset_idx.
+        self._pinned_reset_state: dict[int, dict[str, torch.Tensor]] = {}
+
         # Consecutive steps all drones have been within success_dist_threshold.
         self._success_steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
         # Set to True for envs that triggered success termination this step.
         # Cleared at the start of each _get_dones call; safe to read after env.step() returns.
         self._just_succeeded = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        # Per-drone success tracking: consecutive steps each individual drone has held threshold.
+        self._drone_success_steps = torch.zeros(self.num_envs, self.N, dtype=torch.long, device=device)
+        # Per-drone flag: True for drone n in env e if that drone individually held threshold.
+        self._drone_just_succeeded = torch.zeros(self.num_envs, self.N, dtype=torch.bool, device=device)
 
         # First-env live DMPC horizon visualization buffers. Shapes are
         # (num_drones, horizon, 3); empty until the expert pushes a plan.
@@ -248,28 +264,64 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
     # ── physics step ───────────────────────────────────────────────────────
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Unpack normalised ``[delta_p_w, v_ref_w, a_ref_w]`` commands.
+        """Dispatch to wrench-direct or v_ref→cascade path based on action size.
 
-        The low-level wrench controller consumes the resulting world-frame
-        position, velocity, and acceleration references. The acceleration term
-        is currently passed through for the controller implementation work.
+        * ``actions.shape[-1] == N * 4``: wrench mode — ``[f_z, τ_x, τ_y, τ_z]``
+          per drone (body frame) applied directly, bypassing the cascade.
+        * ``actions.shape[-1] == N * 3``: v_ref mode — normalised velocity
+          reference in goal-aligned frame, converted via the cascade controller.
         """
-        a = actions.view(self.num_envs, self.N, 9).clamp(-1.0, 1.0)
+        E, N = self.num_envs, self.N
+
+        if actions.shape[-1] == N * 4:
+            # ── Wrench-direct mode ────────────────────────────────────────
+            w = actions.view(E, N, 4)
+            self._actions = w.clone()
+            self._thrust[:, :, 0, 2] = w[:, :, 0]    # body-frame thrust (z)
+            self._moment[:, :, 0, :] = w[:, :, 1:]   # body-frame torques
+            self._last_low_level_debug = {
+                "thrust_b_z": w[:, :, 0].detach().clone(),
+                "tau_des_b":  w[:, :, 1:].detach().clone(),
+            }
+            return
+
+        # ── v_ref mode (cascade) ──────────────────────────────────────────
+        a = actions.view(E, N, 3).clamp(-1.0, 1.0)
         self._actions = a.clone()
 
         st = self._stack_drone_state()
         pos_w = st["pos_w"]
-        delta_pos_w = a[..., 0:3] * self.cfg.delta_pos_max
-        ref_vel_w = a[..., 3:6] * self.cfg.v_max
-        ref_acc_w = a[..., 6:9] * self.cfg.accel_action_max
-        ref_pos_w = pos_w + delta_pos_w
+
+        # v_ref is expressed in each drone's goal-aligned frame → rotate to world frame.
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)   # (E, N, 3, 3)
+        self._prev_R = R.detach()  # keep fallback updated for next call
+        v_ref_goal = a * self.cfg.v_max                               # (E, N, 3)
+        ref_vel_w = torch.bmm(
+            R.transpose(-1, -2).reshape(E * N, 3, 3),
+            v_ref_goal.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
+
+        ref_pos_raw = pos_w + ref_vel_w * self.step_dt
+
+        # Near-goal homing: blend ref_pos toward goal so the cascade has a direct
+        # positional attractor.  With v_ref-only control, kp*(ref_pos-pos)=kp*v_ref*dt
+        # → zero restoring force when model predicts v_ref≈0, causing the drone to
+        # hover at a slight offset.  Blending ref_pos → goal when close removes that
+        # offset without changing the far-field behaviour.
+        goal_err = self._goal_pos_w - pos_w           # (E, N, 3)
+        goal_dist = goal_err.norm(dim=-1, keepdim=True)  # (E, N, 1)
+        blend_radius = self.cfg.goal_blend_radius       # default 0.5 m
+        alpha = (1.0 - goal_dist / blend_radius).clamp(min=0.0, max=1.0)
+        ref_pos_w = (1.0 - alpha) * ref_pos_raw + alpha * self._goal_pos_w
+        ref_vel_w = ref_vel_w * (1.0 - alpha)  # damp velocity reference near goal
+
+        ref_acc_w = torch.zeros_like(ref_vel_w)
 
         self._last_ref_pos_w = ref_pos_w.detach().clone()
         self._last_ref_vel_w = ref_vel_w.detach().clone()
         self._last_ref_acc_w = ref_acc_w.detach().clone()
 
-        ### Low-level controller
-        wrench_b = self._ref_to_thrust_moment(ref_pos_w, ref_vel_w, ref_acc_w)  # physical [N, N*m]
+        wrench_b = self._ref_to_thrust_moment(ref_pos_w, ref_vel_w, ref_acc_w)
         self._thrust[:, :, 0, 2] = wrench_b[:, :, 0]
         self._moment[:, :, 0, :] = wrench_b[:, :, 1:]
 
@@ -291,81 +343,129 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             "proj_gravity_b": torch.stack([r.data.projected_gravity_b for r in self._robots], dim=1),
         }
 
-    def get_per_drone_obs(self) -> torch.Tensor:
-        """Build the per-drone observation tensor used by the decentralised
-        student policy.
+    def _compute_goal_aligned_R(
+        self, pos_w: torch.Tensor, goal_w: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-drone goal-aligned rotation matrix: world → goal frame.
+
+        Frame definition:
+          x = horizontal direction toward goal (xy-plane projection)
+          z = global +z (up)
+          y = z × x  (right-hand rule)
+
+        Falls back to ``self._prev_R`` per (env, drone) when the drone's XY
+        position coincides with the goal's XY (degenerate: no horizontal
+        component to define x).  Does NOT update ``_prev_R`` — callers are
+        responsible for that.
+
+        Args:
+            pos_w:  ``(E, N, 3)`` drone positions in world frame.
+            goal_w: ``(E, N, 3)`` goal positions in world frame.
 
         Returns:
-            ``(num_envs, num_drones, per_drone_obs_dim)`` with layout for
-            drone ``i`` (body-frame coordinates expressed in drone ``i``'s body
-            frame):
+            R: ``(E, N, 3, 3)`` — apply as ``v_frame = R @ v_world``.
+        """
+        delta = goal_w - pos_w            # (E, N, 3)
+        dx = delta[..., 0]                # (E, N)
+        dy = delta[..., 1]
+        horiz_dist = (dx * dx + dy * dy).sqrt()  # (E, N)
 
-            * **0-2**   ``lin_vel_b``
-            * **3-5**   ``ang_vel_b``
-            * **6-8**   ``projected_gravity_b``
-            * **9-11**  goal position (body frame)
-            * **12-14** own previous action delta_p  (body frame, normalised)
-            * **15-17** own previous action v_ref    (body frame, normalised)
-            * **18-20** own previous action a_ref    (body frame, normalised)
-            * For each neighbour ``j`` in fixed order (drones ``0..N-1``
-              skipping ``i``):
-              * relative position (body frame, 3),
-              * relative linear velocity (body frame, 3),
-              * neighbour's last applied input -- its desired velocity command,
-                rotated into drone ``i``'s body frame (3).
-              * collision radius r_min (1).
+        safe = horiz_dist.clamp(min=1e-4)
+        cos_t = dx / safe                 # (E, N)
+        sin_t = dy / safe
+
+        zeros = torch.zeros_like(cos_t)
+        ones  = torch.ones_like(cos_t)
+
+        # R rows: x_frame, y_frame, z_frame expressed in world coords.
+        # v_frame = R @ v_world
+        #   R = [[ cos,  sin, 0],
+        #        [-sin,  cos, 0],
+        #        [   0,    0, 1]]
+        R = torch.stack(
+            [cos_t, sin_t, zeros, -sin_t, cos_t, zeros, zeros, zeros, ones],
+            dim=-1,
+        ).view(*cos_t.shape, 3, 3)  # (E, N, 3, 3)
+
+        # Fallback for degenerate cases (drone directly above/below goal).
+        deg = (horiz_dist < 1e-3).unsqueeze(-1).unsqueeze(-1)  # (E, N, 1, 1)
+        return torch.where(deg, self._prev_R, R)
+
+    def get_per_drone_obs(self) -> torch.Tensor:
+        """Build the per-drone observation tensor in world frame.
+
+        Returns:
+            ``(E, N, per_drone_obs_dim)`` layout for drone ``i``:
+
+            * **0-2**   goal position relative to drone, world frame
+            * **3-5**   linear velocity, world frame
+            * **6-14**  rotation matrix body→world, row-major flattened (R_wb)
+            * **15-17** angular velocity, body frame
+            * **18-32** past 5-step own positions relative to current, world frame
+            * **33-36** sinusoidal episode-progress embedding (TIME_EMB_DIM=4)
+            * For each neighbour ``j``:
+              * relative position world frame (3)
+              * relative velocity world frame (3)
+              * unit direction from neighbour to its goal, world frame (3)
         """
         E, N = self.num_envs, self.N
         st = self._stack_drone_state()
-        pos_w = st["pos_w"]
-        quat_w = st["quat_w"]
-        lin_vel_w = st["lin_vel_w"]
+        pos_w     = st["pos_w"]       # (E, N, 3)
+        quat_w    = st["quat_w"]      # (E, N, 4)
+        lin_vel_w = st["lin_vel_w"]   # (E, N, 3)
+        ang_vel_b = st["ang_vel_b"]   # (E, N, 3)
 
-        out = torch.empty(
-            (E, N, self.per_drone_obs_dim), device=self.device, dtype=pos_w.dtype
-        )
+        rot_wb    = matrix_from_quat(quat_w)          # (E, N, 3, 3)
+        R_wb_flat = rot_wb.reshape(E, N, 9)           # (E, N, 9) row-major
+
+        # Episode-progress sinusoidal embedding (E, TIME_EMB_DIM).
+        t = (self.episode_length_buf.float() / self.max_episode_length).clamp(0.0, 1.0)
+        t_emb = torch.stack([
+            torch.sin(torch.pi * t),
+            torch.cos(torch.pi * t),
+            torch.sin(2.0 * torch.pi * t),
+            torch.cos(2.0 * torch.pi * t),
+        ], dim=-1)  # (E, 4)
+
+        out = torch.empty((E, N, self.per_drone_obs_dim), device=self.device, dtype=pos_w.dtype)
+
         for i in range(N):
-            robot = self._robots[i]
-            quat_i = quat_w[:, i]
-            goal_b, _ = subtract_frame_transforms(
-                robot.data.root_pos_w, quat_i, self._goal_pos_w[:, i]
-            )
-            # Previous action (world-frame normalised vectors) → body frame.
-            prev_a = self._actions[:, i]  # (E, 9)
-            prev_delta_p_b = quat_apply_inverse(quat_i, prev_a[:, 0:3])
-            prev_v_ref_b   = quat_apply_inverse(quat_i, prev_a[:, 3:6])
-            prev_a_ref_b   = quat_apply_inverse(quat_i, prev_a[:, 6:9])
-            own = torch.cat(
-                [
-                    st["lin_vel_b"][:, i],
-                    st["ang_vel_b"][:, i],
-                    st["proj_gravity_b"][:, i],
-                    goal_b,
-                    prev_delta_p_b,
-                    prev_v_ref_b,
-                    prev_a_ref_b,
-                ],
-                dim=-1,
-            )  # (E, 21)
-            out[:, i, : PER_DRONE_OWN_DIM] = own
+            # Own features (all world frame except ang_vel_b).
+            goal_rel_w  = self._goal_pos_w[:, i] - pos_w[:, i]  # (E, 3)
+            lin_vel_w_i = lin_vel_w[:, i]                        # (E, 3)
+            R_wb_flat_i = R_wb_flat[:, i]                        # (E, 9)
+            ang_vel_b_i = ang_vel_b[:, i]                        # (E, 3)
 
+            # Past HISTORY_STEPS positions relative to current, world frame.
+            past_feats = []
+            for k in range(HISTORY_STEPS):
+                past_feats.append(self._pos_history[:, i, k] - pos_w[:, i])  # (E, 3)
+            past_rel_w = torch.cat(past_feats, dim=-1)  # (E, HISTORY_STEPS*3)
+
+            own = torch.cat(
+                [goal_rel_w, lin_vel_w_i, R_wb_flat_i, ang_vel_b_i, past_rel_w, t_emb],
+                dim=-1,
+            )  # (E, 37)
+            out[:, i, :PER_DRONE_OWN_DIM] = own
+
+            # Neighbour features (world frame).
             offset = PER_DRONE_OWN_DIM
             for j in range(N):
                 if j == i:
                     continue
-                rel_pos_w = pos_w[:, j] - pos_w[:, i]
-                rel_vel_w = lin_vel_w[:, j] - lin_vel_w[:, i]
-                rel_pos_b = quat_apply_inverse(quat_i, rel_pos_w)
-                rel_vel_b = quat_apply_inverse(quat_i, rel_vel_w)
-                # Neighbour input: their applied velocity reference, mapped
-                # into drone i's body frame. This is the "u_j" they are
-                # executing right now in paper notation.
-                neigh_ref_b = quat_apply_inverse(quat_i, self._last_ref_vel_w[:, j])
-                out[:, i, offset : offset + 3] = rel_pos_b
-                out[:, i, offset + 3 : offset + 6] = rel_vel_b
-                out[:, i, offset + 6 : offset + 9] = neigh_ref_b
-                out[:, i, offset + 9] = self._drone_rmin[j]
-                offset += PER_NEIGHBOUR_DIM
+                rel_pos_w = pos_w[:, j] - pos_w[:, i]              # (E, 3)
+                rel_vel_w = lin_vel_w[:, j] - lin_vel_w[:, i]      # (E, 3)
+                ng_delta  = self._goal_pos_w[:, j] - pos_w[:, j]   # (E, 3)
+                ng_dir_w  = ng_delta / ng_delta.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+                out[:, i, offset     : offset + 3] = rel_pos_w
+                out[:, i, offset + 3 : offset + 6] = rel_vel_w
+                out[:, i, offset + 6 : offset + 9] = ng_dir_w
+                offset += PER_NEIGHBOUR_DIM  # 9
+
+        # Shift position history and record current positions.
+        self._pos_history[:, :, 1:, :] = self._pos_history[:, :, :-1, :].clone()
+        self._pos_history[:, :, 0, :] = pos_w.detach()
+
         return out
 
     def _get_observations(self) -> dict:
@@ -428,6 +528,12 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # NOT cleared in _reset_idx — next _get_dones call clears it at entry.
         self._just_succeeded[:] = succeeded
 
+        # Per-drone success: each drone independently tracked regardless of others.
+        per_close = dist < self.cfg.success_dist_threshold  # (E, N)
+        self._drone_success_steps[per_close] += 1
+        self._drone_success_steps[~per_close] = 0
+        self._drone_just_succeeded[:] = self._drone_success_steps >= hold_steps
+
         return died | succeeded, time_out
 
     # ── resets ─────────────────────────────────────────────────────────────
@@ -467,6 +573,9 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_vel_w[env_ids] = 0.0
         self._last_ref_acc_w[env_ids] = 0.0
         self._success_steps[env_ids] = 0
+        self._drone_success_steps[env_ids] = 0
+        self._drone_just_succeeded[env_ids] = False
+        self._prev_R[env_ids] = torch.eye(3, device=self.device)
 
         # Random-exchange scenario (DMPC paper Section IV/VI): each drone on
         # one side of a random circle, goal on the diametrically opposite side.
@@ -494,8 +603,18 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         goal_pos = torch.cat([goal_xy, zg.unsqueeze(-1)], dim=-1)
         goal_pos[..., :2] += origins[:, None, :2]
 
+        # One-shot override: replay mode can pin specific envs to exact positions.
+        if self._pinned_reset_state:
+            for local_i, env_id in enumerate(env_ids.tolist()):
+                if env_id in self._pinned_reset_state:
+                    pin = self._pinned_reset_state.pop(env_id)
+                    init_pos[local_i] = pin["init_pos"].to(device)
+                    goal_pos[local_i] = pin["goal"].to(device)
+
         self._goal_pos_w[env_ids] = goal_pos
         self._init_pos_w[env_ids] = init_pos
+        # Fill history with init_pos so first-step relative displacements start at zero.
+        self._pos_history[env_ids] = init_pos.unsqueeze(2).expand(n, self.N, HISTORY_STEPS, 3)
 
         for i, robot in enumerate(self._robots):
             default_root = robot.data.default_root_state[env_ids].clone()
@@ -521,29 +640,31 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self,
         ref_pos_w: torch.Tensor,
         ref_vel_w: torch.Tensor | None = None,
-        ref_acc_w: torch.Tensor | None = None,
+        _ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pack world-frame ``[delta_p, v_ref, a_ref]`` into normalised action.
+        """Pack world-frame velocity reference into normalised 3-D action.
 
         Args:
-            ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions.
-            ref_vel_w: optional desired velocities in m/s.
-            ref_acc_w: optional desired accelerations in m/s^2.
+            ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions (unused,
+                kept for API compatibility with the DMPC expert).
+            ref_vel_w: desired velocities in m/s; zeros if omitted.
+            _ref_acc_w: ignored (kept for API compatibility).
 
         Returns:
-            ``(num_envs, num_drones * 9)`` action tensor in ``[-1, 1]``.
+            ``(num_envs, num_drones * 3)`` normalised v_ref in ``[-1, 1]``.
         """
-        st = self._stack_drone_state()
-        pos_w = st["pos_w"]
         if ref_vel_w is None:
             ref_vel_w = torch.zeros_like(ref_pos_w)
-        if ref_acc_w is None:
-            ref_acc_w = torch.zeros_like(ref_pos_w)
         E, N = ref_pos_w.shape[0], ref_pos_w.shape[1]
-        delta_norm = ((ref_pos_w - pos_w) / max(self.cfg.delta_pos_max, 1e-6)).clamp(-1.0, 1.0)
-        vel_norm = (ref_vel_w / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
-        acc_norm = (ref_acc_w / max(self.cfg.accel_action_max, 1e-6)).clamp(-1.0, 1.0)
-        return torch.cat([delta_norm, vel_norm, acc_norm], dim=-1).reshape(E, N * 9)
+        pos_w = self._stack_drone_state()["pos_w"]
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)  # (E, N, 3, 3)
+        # Rotate world-frame v_ref into each drone's goal-aligned frame.
+        v_ref_goal = torch.bmm(
+            R.reshape(E * N, 3, 3),
+            ref_vel_w.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
+        vel_norm = (v_ref_goal / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
+        return vel_norm.reshape(E, N * 3)
 
     def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
         """Compatibility helper: pack velocity-only commands with zero acceleration."""
