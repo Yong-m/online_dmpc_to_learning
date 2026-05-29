@@ -301,19 +301,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             v_ref_goal.reshape(E * N, 3, 1),
         ).reshape(E, N, 3)
 
-        ref_pos_raw = pos_w + ref_vel_w * self.step_dt
-
-        # Near-goal homing: blend ref_pos toward goal so the cascade has a direct
-        # positional attractor.  With v_ref-only control, kp*(ref_pos-pos)=kp*v_ref*dt
-        # → zero restoring force when model predicts v_ref≈0, causing the drone to
-        # hover at a slight offset.  Blending ref_pos → goal when close removes that
-        # offset without changing the far-field behaviour.
-        goal_err = self._goal_pos_w - pos_w           # (E, N, 3)
-        goal_dist = goal_err.norm(dim=-1, keepdim=True)  # (E, N, 1)
-        blend_radius = self.cfg.goal_blend_radius       # default 0.5 m
-        alpha = (1.0 - goal_dist / blend_radius).clamp(min=0.0, max=1.0)
-        ref_pos_w = (1.0 - alpha) * ref_pos_raw + alpha * self._goal_pos_w
-        ref_vel_w = ref_vel_w * (1.0 - alpha)  # damp velocity reference near goal
+        # Integrate v_ref: advance reference from last reference position.
+        ref_pos_w = self._last_ref_pos_w + ref_vel_w * self.step_dt
 
         ref_acc_w = torch.zeros_like(ref_vel_w)
 
@@ -569,7 +558,6 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             )
 
         self._actions[env_ids] = 0.0
-        self._last_ref_pos_w[env_ids] = 0.0
         self._last_ref_vel_w[env_ids] = 0.0
         self._last_ref_acc_w[env_ids] = 0.0
         self._success_steps[env_ids] = 0
@@ -613,6 +601,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
         self._goal_pos_w[env_ids] = goal_pos
         self._init_pos_w[env_ids] = init_pos
+        self._last_ref_pos_w[env_ids] = init_pos  # seed integration at drone start position
         # Fill history with init_pos so first-step relative displacements start at zero.
         self._pos_history[env_ids] = init_pos.unsqueeze(2).expand(n, self.N, HISTORY_STEPS, 3)
 
