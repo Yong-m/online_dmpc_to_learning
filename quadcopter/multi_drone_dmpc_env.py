@@ -44,7 +44,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_rotate_inverse, subtract_frame_transforms, matrix_from_quat
+from isaaclab.utils.math import quat_apply_inverse, subtract_frame_transforms, matrix_from_quat
 
 ##
 # Pre-defined configs
@@ -54,8 +54,9 @@ from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 
 
 # Per-drone observation layout sizes.
-PER_DRONE_OWN_DIM = 12   # lin_vel_b (3) + ang_vel_b (3) + projected_gravity_b (3) + goal_b (3)
-PER_NEIGHBOUR_DIM = 9    # rel_pos_b (3) + rel_vel_b (3) + neighbour_last_input_b (3)
+PER_DRONE_OWN_DIM = 21   # lin_vel_b (3) + ang_vel_b (3) + projected_gravity_b (3) + goal_b (3)
+                         # + prev_delta_p_b (3) + prev_v_ref_b (3) + prev_a_ref_b (3)
+PER_NEIGHBOUR_DIM = 10   # rel_pos_b (3) + rel_vel_b (3) + neighbour_last_input_b (3) + r_min (1)
 
 
 def per_drone_obs_dim(num_drones: int) -> int:
@@ -78,7 +79,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4 # overwritten by cli args
     episode_length_s: float = 10.0
-    decimation: int = 2
+    decimation: int = 5
     action_space: int = 9 * 4   # 9 per drone, overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
@@ -108,6 +109,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     static_obstacle_xy_min: tuple[float, float] = (-1.0, -1.0)
     static_obstacle_xy_max: tuple[float, float] = (1.0, 1.0)
     static_obstacle_z_range: tuple[float, float] = (0.6, 1.4)
+    success_dist_threshold: float = 0.05   # metres; all drones must be within this
+    success_hold_s: float = 1.0            # seconds all drones must hold the threshold
 
     ui_window_class_type = MultiDroneDmpcEnvWindow
 
@@ -168,8 +171,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     rmin: float = 0.3
     # Action normalisation for the reference-command interface. The per-drone
     # action is [delta_p_w, v_ref_w, a_ref_w] in normalised [-1, 1] units.
-    delta_pos_max: float = 10.0 # 0.2
-    v_max: float = 5.0 #2.0
+    delta_pos_max: float = 0.3
+    v_max: float = 2.0
     accel_action_max: float = 2.0 #1.0
 
     # ── position-reference tracker gains ──
@@ -224,6 +227,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._static_obstacle_pos_w = torch.zeros(
             self.num_envs, self.cfg.num_static_obstacles, 3, device=device
         )
+
+        # Per-drone collision radius used in the neighbour observation.
+        # Defaults to cfg.rmin for all drones; set individual entries to model
+        # obstacles as virtual agents with a larger radius.
+        self._drone_rmin = torch.full((self.N,), self.cfg.rmin, device=device)
+
+        # Consecutive steps all drones have been within success_dist_threshold.
+        self._success_steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        # Set to True for envs that triggered success termination this step.
+        # Cleared at the start of each _get_dones call; safe to read after env.step() returns.
+        self._just_succeeded = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
 
         # First-env live DMPC horizon visualization buffers. Shapes are
         # (num_drones, horizon, 3); empty until the expert pushes a plan.
@@ -346,12 +360,16 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             * **3-5**   ``ang_vel_b``
             * **6-8**   ``projected_gravity_b``
             * **9-11**  goal position (body frame)
+            * **12-14** own previous action delta_p  (body frame, normalised)
+            * **15-17** own previous action v_ref    (body frame, normalised)
+            * **18-20** own previous action a_ref    (body frame, normalised)
             * For each neighbour ``j`` in fixed order (drones ``0..N-1``
               skipping ``i``):
               * relative position (body frame, 3),
               * relative linear velocity (body frame, 3),
               * neighbour's last applied input -- its desired velocity command,
                 rotated into drone ``i``'s body frame (3).
+              * collision radius r_min (1).
         """
         E, N = self.num_envs, self.N
         st = self._stack_drone_state()
@@ -368,15 +386,23 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             goal_b, _ = subtract_frame_transforms(
                 robot.data.root_pos_w, quat_i, self._goal_pos_w[:, i]
             )
+            # Previous action (world-frame normalised vectors) → body frame.
+            prev_a = self._actions[:, i]  # (E, 9)
+            prev_delta_p_b = quat_apply_inverse(quat_i, prev_a[:, 0:3])
+            prev_v_ref_b   = quat_apply_inverse(quat_i, prev_a[:, 3:6])
+            prev_a_ref_b   = quat_apply_inverse(quat_i, prev_a[:, 6:9])
             own = torch.cat(
                 [
                     st["lin_vel_b"][:, i],
                     st["ang_vel_b"][:, i],
                     st["proj_gravity_b"][:, i],
                     goal_b,
+                    prev_delta_p_b,
+                    prev_v_ref_b,
+                    prev_a_ref_b,
                 ],
                 dim=-1,
-            )  # (E, 12)
+            )  # (E, 21)
             out[:, i, : PER_DRONE_OWN_DIM] = own
 
             offset = PER_DRONE_OWN_DIM
@@ -385,15 +411,16 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                     continue
                 rel_pos_w = pos_w[:, j] - pos_w[:, i]
                 rel_vel_w = lin_vel_w[:, j] - lin_vel_w[:, i]
-                rel_pos_b = quat_rotate_inverse(quat_i, rel_pos_w)
-                rel_vel_b = quat_rotate_inverse(quat_i, rel_vel_w)
+                rel_pos_b = quat_apply_inverse(quat_i, rel_pos_w)
+                rel_vel_b = quat_apply_inverse(quat_i, rel_vel_w)
                 # Neighbour input: their applied velocity reference, mapped
                 # into drone i's body frame. This is the "u_j" they are
                 # executing right now in paper notation.
-                neigh_ref_b = quat_rotate_inverse(quat_i, self._last_ref_vel_w[:, j])
+                neigh_ref_b = quat_apply_inverse(quat_i, self._last_ref_vel_w[:, j])
                 out[:, i, offset : offset + 3] = rel_pos_b
                 out[:, i, offset + 3 : offset + 6] = rel_vel_b
                 out[:, i, offset + 6 : offset + 9] = neigh_ref_b
+                out[:, i, offset + 9] = self._drone_rmin[j]
                 offset += PER_NEIGHBOUR_DIM
         return out
 
@@ -437,6 +464,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self._just_succeeded[:] = False  # clear previous step's flag
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         pos_w = torch.stack([r.data.root_pos_w for r in self._robots], dim=1)
         z = pos_w[..., 2]
@@ -444,7 +472,19 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             died = ((z < self.cfg.z_min) | (z > self.cfg.z_max)).any(dim=-1)
         else:
             died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        return died, time_out
+
+        # Success termination: all drones within threshold for hold duration.
+        dist = torch.linalg.norm(pos_w - self._goal_pos_w, dim=-1)  # (E, N)
+        all_close = (dist < self.cfg.success_dist_threshold).all(dim=-1)  # (E,)
+        self._success_steps[all_close] += 1
+        self._success_steps[~all_close] = 0
+        hold_steps = max(1, round(self.cfg.success_hold_s / self.step_dt))
+        succeeded = self._success_steps >= hold_steps
+        # Expose for the collection loop to read after env.step() returns.
+        # NOT cleared in _reset_idx — next _get_dones call clears it at entry.
+        self._just_succeeded[:] = succeeded
+
+        return died | succeeded, time_out
 
     # ── resets ─────────────────────────────────────────────────────────────
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -486,6 +526,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_acc_w[env_ids] = 0.0
         self._vel_action_ref_pos_w[env_ids] = 0.0
         self._vel_action_ref_initialized[env_ids] = False
+        self._success_steps[env_ids] = 0
 
         # Random-exchange scenario (DMPC paper Section IV/VI): each drone on
         # one side of a random circle, goal on the diametrically opposite side.
@@ -1066,7 +1107,7 @@ def _acc_to_thrust_moment_action(env: MultiDroneDmpcEnv, accel_w: torch.Tensor) 
     err_w = torch.cross(body_z_w, b_z_des, dim=-1)
 
     ang_vel_b = torch.stack([r.data.root_ang_vel_b for r in env._robots], dim=1)
-    err_b = quat_rotate_inverse(quat_w.reshape(-1, 4), err_w.reshape(-1, 3)).reshape(E, N, 3)
+    err_b = quat_apply_inverse(quat_w.reshape(-1, 4), err_w.reshape(-1, 3)).reshape(E, N, 3)
 
     moment_cmd = env.cfg.att_track_kp * err_b - env.cfg.att_track_kd * ang_vel_b
     norm = (moment_cmd / max(env.cfg.moment_scale, 1e-6)).clamp(-1.0, 1.0)
