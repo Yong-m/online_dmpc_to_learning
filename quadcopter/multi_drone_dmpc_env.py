@@ -670,6 +670,24 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         """Alias for :meth:`reference_to_action` used by the DMPC expert."""
         return self.reference_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
 
+    def vref_to_action(self, ref_vel_w: torch.Tensor) -> torch.Tensor:
+        """Rotate world-frame velocity reference into goal-aligned frame and normalise.
+
+        Returns ``(num_envs, num_drones * 3)`` in ``[-1, 1]`` — the 3-D action
+        consumed by the v_ref cascade path in :meth:`_pre_physics_step`.
+        """
+        st = self._stack_drone_state()
+        pos_w = st["pos_w"]
+        E, N = pos_w.shape[0], pos_w.shape[1]
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)   # (E, N, 3, 3)
+        # world → goal frame: v_goal = R @ ref_vel_w
+        v_goal = torch.bmm(
+            R.reshape(E * N, 3, 3),
+            ref_vel_w.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
+        vel_norm = (v_goal / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
+        return vel_norm.reshape(E, N * 3)
+
     # ── internal: cascaded position controller -> thrust/moment ────────────
     def _ref_to_thrust_moment(
         self,

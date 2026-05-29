@@ -188,7 +188,7 @@ except Exception:
 
 
 # Per-drone action dimension: wrench [f_z, tau_x, tau_y, tau_z] in body frame.
-PER_DRONE_ACTION_DIM = 4
+PER_DRONE_ACTION_DIM = 3  # goal-aligned v_ref [vx, vy, vz] normalised to [-1, 1]
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -679,7 +679,8 @@ def expert_action(
     )
     ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     _push_first_env_debug_trajectories(env, expert, states)
-    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
+    # Convert world-frame v_ref to goal-aligned 3D action for the v_ref cascade.
+    action = env.vref_to_action(ref_vel_w)
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
     return action
@@ -1166,7 +1167,6 @@ def main():
         emb_dim=args_cli.emb_dim,
         sample_steps=args_cli.sample_steps,
         device=device,
-        action_clip=args_cli.action_clip,
     ).to(device)
     if args_cli.resume is not None and os.path.isfile(args_cli.resume):
         policy.load_state_dict(torch.load(args_cli.resume, map_location=device))
@@ -1315,28 +1315,19 @@ def main():
                         debug_step=expert_collect_step,
                     )  # (E, N*A)
 
-                action_per_drone = action_flat.view(env_raw.num_envs, N, A).clone()
-                act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
+                obs_before = per_drone_obs  # obs at time t
 
-                # Override replay envs with saved trajectory actions.
-                if replay_pool is not None and replay_pool.active:
-                    for _rid in replay_pool.replay_ids:
-                        _ra, _rl = replay_pool.step(_rid)
-                        if _ra is not None:
-                            action_per_drone[_rid] = _ra
-                            act_latent[_rid] = _rl
-                    action_flat = action_per_drone.reshape(env_raw.num_envs, N * A)
-
-                # Update obs normaliser stats every step (all envs, regardless of
-                # episode outcome) so the normaliser sees the full distribution.
-                policy.update_obs_norm(per_drone_obs.reshape(-1, P).detach())
-                # Stage in per-env episode buffer; flush per-drone on episode end
-                # based on individual drone success (not env-level all-or-nothing).
-                ep_buf.push(per_drone_obs.detach(), act_latent.detach())
-                if traj_recorder is not None:
-                    traj_recorder.push(per_drone_obs.detach(), act_latent.detach(), env_raw)
+                # Update obs normaliser stats before stepping.
+                policy.update_obs_norm(obs_before.reshape(-1, P).detach())
 
                 _, reward, terminated, truncated, _ = env.step(action_flat)
+
+                # action_flat is goal-aligned v_ref ∈ [-1,1]^3 per drone.
+                action_per_drone = action_flat.view(env_raw.num_envs, N, A).detach()
+                policy.update_act_norm(action_per_drone.reshape(-1, A))
+                ep_buf.push(obs_before.detach(), action_per_drone)
+                if traj_recorder is not None:
+                    traj_recorder.push(obs_before.detach(), action_per_drone, env_raw)
                 per_drone_obs = env_raw.get_per_drone_obs()
                 episode_returns += reward
                 done = terminated | truncated
