@@ -79,7 +79,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4
     episode_length_s: float = 10.0
-    decimation: int = 5
+    decimation: int = 2
     action_space: int = 3 * 4   # 3 (v_ref) per drone, overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
@@ -276,12 +276,15 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         if actions.shape[-1] == N * 4:
             # ── Wrench-direct mode ────────────────────────────────────────
             w = actions.view(E, N, 4)
-            self._actions = w.clone()
-            self._thrust[:, :, 0, 2] = w[:, :, 0]    # body-frame thrust (z)
-            self._moment[:, :, 0, :] = w[:, :, 1:]   # body-frame torques
+            max_thrust = self.cfg.thrust_to_weight * self._robot_weight
+            f_z  = w[:, :, 0].clamp(0.0, max_thrust)
+            tau  = w[:, :, 1:].clamp(-self.cfg.moment_scale, self.cfg.moment_scale)
+            self._actions = torch.cat([f_z.unsqueeze(-1), tau], dim=-1)
+            self._thrust[:, :, 0, 2] = f_z
+            self._moment[:, :, 0, :] = tau
             self._last_low_level_debug = {
-                "thrust_b_z": w[:, :, 0].detach().clone(),
-                "tau_des_b":  w[:, :, 1:].detach().clone(),
+                "thrust_b_z": f_z.detach().clone(),
+                "tau_des_b":  tau.detach().clone(),
             }
             return
 
@@ -724,9 +727,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         ) # (E, N, 3)
         z_wb = rot_wb[:, :, :, 2]  # (E, N, 3)
         f = torch.einsum("...i,...i->...", F_des_w, z_wb)  # (E, N), desired thrust magnitude
-        # max_thrust = self.cfg.thrust_to_weight * self._robot_weight
-        # f = f.clamp(0.0, max_thrust)
-        # Temporarily leave thrust unclipped while debugging the ideal wrench controller.
+        max_thrust = self.cfg.thrust_to_weight * self._robot_weight
+        f = f.clamp(0.0, max_thrust)
 
         # attitude
         z_des = F_des_w / torch.norm(F_des_w, dim=-1, keepdim=True).clamp(min=1e-6)  # (E, N, 3)
@@ -745,9 +747,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         e_R = vee(0.5 * (torch.einsum("...ij,...ik->...jk", rot_des, rot_wb) - torch.einsum("...ij,...ik->...jk", rot_wb, rot_des))) # (E, N, 3)
         e_w = angvel_b # set desired angular velocity to zero for now
 
-        tau_des_b = -self.cfg.att_track_kp * e_R - self.cfg.att_track_kd * e_w  # (E, N, 3)
-        # tau_des_b = - self.cfg.att_track_kp * e_R
-        # tau_des_b = torch.zeros_like(e_R)  # placeholder while we iterate on the controller implementation
+        tau_des_b = (-self.cfg.att_track_kp * e_R - self.cfg.att_track_kd * e_w
+                     ).clamp(-self.cfg.moment_scale, self.cfg.moment_scale)  # (E, N, 3)
         self._last_low_level_debug = {
             "acc_cmd_w": acc_cmd_w.detach().clone(),
             "F_des_w": F_des_w.detach().clone(),
