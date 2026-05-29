@@ -803,7 +803,7 @@ class DMPCExpert:
         new_seeds = [
             (self._M_deriv_h[r] @ U_sol).reshape(3)
             for r in range(self.p.deg_poly + 1)
-        ]
+        ] # sample refs shifted by one timestep
         self._state[(env_idx, agent_idx)] = {
             "U": U_sol,
             "u_pred": u_pred,

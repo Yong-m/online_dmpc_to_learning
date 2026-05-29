@@ -93,10 +93,6 @@ parser.add_argument("--expert_test_steps", type=int, default=None,
                     help="Expert-only rollout length. Defaults to 3 full episodes per env.")
 parser.add_argument("--expert_test_progress_every", type=int, default=100,
                     help="Print expert-test progress every N env steps (0 disables progress prints).")
-parser.add_argument("--success_goal_tol", type=float, default=0.05,
-                    help="Per-drone goal distance threshold for env-level success.")
-parser.add_argument("--success_dwell_steps", type=int, default=10,
-                    help="Consecutive steps all drones must stay within goal tolerance.")
 parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds for debug rollouts.")
 parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
@@ -560,8 +556,9 @@ def expert_action(
     )
     ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     _push_first_env_debug_trajectories(env, expert, states)
-    # action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)   # i) Full trajectory command
-    action = env.velocity_to_action(ref_vel_w)                      # ii) Recon from velocity command
+    
+    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)   # i) Full trajectory command
+    # action = env.velocity_to_action(ref_vel_w)                      # ii) Recon from velocity command
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
     return action
@@ -715,8 +712,6 @@ def run_expert_test(
     env: MultiDroneDmpcEnv,
     expert: DMPCExpert,
     n_steps: int,
-    goal_tol: float,
-    dwell_steps: int,
     debug_logger: DmpcExpertLogger | None = None,
     log_every: int = 1,
     progress_every: int = 100,
@@ -732,7 +727,6 @@ def run_expert_test(
     E = env.num_envs
     N = env.cfg.num_drones
     episode_returns = torch.zeros(E, device=device)
-    episode_dwell = torch.zeros(E, dtype=torch.long, device=device)
     episode_success = torch.zeros(E, dtype=torch.bool, device=device)
     episode_drone_collision = torch.zeros(E, dtype=torch.bool, device=device)
     episode_obstacle_collision = torch.zeros(E, dtype=torch.bool, device=device)
@@ -758,7 +752,6 @@ def run_expert_test(
             ids = rewound.nonzero(as_tuple=False).flatten()
             expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
             episode_returns[ids] = 0.0
-            episode_dwell[ids] = 0
             episode_success[ids] = False
             episode_drone_collision[ids] = False
             episode_obstacle_collision[ids] = False
@@ -778,9 +771,6 @@ def run_expert_test(
         st = env.get_world_states()
         pos_w = st["pos_w"]
         goal_dist = torch.linalg.norm(pos_w - st["goal_w"], dim=-1)
-        all_at_goal = goal_dist.max(dim=-1).values < goal_tol
-        episode_dwell = torch.where(all_at_goal, episode_dwell + 1, torch.zeros_like(episode_dwell))
-
         if N > 1:
             pair_diff = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)
             pair_dist = torch.linalg.norm(pair_diff, dim=-1)
@@ -792,24 +782,24 @@ def run_expert_test(
         z = pos_w[..., 2]
         episode_bounds_failure |= ((z < env.cfg.z_min) | (z > env.cfg.z_max)).any(dim=-1)
 
-        goal_reached = episode_dwell >= dwell_steps
-        newly_succeeded = goal_reached & ~episode_success
+        success_done = getattr(env, "_just_succeeded", torch.zeros(E, dtype=torch.bool, device=device)).clone()
+        newly_succeeded = success_done & ~episode_success
         episode_success_step[newly_succeeded] = step
         episode_success |= newly_succeeded
 
         natural_done = terminated | truncated
-        success_done = newly_succeeded
         done = natural_done | success_done
         if done.any():
             done_ids = done.nonzero(as_tuple=False).flatten()
             total_episodes += int(done_ids.numel())
-            clean_success = episode_success & ~(episode_drone_collision | episode_obstacle_collision | episode_bounds_failure | terminated)
+            failure_terminated = terminated & ~success_done
+            clean_success = episode_success & ~(episode_drone_collision | episode_obstacle_collision | episode_bounds_failure | failure_terminated)
             total_success += int(episode_success[done_ids].sum().item())
             total_clean_success += int(clean_success[done_ids].sum().item())
             total_drone_collision += int(episode_drone_collision[done_ids].sum().item())
             total_obstacle_collision += int(episode_obstacle_collision[done_ids].sum().item())
             total_bounds_failure += int(episode_bounds_failure[done_ids].sum().item())
-            total_terminated += int(terminated[done_ids].sum().item())
+            total_terminated += int(failure_terminated[done_ids].sum().item())
             total_truncated += int(truncated[done_ids].sum().item())
             completed_returns.extend(episode_returns[done_ids].detach().cpu().tolist())
             success_done_ids = done_ids[episode_success[done_ids]]
@@ -835,19 +825,8 @@ def run_expert_test(
         else:
             ids = None
 
-        manual_success_ids = success_done.nonzero(as_tuple=False).flatten()
-        if manual_success_ids.numel() > 0:
-            env._reset_idx(manual_success_ids)
-            env.scene.write_data_to_sim()
-            env.sim.forward()
-            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=manual_success_ids)
-            if hasattr(env, "_last_reset_env_ids"):
-                env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
-            ids = manual_success_ids if ids is None else torch.unique(torch.cat([ids, manual_success_ids]))
-
         if ids is not None and ids.numel() > 0:
             episode_returns[ids] = 0.0
-            episode_dwell[ids] = 0
             episode_success[ids] = False
             episode_drone_collision[ids] = False
             episode_obstacle_collision[ids] = False
@@ -971,21 +950,6 @@ def main():
         f"obs_total={env_raw.cfg.observation_space}  action_total={env_raw.cfg.action_space}"
     )
 
-    policy = SharedDronePolicy(
-        per_drone_obs_dim=P,
-        per_drone_action_dim=A,
-        hidden_dims=args_cli.hidden_dims,
-        emb_dim=args_cli.emb_dim,
-        sample_steps=args_cli.sample_steps,
-        device=device,
-    ).to(device)
-    if args_cli.resume is not None and os.path.isfile(args_cli.resume):
-        policy.load_state_dict(torch.load(args_cli.resume, map_location=device))
-        print(f"[online_bc_dmpc] loaded checkpoint from {args_cli.resume}")
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args_cli.lr)
-
-    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A, device)
-
     # The DMPC expert distinguishes the MPC replanning period ``h`` (default
     # 0.1 s, as in the paper) from the control / subsample rate ``ts``. We
     # bind ``ts`` to the env step (sim.dt * decimation) so every env step the
@@ -1022,14 +986,12 @@ def main():
 
     expert.reset(obstacle_info=env_raw.get_obstacle_info())
     if args_cli.expert_test_only:
-        n_test_steps = args_cli.expert_test_steps if args_cli.expert_test_steps is not None else 3 * int(env.max_episode_length)
+        n_test_steps = args_cli.expert_test_steps if args_cli.expert_test_steps is not None else 3 * int(env_raw.max_episode_length)
         try:
             run_expert_test(
-                env=env,
+                env=env_raw,
                 expert=expert,
                 n_steps=n_test_steps,
-                goal_tol=args_cli.success_goal_tol,
-                dwell_steps=args_cli.success_dwell_steps,
                 debug_logger=dmpc_logger,
                 log_every=args_cli.dmpc_log_every,
                 progress_every=args_cli.expert_test_progress_every,
@@ -1041,6 +1003,21 @@ def main():
             env.close()
             simulation_app.close()
         return
+
+    policy = SharedDronePolicy(
+        per_drone_obs_dim=P,
+        per_drone_action_dim=A,
+        hidden_dims=args_cli.hidden_dims,
+        emb_dim=args_cli.emb_dim,
+        sample_steps=args_cli.sample_steps,
+        device=device,
+    ).to(device)
+    if args_cli.resume is not None and os.path.isfile(args_cli.resume):
+        policy.load_state_dict(torch.load(args_cli.resume, map_location=device))
+        print(f"[online_bc_dmpc] loaded checkpoint from {args_cli.resume}")
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args_cli.lr)
+
+    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A, device)
 
     if hasattr(env_raw, "_last_reset_env_ids"):
         env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
@@ -1111,7 +1088,7 @@ def main():
                                  env_ids=reset_env_ids)
                     env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
                 if done.any():
-                    expert.reset(obstacle_info=env.get_obstacle_info(),
+                    expert.reset(obstacle_info=env_raw.get_obstacle_info(),
                                  env_ids=done.nonzero(as_tuple=False).flatten())
                 if done.any():
                     # _just_succeeded is set by _get_dones inside env.step() and

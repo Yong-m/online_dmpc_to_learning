@@ -79,8 +79,9 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4 # overwritten by cli args
     episode_length_s: float = 10.0
-    decimation: int = 5
-    action_space: int = 9 * 4   # 9 per drone, overwritten in __post_init__
+    decimation: int = 2
+    # action_type: str = "full_traj" # "full_traj", "velocity", "wrench"
+    action_space: int = None   # overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
@@ -89,7 +90,11 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     randomize_episode_start: bool = True
     terminate_on_bounds: bool = True
     collision_free_two_drone_reset: bool = False # For DMPC debugging
-
+    task_spread_mode: str = "symmetric"  # "symmetric" for ring/opposite goals, "free" for spread sampling
+    reset_min_separation: float = 0.45
+    reset_min_start_goal_distance: float = 1.0
+    reset_sampling_attempts: int = 64
+    
     # Static obstacles
     enable_static_obstacles: bool = True
     randomize_static_obstacles: bool = False
@@ -537,16 +542,30 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             goal_xy = torch.tensor([[1.0, -0.55], [1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
             z0 = torch.ones(n, self.N, device=device)
             zg = torch.ones(n, self.N, device=device)
-        else:
+        elif self.cfg.task_spread_mode == "symmetric":
             radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
             theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
             theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
             theta0 = theta_base + theta_offsets
             z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
-
             init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
             goal_xy = -init_xy
             zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+        elif self.cfg.task_spread_mode == "free":
+            init_pos_local = self._sample_spread_reset_points(n, self.N, device)
+            goal_pos_local = self._sample_spread_reset_points(
+                n,
+                self.N,
+                device,
+                avoid_points=init_pos_local,
+                min_avoid_dist=self.cfg.reset_min_start_goal_distance,
+            )
+            init_xy = init_pos_local[..., :2]
+            z0 = init_pos_local[..., 2]
+            goal_xy = goal_pos_local[..., :2]
+            zg = goal_pos_local[..., 2]
+        else:
+            raise ValueError(f"Unsupported task_spread_mode: {self.cfg.task_spread_mode!r}")
 
         origins = self._terrain.env_origins[env_ids]
         init_pos = torch.cat([init_xy, z0.unsqueeze(-1)], dim=-1)
@@ -604,6 +623,47 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             robot.write_root_pose_to_sim(default_root[:, :7], env_ids)
             robot.write_root_velocity_to_sim(default_root[:, 7:], env_ids)
             robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+    def _sample_spread_reset_points(
+        self,
+        num_resets: int,
+        num_points: int,
+        device: torch.device,
+        avoid_points: torch.Tensor | None = None,
+        min_avoid_dist: float | None = None,
+    ) -> torch.Tensor:
+        """Sample workspace points with simple 3D spread constraints."""
+        pmin = torch.tensor(self.cfg.pos_min, device=device, dtype=torch.float32)
+        pmax = torch.tensor(self.cfg.pos_max, device=device, dtype=torch.float32)
+        z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
+        z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
+        pmin = pmin.clone()
+        pmax = pmax.clone()
+        pmin[2] = z_low
+        pmax[2] = z_high
+
+        points = pmin + (pmax - pmin) * torch.rand(num_resets, num_points, 3, device=device)
+        min_pair = float(self.cfg.reset_min_separation)
+        if min_avoid_dist is None:
+            min_avoid_dist = min_pair
+
+        for _ in range(max(1, int(self.cfg.reset_sampling_attempts))):
+            invalid = torch.zeros(num_resets, num_points, dtype=torch.bool, device=device)
+            if num_points > 1 and min_pair > 0.0:
+                diff = points[:, :, None, :] - points[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1)
+                eye = torch.eye(num_points, device=device, dtype=torch.bool).unsqueeze(0)
+                too_close = (dist < min_pair) & ~eye
+                invalid |= too_close.any(dim=-1)
+            if avoid_points is not None and min_avoid_dist > 0.0:
+                avoid_diff = points[:, :, None, :] - avoid_points[:, None, :, :]
+                avoid_dist = torch.linalg.norm(avoid_diff, dim=-1)
+                invalid |= (avoid_dist < min_avoid_dist).any(dim=-1)
+            if not invalid.any():
+                break
+            resampled = pmin + (pmax - pmin) * torch.rand(num_resets, num_points, 3, device=device)
+            points = torch.where(invalid[..., None], resampled, points)
+        return points
 
     def _push_points_out_of_static_obstacle_ellipsoids(
         self,
@@ -734,17 +794,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         st = self._stack_drone_state()
         pos_w = st["pos_w"]
 
-        init_mask = ~self._vel_action_ref_initialized
-        if init_mask.any():
-            self._vel_action_ref_pos_w[init_mask] = pos_w[init_mask]
-            self._vel_action_ref_initialized[init_mask] = True
+        # init_mask = ~self._vel_action_ref_initialized
+        # if init_mask.any():
+        #     self._vel_action_ref_pos_w[init_mask] = pos_w[init_mask]
+        #     self._vel_action_ref_initialized[init_mask] = True
 
-        self._vel_action_ref_pos_w = self._vel_action_ref_pos_w + v_cmd_w * self.step_dt
-        ref_pos_w = self._vel_action_ref_pos_w
+        # self._vel_action_ref_pos_w = self._vel_action_ref_pos_w + v_cmd_w * self.step_dt
+        # ref_pos_w = self._vel_action_ref_pos_w
 
         # Previous reconstruction used the current state every step, which makes
         # the reference position discontinuous when tracking error exists:
-        # ref_pos_w = pos_w + v_cmd_w * self.step_dt
+        ref_pos_w = pos_w + v_cmd_w * self.step_dt
         return self.reference_to_action(ref_pos_w, v_cmd_w, torch.zeros_like(v_cmd_w))
 
     def ref_to_action(
