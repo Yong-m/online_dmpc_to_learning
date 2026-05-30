@@ -101,7 +101,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     show_static_obstacle_ellipsoid_vis: bool = True
     num_static_obstacles: int = 2
     static_obstacle_radius: float = 0.15
-    static_obstacle_size: tuple[float, float, float] = (0.25, 1.2, 2.5)
+    static_obstacle_size: tuple[float, float, float] = (0.25, 1.25, 2.5)
     static_obstacle_ellipsoid_margin: float = 0.10
     static_obstacle_ellipsoid_mode: str = "outer_single"  # "outer_single" or "grid"
     static_obstacle_outer_ellipsoid_axes: tuple[float, float, float] = (0.4, 1.3, 10.0)
@@ -596,10 +596,13 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
 
             init_pos = self._push_points_out_of_static_obstacle_ellipsoids(init_pos, obs_pos, origins)
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, obs_pos, origins)
             init_pos[..., 2] = init_pos[..., 2].clamp(z_low, z_high)
             self._init_pos_w[env_ids] = init_pos
 
             goal_pos = self._push_points_out_of_static_obstacle_ellipsoids(goal_pos, obs_pos, origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, obs_pos, origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, obs_pos, origins, avoid_points=init_pos)
             goal_pos[..., 2] = goal_pos[..., 2].clamp(z_low, z_high)
             self._goal_pos_w[env_ids] = goal_pos
 
@@ -613,6 +616,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 obstacle.write_root_velocity_to_sim(zero_vel, env_ids)
         elif self.cfg.num_static_obstacles > 0:
             self._static_obstacle_pos_w[env_ids] = 0.0
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
+            self._init_pos_w[env_ids] = init_pos
+            self._goal_pos_w[env_ids] = goal_pos
+        else:
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
+            self._init_pos_w[env_ids] = init_pos
+            self._goal_pos_w[env_ids] = goal_pos
 
         for i, robot in enumerate(self._robots):
             default_root = robot.data.default_root_state[env_ids].clone()
@@ -664,6 +678,52 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             resampled = pmin + (pmax - pmin) * torch.rand(num_resets, num_points, 3, device=device)
             points = torch.where(invalid[..., None], resampled, points)
         return points
+
+    def _separate_reset_points(
+        self,
+        points_w: torch.Tensor,
+        min_dist: float,
+        obstacle_pos_w: torch.Tensor | None = None,
+        env_origins_w: torch.Tensor | None = None,
+        avoid_points: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Push reset points apart after sampling/obstacle correction."""
+        if min_dist <= 0.0:
+            return points_w
+        separated = points_w.clone()
+        pmin = torch.tensor(self.cfg.pos_min, device=self.device, dtype=separated.dtype)
+        pmax = torch.tensor(self.cfg.pos_max, device=self.device, dtype=separated.dtype)
+        z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
+        z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
+        origins = env_origins_w[:, None, :] if env_origins_w is not None else torch.zeros_like(separated[:, :1, :])
+        low_w = origins + pmin
+        high_w = origins + pmax
+        low_w[..., 2] = z_low
+        high_w[..., 2] = z_high
+        eps = 1e-6
+
+        for _ in range(max(1, int(self.cfg.reset_sampling_attempts))):
+            moved = torch.zeros_like(separated)
+            if separated.shape[1] > 1:
+                diff = separated[:, :, None, :] - separated[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1).clamp(min=eps)
+                eye = torch.eye(separated.shape[1], device=self.device, dtype=torch.bool).unsqueeze(0)
+                too_close = (dist < min_dist) & ~eye
+                direction = diff / dist[..., None]
+                moved += (direction * (0.5 * (min_dist - dist).clamp(min=0.0))[..., None] * too_close[..., None]).sum(dim=2)
+            if avoid_points is not None:
+                diff = separated[:, :, None, :] - avoid_points[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1).clamp(min=eps)
+                too_close = dist < min_dist
+                direction = diff / dist[..., None]
+                moved += (direction * ((min_dist - dist).clamp(min=0.0))[..., None] * too_close[..., None]).sum(dim=2)
+            if torch.linalg.norm(moved, dim=-1).max() <= 1e-6:
+                break
+            separated = (separated + moved).clamp(min=low_w, max=high_w)
+            if obstacle_pos_w is not None and obstacle_pos_w.shape[1] > 0:
+                separated = self._push_points_out_of_static_obstacle_ellipsoids(separated, obstacle_pos_w, env_origins_w)
+                separated = separated.clamp(min=low_w, max=high_w)
+        return separated
 
     def _push_points_out_of_static_obstacle_ellipsoids(
         self,

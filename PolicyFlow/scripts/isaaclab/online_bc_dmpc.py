@@ -93,6 +93,8 @@ parser.add_argument("--expert_test_steps", type=int, default=None,
                     help="Expert-only rollout length. Defaults to 3 full episodes per env.")
 parser.add_argument("--expert_test_progress_every", type=int, default=100,
                     help="Print expert-test progress every N env steps (0 disables progress prints).")
+parser.add_argument("--rmin_check", type=float, default=0.15,
+                    help="Inter-agent collision judgement radius for test metrics (C++ simulator used 0.15).")
 parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds for debug rollouts.")
 parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
@@ -715,6 +717,7 @@ def run_expert_test(
     debug_logger: DmpcExpertLogger | None = None,
     log_every: int = 1,
     progress_every: int = 100,
+    rmin_check: float = 0.15,
 ) -> dict[str, float]:
     """Run repeated DMPC-only episodes and aggregate env-level success metrics."""
     device = env.device
@@ -776,7 +779,7 @@ def run_expert_test(
             pair_dist = torch.linalg.norm(pair_diff, dim=-1)
             eye = torch.eye(N, dtype=torch.bool, device=device)
             pair_dist = pair_dist.masked_fill(eye, float("inf"))
-            episode_drone_collision |= pair_dist.amin(dim=(1, 2)) < env.cfg.rmin
+            episode_drone_collision |= pair_dist.amin(dim=(1, 2)) < rmin_check
 
         episode_obstacle_collision |= _static_obstacle_collision_mask(env, pos_w)
         z = pos_w[..., 2]
@@ -995,6 +998,7 @@ def main():
                 debug_logger=dmpc_logger,
                 log_every=args_cli.dmpc_log_every,
                 progress_every=args_cli.expert_test_progress_every,
+                rmin_check=args_cli.rmin_check,
             )
         finally:
             if dmpc_logger is not None:

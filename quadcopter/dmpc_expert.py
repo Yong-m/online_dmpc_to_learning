@@ -143,16 +143,29 @@ class DMPCParams:
     spd_f: int = 3
     s_obs: float = 100.0
     spd_o: int = 1
-    acc_cost: float = 1.0 #10.0 #8e-3
-    lin_coll: float = -1.0e2 #-1.0e5
+    acc_cost: float = 1.0 #1.0 #10.0 #8e-3
+    lin_coll: float = -1.0e3 #-1.0e5
     quad_coll: float = 1.0 #1.0
 
     # Collision parameters
     rmin: float = 0.5 #0.3
     height_scaling: float = 2.0
     agent_g_factor: float = 2.0
-    obs_g_factor: float = 1.2
+    obs_g_factor: float = 1.0 #1.2
+    emergency_repel_factor: float = 1.5
+    emergency_prediction_steps: int = 3
     # height_scaling_obs: float = 4.0
+
+    # Optional priority metadata. Higher score means the agent has stronger
+    # right-of-way. It is gathered with neighbour predictions but is not yet
+    # consumed by the collision-constraint builder.
+    enable_priority: bool = True
+    priority_goal_enter_dist: float = 0.05
+    priority_goal_exit_dist: float = 0.10
+    priority_hold_score: float = 10.0
+    priority_goal_dist_weight: float = 1.0
+    priority_velocity_align_weight: float = 0.5
+    priority_velocity_eps: float = 1.0e-3
 
     # Event-triggered replanning
     f_min: float = -0.01
@@ -389,6 +402,9 @@ class DMPCExpert:
         #                so the reference is C^{deg_poly}-continuous.
         #   "steps"      subsample counter modulo n_substeps
         self._state: dict[tuple[int, int], dict] = {}
+        # Hysteresis latch for priority: agents that have reached their goal
+        # keep right-of-way until they clearly leave the goal ball.
+        self._priority_hold: dict[tuple[int, int], bool] = {}
 
     # ───────────────────────────────────────────────────────────────────
     # Constant cost
@@ -419,6 +435,7 @@ class DMPCExpert:
 
         self._Q_diag_free, self._H_bez_free = _make_mode(self.p.s_free, self.p.spd_f)
         self._Q_diag_obs, self._H_bez_obs = _make_mode(self.p.s_obs, self.p.spd_o)
+        self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.0, 0)
 
     def _build_energy_quadratic(self) -> np.ndarray:
         """``H`` such that ``U^T H U = integral ||u''(t)||^2 dt``."""
@@ -560,7 +577,10 @@ class DMPCExpert:
         # ── Phase 1: flag reset + gather all neighbour predictions ────────
         # Sequential: gather reads _state[(e,j)] which replan (Phase 2) writes.
         # Must complete for all (e,i) before any replan starts.
+        priority_scores = self._compute_priority_scores(pos_np_local, vel_np, goal_np_local, env_list)
         nbr_preds: dict[tuple[int, int], np.ndarray] = {}
+        nbr_priorities: dict[tuple[int, int], np.ndarray] = {}
+        nbr_ids: dict[tuple[int, int], list[int]] = {}
         for e in env_list:
             for i in range(N):
                 st = self._state.get((e, i))
@@ -568,7 +588,10 @@ class DMPCExpert:
                     st["last_replanned"] = False
                     st["last_reset_mode"] = False
                     st["last_fallback"] = False
-                nbr_preds[(e, i)] = self._gather_neighbour_predictions(e, i, pos_np_local)
+                    st["last_emergency_mode"] = False
+                nbr_preds[(e, i)], nbr_priorities[(e, i)], nbr_ids[(e, i)] = self._gather_neighbour_predictions(
+                    e, i, pos_np_local, priority_scores
+                )
 
         # ── Phase 2: replan — all (e, i) pairs are independent ───────────
         # Each _replan_agent writes only _state[(e, i)] for its own key.
@@ -583,10 +606,13 @@ class DMPCExpert:
             e, i = ei
             self._replan_agent(
                 e, i,
+                nbr_ids=nbr_ids[(e, i)],
                 pos_local=pos_np_local[e, i],
                 vel=vel_np[e, i],
                 goal_local=goal_np_local[e, i],
+                own_priority_score=priority_scores[e][i],
                 nbr_pred=nbr_preds[(e, i)],
+                nbr_priority_scores=nbr_priorities[(e, i)],
             )
 
         if self._pool is not None and len(replan_tasks) > 1:
@@ -624,21 +650,86 @@ class DMPCExpert:
         self._precompute_static_obstacle_coeffs(obstacle_info)
         if env_ids is None:
             self._state.clear()
+            self._priority_hold.clear()
             return
         ids = set(int(i) for i in env_ids.detach().cpu().tolist())
         self._state = {k: v for k, v in self._state.items() if k[0] not in ids}
+        self._priority_hold = {k: v for k, v in self._priority_hold.items() if k[0] not in ids}
 
     # ───────────────────────────────────────────────────────────────────
     # Neighbour broadcast retrieval
     # ───────────────────────────────────────────────────────────────────
+    def _compute_priority_scores(
+        self,
+        pos_local: np.ndarray,
+        vel: np.ndarray,
+        goal_local: np.ndarray,
+        env_list: list[int],
+    ) -> dict[int, np.ndarray]:
+        """Compute per-agent right-of-way scores for the selected envs.
+
+        Higher score means higher priority. Goal hysteresis prevents agents
+        already settled at the goal from repeatedly yielding near the success
+        threshold; in-transit scores combine goal urgency and velocity alignment.
+        """
+        scores_by_env: dict[int, np.ndarray] = {}
+        if not self.p.enable_priority:
+            for e in env_list:
+                scores_by_env[e] = np.zeros(self.N, dtype=np.float64)
+            return scores_by_env
+
+        eps = self.p.priority_velocity_eps
+        for e in env_list:
+            scores = np.zeros(self.N, dtype=np.float64)
+            for i in range(self.N):
+                key = (e, i)
+                to_goal = goal_local[e, i] - pos_local[e, i]
+                goal_dist = float(np.linalg.norm(to_goal))
+
+                hold = self._priority_hold.get(key, False)
+                if hold:
+                    hold = goal_dist <= self.p.priority_goal_exit_dist
+                else:
+                    hold = goal_dist <= self.p.priority_goal_enter_dist
+                self._priority_hold[key] = hold
+
+                if hold:
+                    scores[i] = self.p.priority_hold_score
+                    continue
+
+                vel_i = vel[e, i]
+                vel_norm = float(np.linalg.norm(vel_i))
+                if goal_dist > eps and vel_norm > eps:
+                    align = float(np.dot(vel_i, to_goal) / (vel_norm * goal_dist))
+                    align = float(np.clip(align, -1.0, 1.0))
+                else:
+                    align = 0.0
+
+                scores[i] = (
+                    self.p.priority_goal_dist_weight * goal_dist
+                    + self.p.priority_velocity_align_weight * align
+                )
+            scores_by_env[e] = scores
+        return scores_by_env
+
     def _gather_neighbour_predictions(
-        self, env_idx: int, agent_idx: int, pos_local: np.ndarray
-    ) -> np.ndarray:
-        """Return broadcast input predictions ``(N-1, K, 3)`` for the
-        neighbours of ``agent_idx`` in env ``env_idx``. Agents without a
-        cached plan yet are treated as stationary at their current position."""
+        self,
+        env_idx: int,
+        agent_idx: int,
+        pos_local: np.ndarray,
+        priority_scores: dict[int, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, list[int]]:
+        """Return neighbour predictions, priority scores, and agent IDs.
+
+        Predictions have shape ``(N-1, K, 3)``. Agents without a cached plan yet
+        are treated as stationary at their current position. Priority scores and
+        IDs are returned in the same neighbour order as the predictions.
+        """
         K = self.p.k_hor
         preds: list[np.ndarray] = []
+        scores: list[float] = []
+        ids: list[int] = []
+        env_scores = None if priority_scores is None else priority_scores.get(env_idx)
         for j in range(self.N):
             if j == agent_idx:
                 continue
@@ -647,7 +738,12 @@ class DMPCExpert:
                 preds.append(np.tile(pos_local[env_idx, j], (K, 1)))
             else:
                 preds.append(sj["u_pred"].copy())
-        return np.stack(preds, axis=0) if preds else np.zeros((0, K, 3))
+            scores.append(0.0 if env_scores is None else float(env_scores[j]))
+            ids.append(j)
+
+        if preds:
+            return np.stack(preds, axis=0), np.asarray(scores, dtype=np.float64), ids
+        return np.zeros((0, K, 3)), np.zeros(0, dtype=np.float64), ids
 
     # ───────────────────────────────────────────────────────────────────
     # Per-agent replanning: build + solve one QP.
@@ -656,10 +752,13 @@ class DMPCExpert:
         self,
         env_idx: int,
         agent_idx: int,
+        nbr_ids: List[int],
         pos_local: np.ndarray,
         vel: np.ndarray,
         goal_local: np.ndarray,
+        own_priority_score: float,
         nbr_pred: np.ndarray,
+        nbr_priority_scores: np.ndarray | None = None,
     ) -> None:
         K = self.p.k_hor
         n_bez = self.n_bez
@@ -672,10 +771,20 @@ class DMPCExpert:
 
         # ── Collision constraints first: their presence selects the cost mode.
         own_pred_seed = self._seed_input_prediction(prev, seeds[0], goal_local)
+        emergency_points = np.vstack([
+            pos_local.reshape(1, 3),
+            own_pred_seed[: max(0, self.p.emergency_prediction_steps)],
+        ])
+        emergency_mode, violated_obs = self._is_inside_static_obstacle(env_idx, emergency_points)
         coll_A, coll_l, coll_u, inter_agent_col_t, static_collision_timesteps, n_slack = self._build_collision_constraints(
             env_idx=env_idx,
+            agent_idx=agent_idx,
             own_pred=own_pred_seed,
             nbr_pred=nbr_pred,
+            own_priority_score=own_priority_score,
+            nbr_priority_scores=nbr_priority_scores,
+            nbr_ids=nbr_ids,
+            violated_obs=violated_obs,
         )
         collision_sample_indices = [max(int(inter_agent_col_t) - 1, 0)] if inter_agent_col_t >= 0 else []
         for kc_o in static_collision_timesteps:
@@ -683,9 +792,15 @@ class DMPCExpert:
                 collision_sample_indices.append(max(int(kc) - 1, 0))
         collision_sample_indices = sorted(set(collision_sample_indices))
         collision_mode = coll_A is not None
+        
 
-        # Pick free / obs cost mode (mirrors C++ generator.cpp::buildQP).
-        if collision_mode:
+        # Pick free / obs / emergency cost mode. Emergency mode is for testing
+        # recovery from actual static-obstacle penetration: keep regularization
+        # and collision constraints, but remove the goal-reaching objective.
+        if emergency_mode:
+            H_bez_const = self._H_bez_emergency
+            Q_diag = self._Q_diag_emergency
+        elif collision_mode:
             H_bez_const = self._H_bez_obs
             Q_diag = self._Q_diag_obs
         else:
@@ -780,8 +895,12 @@ class DMPCExpert:
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
+            self._state[(env_idx, agent_idx)]["last_emergency_mode"] = bool(emergency_mode)
             self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
             self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
+            self._state[(env_idx, agent_idx)]["priority_scores"] = (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            )
             return
 
         if prev is not None and prev["U"].shape[0] == n_bez:
@@ -794,8 +913,12 @@ class DMPCExpert:
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
+            self._state[(env_idx, agent_idx)]["last_emergency_mode"] = bool(emergency_mode)
             self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
             self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
+            self._state[(env_idx, agent_idx)]["priority_scores"] = (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            )
             return
 
         U_sol = res.x[:n_bez]
@@ -812,8 +935,12 @@ class DMPCExpert:
             "last_replanned": True,
             "last_reset_mode": bool(_reset_mode),
             "last_fallback": False,
+            "last_emergency_mode": bool(emergency_mode),
             "collision_timestep": int(inter_agent_col_t),
             "collision_sample_indices": collision_sample_indices,
+            "priority_scores": (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            ),
         }
 
     # ───────────────────────────────────────────────────────────────────
@@ -881,14 +1008,38 @@ class DMPCExpert:
             traj[k] = p
         return traj
 
+    def _is_inside_static_obstacle(self, env_idx: int, points_local: np.ndarray) -> tuple[bool, int]:
+        """Return True if any provided point is inside a static obstacle ellipsoid.
+
+        ``points_local`` may be one point ``(3,)`` or a short trajectory
+        ``(M, 3)``. The short trajectory is used to catch imminent penetration
+        when the actual state and replanning seed are slightly out of phase.
+        """
+        if self._num_static_obstacles <= 0 or self._obstacle_pos_local is None:
+            return False, -1
+
+        points = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+        for o in range(self._num_static_obstacles):
+            Theta_inv_o = self._obs_theta_inv[env_idx, o]
+            obstacle_pos = self._obstacle_pos_local[env_idx, o]
+            metric = np.linalg.norm((points - obstacle_pos) @ Theta_inv_o.T, axis=1)
+            if np.any(metric < self._obs_rmin[env_idx, o] * self.p.obs_g_factor):
+                return True, o
+        return False, -1
+
     # ───────────────────────────────────────────────────────────────────
     # On-demand input-space collision constraints (Section III.E)
     # ───────────────────────────────────────────────────────────────────
     def _build_collision_constraints(
         self,
         env_idx: int,
+        agent_idx: int,
+        nbr_ids: list[int],
         own_pred: np.ndarray,
         nbr_pred: np.ndarray,
+        own_priority_score: float,
+        nbr_priority_scores: np.ndarray,
+        violated_obs: int,
         # n_slack: int,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | List[List[int]] | int]:
         """Construct collision-avoidance inequalities. For each neighbour ``j``
@@ -919,7 +1070,7 @@ class DMPCExpert:
         # 2. Determine Omega_i: the set of neighbors j s.t. d < g_thresh at k_c,i
 
         # 1. Determine k_c,i
-        for k in range(1, K):
+        for k in range(2, K): # exclude current timestep(already fixed) # range(1, K)
             # Inter-agent
             for j in range(n_nbr):
                 d = Theta_inv @ (own_pred[k - 1] - nbr_pred[j, k])
@@ -932,7 +1083,7 @@ class DMPCExpert:
         # Static obstacle
         for o in range(n_obs):
             obs_kc_o = []
-            for k in range(1, K):
+            for k in range(2, K): # range(1, K)
                 Theta_inv_o = self._obs_theta_inv[env_idx, o]
                 d = Theta_inv_o @ (own_pred[k - 1] - self._obstacle_pos_local[env_idx, o])
                 if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]: # more conservative collision checking for static obstacles #self._obs_rmin[env_idx, o]:
@@ -940,12 +1091,18 @@ class DMPCExpert:
             l_obs_kc.append(obs_kc_o)
         
         # 2. Determine Omega_i and construct constraint
+        # Inter-agent
         if inter_agent_kc >= 0:
             Phi_kc = self.M_pos_hor[3 * (inter_agent_kc - 1) : 3 * (inter_agent_kc - 1) + 3, :]
-            # Inter-agent
             for j in range(n_nbr):
                 d = Theta_inv @ (own_pred[inter_agent_kc - 1] - nbr_pred[j, inter_agent_kc])
-                if np.linalg.norm(d) < g_thresh:
+                prioritized = False
+                if self.p.enable_priority:
+                    nbr_agent_idx = nbr_ids[j]
+                    margin = min(1e-3, 0.01 * max(abs(own_priority_score), abs(nbr_priority_scores[j])))
+                    prioritized = (own_priority_score > nbr_priority_scores[j] + margin
+                                or (abs(own_priority_score - nbr_priority_scores[j]) < margin and agent_idx > nbr_agent_idx))
+                if np.linalg.norm(d) < g_thresh and not prioritized:
                     # construct collision constraint
                     unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
                     dg_dU = unit_diff.transpose() @ Theta_inv @ Phi_kc
@@ -972,7 +1129,10 @@ class DMPCExpert:
                 if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]:
                     unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
                     dg_dU = unit_diff.transpose() @ Theta_inv_o @ Phi_kc_oi
-                    rhs_lower = unit_diff.transpose() @ Theta_inv_o @ obstacle_pos + self._obs_rmin[env_idx, o]
+                    obs_rmin = self._obs_rmin[env_idx, o]
+                    if o == violated_obs:
+                        obs_rmin *= self.p.emergency_repel_factor
+                    rhs_lower = unit_diff.transpose() @ Theta_inv_o @ obstacle_pos + obs_rmin
 
                     row = np.zeros(self.n_bez) # + n_slack)
                     row = dg_dU
@@ -1024,6 +1184,8 @@ class DMPCExpert:
             "u_pred": u_pred,
             "seeds": seeds,
             "steps": 0,
+            "last_emergency_mode": False,
             "collision_timestep": -1,
             "collision_sample_indices": [],
+            "priority_scores": np.zeros(0, dtype=np.float64),
         }
