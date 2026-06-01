@@ -298,6 +298,153 @@ def _build_state_propagator(A_d: np.ndarray, B_d: np.ndarray, K: int) -> tuple[n
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Batched GPU ADMM QP solver
+# ───────────────────────────────────────────────────────────────────────────
+
+class BatchedGPUDMPC:
+    """Batched ADMM solver for the constant-structure DMPC QP.
+
+    All (env, agent) pairs without active collision constraints share the same
+    constraint matrix  A_fixed = [A_cont ; M_deriv_0[0..d] ; M_pos_hor ; M_acc_hor]
+    and (in the free-cost mode) the same Hessian H.  The KKT factor L from
+    H + rho*A^T*A  is computed once at init; every GPU solve then needs only
+    two batched triangular solves plus element-wise clamp/axpy ops—all on GPU.
+
+    Warm-start tensors (z, y) are maintained per (env, agent) across replanning
+    windows, stored at flat index  e * N_agents + i  in pre-allocated buffers.
+
+    Agents with active collision constraints must be handled by the caller
+    (e.g., fall back to CPU OSQP).
+
+    ADMM iteration (OSQP formulation):
+        x-update:  (H + rho A^T A) x  =  -q + A^T (rho z - y)
+        z-update:  z  =  clip( A x + y/rho,  l,  u )
+        y-update:  y  =  y + rho (A x - z)
+
+    Equality constraints are handled as  l_i = u_i = b_eq_i  (box of width 0).
+    """
+
+    def __init__(
+        self,
+        n_bez: int,
+        H_bez: np.ndarray,
+        A_cont: np.ndarray,
+        M_deriv_0: list[np.ndarray],
+        M_pos_hor: np.ndarray,
+        M_acc_hor: np.ndarray,
+        pmin_vec: np.ndarray,
+        pmax_vec: np.ndarray,
+        amin_vec: np.ndarray,
+        amax_vec: np.ndarray,
+        max_B: int,
+        rho: float = 1.0,
+        admm_iters: int = 50,
+        alpha: float = 1.6,
+        device: str | torch.device = "cuda",
+        reg: float = 1e-6,
+    ) -> None:
+        self.device = torch.device(device)
+        self.n_bez = n_bez
+        self.rho = rho
+        self.admm_iters = admm_iters
+        self.alpha = alpha  # OSQP-style over-relaxation (1.6 is OSQP default)
+        self.max_B = max_B
+
+        # ── Partition constraint rows ─────────────────────────────────────
+        n_eq_cont = A_cont.shape[0]
+        A_init_np = [M.astype(np.float64) for M in M_deriv_0]
+        n_eq_init = sum(M.shape[0] for M in A_init_np)
+        self.n_eq_cont = n_eq_cont
+        self.n_eq_init = n_eq_init
+        self.n_eq = n_eq_cont + n_eq_init
+
+        A_ineq_np = np.vstack([M_pos_hor, M_acc_hor]).astype(np.float64)
+        self.n_ineq = A_ineq_np.shape[0]
+        self.m = self.n_eq + self.n_ineq
+
+        # ── Constant A_fixed (m, n_bez) ───────────────────────────────────
+        A_fixed_np = np.vstack(
+            [A_cont.astype(np.float64)] + A_init_np + [A_ineq_np]
+        )
+
+        # ── KKT = H + rho * A^T A, Cholesky-factored in float64 ──────────
+        KKT_np = H_bez.astype(np.float64) + rho * (A_fixed_np.T @ A_fixed_np)
+        KKT_np = 0.5 * (KKT_np + KKT_np.T) + reg * np.eye(n_bez)
+        KKT_t = torch.from_numpy(KKT_np).to(dtype=torch.float64, device=self.device)
+        self._L = torch.linalg.cholesky(KKT_t).float()  # (n, n), lower-triangular float32
+        self._L_T = self._L.T.contiguous()
+
+        self._A = torch.from_numpy(A_fixed_np).float().to(self.device)  # (m, n)
+
+        # ── Constant inequality bounds ────────────────────────────────────
+        l_ineq = np.concatenate([pmin_vec, amin_vec]).astype(np.float32)
+        u_ineq = np.concatenate([pmax_vec, amax_vec]).astype(np.float32)
+        self._l_ineq = torch.from_numpy(l_ineq).to(self.device)
+        self._u_ineq = torch.from_numpy(u_ineq).to(self.device)
+
+        # ── Warm-start buffers (max_B, m) ─────────────────────────────────
+        self._z = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
+        self._y = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
+
+    def reset_warm_start(self, flat_indices: torch.Tensor | None = None) -> None:
+        """Zero warm-start for the given flat indices (all if None)."""
+        if flat_indices is None:
+            self._z.zero_()
+            self._y.zero_()
+        else:
+            idx = flat_indices.to(self.device)
+            self._z[idx] = 0.0
+            self._y[idx] = 0.0
+
+    @torch.no_grad()
+    def solve(
+        self,
+        q_batch: torch.Tensor,       # (B, n_bez) float32 on device
+        b_eq_batch: torch.Tensor,    # (B, n_eq) float32 on device
+        flat_indices: torch.Tensor,  # (B,) int64
+    ) -> torch.Tensor:               # (B, n_bez) float32
+        """Warm-started batched ADMM solve.  Returns primal solutions (B, n_bez)."""
+        B = q_batch.shape[0]
+        rho = self.rho
+        A = self._A       # (m, n)
+        L = self._L       # (n, n) lower-triangular
+        L_T = self._L_T   # (n, n) upper-triangular
+
+        # Per-problem bounds (B, m): equality rows have l=u=b_eq
+        l = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
+        u = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
+        l[:, : self.n_eq] = b_eq_batch
+        u[:, : self.n_eq] = b_eq_batch
+        l[:, self.n_eq :].copy_(self._l_ineq)
+        u[:, self.n_eq :].copy_(self._u_ineq)
+
+        z = self._z[flat_indices].clone()  # (B, m)
+        y = self._y[flat_indices].clone()
+        inv_rho = 1.0 / rho
+        alpha = self.alpha
+        one_minus_alpha = 1.0 - alpha
+
+        for _ in range(self.admm_iters):
+            # x-update: KKT x = -q + A^T(rho*z - y)  →  two triangular solves
+            rhs = (-q_batch + (rho * z - y) @ A).T.contiguous()  # (n, B)
+            fwd = torch.linalg.solve_triangular(L, rhs, upper=False)  # (n, B)
+            x = torch.linalg.solve_triangular(L_T, fwd, upper=True).T  # (B, n)
+
+            # Over-relaxed z-update (Boyd 2011, Eq 3.21-3.23 with unscaled dual y):
+            #   z_hat = alpha*Ax + (1-alpha)*z_prev   [over-relaxed proxy for Ax]
+            #   z_new = clip(z_hat + y/rho, l, u)
+            #   y    += rho * (z_hat - z_new)          [= standard ADMM when alpha=1]
+            Ax = x @ A.T                                       # (B, m)
+            z_hat = alpha * Ax + one_minus_alpha * z           # uses OLD z
+            z = torch.clamp(z_hat + y * inv_rho, l, u)        # NEW z
+            y = y + rho * (z_hat - z)
+
+        self._z[flat_indices] = z
+        self._y[flat_indices] = y
+        return x
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # DMPC expert
 # ───────────────────────────────────────────────────────────────────────────
 class DMPCExpert:
@@ -390,6 +537,9 @@ class DMPCExpert:
         #                so the reference is C^{deg_poly}-continuous.
         #   "steps"      subsample counter modulo n_substeps
         self._state: dict[tuple[int, int], dict] = {}
+
+        # Batched GPU ADMM solver (None until enable_gpu_admm() is called).
+        self._gpu_solver: BatchedGPUDMPC | None = None
 
     # ───────────────────────────────────────────────────────────────────
     # Constant cost
@@ -491,63 +641,199 @@ class DMPCExpert:
 
         ts = self.p.ts
         h_total = (self.p.k_hor - 1) * self.p.h
+        K = self.p.k_hor
         N = self.N
         env_list = list(env_iter)
 
-        # ── Phase 1: flag reset + gather all neighbour predictions ────────
-        # Sequential: gather reads _state[(e,j)] which replan (Phase 2) writes.
-        # Must complete for all (e,i) before any replan starts.
-        nbr_preds: dict[tuple[int, int], np.ndarray] = {}
-        for e in env_list:
-            for i in range(N):
-                st = self._state.get((e, i))
-                if st is not None:
-                    st["last_replanned"] = False
-                    st["last_reset_mode"] = False
-                    st["last_fallback"] = False
-                nbr_preds[(e, i)] = self._gather_neighbour_predictions(e, i, pos_np_local)
+        import time as _time
+        _tc0 = _time.perf_counter()
+        E_n = len(env_list)
+        env_arr  = np.array(env_list, dtype=np.intp)           # (E_n,)
+        e_all    = np.repeat(env_arr, N)                        # (E_n*N,)
+        i_all    = np.tile(np.arange(N, dtype=np.intp), E_n)   # (E_n*N,)
 
-        # ── Phase 2: replan — all (e, i) pairs are independent ───────────
-        # Each _replan_agent writes only _state[(e, i)] for its own key.
-        # OSQP releases the GIL during solve(), so threads run concurrently.
-        replan_tasks = [
-            (e, i) for e in env_list for i in range(N)
-            if (self._state.get((e, i)) is None
-                or self._state[(e, i)]["steps"] % self.n_substeps == 0)
-        ]
+        # sub-timers (set in GPU block, 0 for OSQP path)
+        _t_flag = _t_nbr = _t_check = 0.0
 
-        def _do_replan(ei: tuple[int, int]) -> None:
-            e, i = ei
-            self._replan_agent(
-                e, i,
-                pos_local=pos_np_local[e, i],
-                vel=vel_np[e, i],
-                goal_local=goal_np_local[e, i],
-                nbr_pred=nbr_preds[(e, i)],
-            )
+        if self._gpu_solver is not None:
+            # ── GPU path: fully vectorised, no per-agent Python loops ─────
 
-        if self._pool is not None and len(replan_tasks) > 1:
-            list(self._pool.map(_do_replan, replan_tasks))
+            # Phase 1a: reset flags — numpy batch, no Python loop
+            _ta = _time.perf_counter()
+            self._st_replanned[env_arr, :]  = False
+            self._st_reset_mode[env_arr, :] = False
+            self._st_fallback[env_arr, :]   = False
+            _t_flag = _time.perf_counter() - _ta
+
+            # Phase 1b: build nbr_preds_arr via numpy fancy indexing — no loop
+            # _st_u_pred[e,i] = (K,3) plan or zeros for uninitialised agents.
+            # For uninitialised agents: use stationary position tiled K times.
+            _tb = _time.perf_counter()
+            upred_all = self._st_u_pred[env_arr]         # (E_n, N, K, 3)
+            has_all   = self._st_has[env_arr]            # (E_n, N)
+            pos_tiled = np.repeat(
+                pos_np_local[env_arr, :, np.newaxis, :], K, axis=2
+            )  # (E_n, N, K, 3)
+            upred_safe = np.where(
+                has_all[:, :, np.newaxis, np.newaxis], upred_all, pos_tiled
+            )  # (E_n, N, K, 3)
+            # nbr_preds_arr[e_idx, i] = predictions of the N-1 neighbours of i
+            nbr_preds_arr = upred_safe[:, self._neighbor_idx]   # (E_n,N,N-1,K,3)
+            valid_nbr_arr = has_all[:, self._neighbor_idx]       # (E_n, N, N-1)
+            _t_nbr = _time.perf_counter() - _tb
+
+            # Phase 2: replan condition via numpy — no dict loop
+            _tc_chk = _time.perf_counter()
+            needs_replan = (
+                (~self._st_has[e_all, i_all]) |
+                (self._st_steps[e_all, i_all] % self.n_substeps == 0)
+            )  # (E_n*N,)
+            replan_e_arr = e_all[needs_replan]
+            replan_i_arr = i_all[needs_replan]
+            _t_check = _time.perf_counter() - _tc_chk
+
+            _tc1 = _time.perf_counter()
+
+            if replan_e_arr.size > 0:
+                self._plan_batched_gpu(
+                    replan_e_arr, replan_i_arr,
+                    nbr_preds_arr, valid_nbr_arr,
+                    pos_np_local, vel_np, goal_np_local,
+                )
+
+            _tc2 = _time.perf_counter()
+
+            # Phase 3: sample references — no per-agent Python loop
+            _S_pos = getattr(self, "_S_pos_cache", None)
+            if _S_pos is None or len(_S_pos) != self.n_substeps:
+                self._S_pos_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=0
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
+                self._S_vel_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=1
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
+
+            all_U   = self._st_U[e_all, i_all].astype(np.float32)    # (E_n*N, n_bez)
+            all_sub = (self._st_steps[e_all, i_all] % self.n_substeps).astype(np.int32)
+            self._st_steps[e_all, i_all] += 1                        # batch increment
+            if origins_np is not None:
+                all_ori = np.repeat(origins_np[env_arr], N, axis=0).astype(np.float32)
+            else:
+                all_ori = np.zeros((E_n * N, 3), dtype=np.float32)
+
         else:
-            for task in replan_tasks:
-                _do_replan(task)
+            # ── OSQP / CPU path: unchanged serial logic ───────────────────
+            nbr_preds: dict[tuple[int, int], np.ndarray] = {}
+            for e in env_list:
+                for i in range(N):
+                    st = self._state.get((e, i))
+                    if st is not None:
+                        st["last_replanned"] = False
+                        st["last_reset_mode"] = False
+                        st["last_fallback"] = False
+                    nbr_preds[(e, i)] = self._gather_neighbour_predictions(e, i, pos_np_local)
 
-        # ── Phase 3: sample references ────────────────────────────────────
-        for e in env_list:
-            origin_e = origins_np[e] if origins_np is not None else np.zeros(3, dtype=np.float64)
-            for i in range(N):
-                st = self._state[(e, i)]
-                t_sub = ((st["steps"] % self.n_substeps) + 1) * ts
-                t_sub = min(t_sub, h_total)
-                ref_pos[e, i] = torch.from_numpy(
-                    (self.bezier.sample_matrix(np.array([t_sub]), deriv=0) @ st["U"]
-                     + origin_e).astype(np.float32)
-                ).to(device)
-                ref_vel[e, i] = torch.from_numpy(
-                    (self.bezier.sample_matrix(np.array([t_sub]), deriv=1) @ st["U"]
-                     ).astype(np.float32)
-                ).to(device)
-                st["steps"] += 1
+            _tc1 = _time.perf_counter()
+
+            replan_tasks = [
+                (e, i) for e in env_list for i in range(N)
+                if (self._state.get((e, i)) is None
+                    or self._state[(e, i)]["steps"] % self.n_substeps == 0)
+            ]
+
+            def _do_replan(ei: tuple[int, int]) -> None:
+                e, i = ei
+                self._replan_agent(
+                    e, i,
+                    pos_local=pos_np_local[e, i],
+                    vel=vel_np[e, i],
+                    goal_local=goal_np_local[e, i],
+                    nbr_pred=nbr_preds[(e, i)],
+                )
+
+            if self._pool is not None and len(replan_tasks) > 1:
+                list(self._pool.map(_do_replan, replan_tasks))
+            else:
+                for task in replan_tasks:
+                    _do_replan(task)
+
+            _tc2 = _time.perf_counter()
+
+            # Phase 3: serial U collection (OSQP path)
+            _S_pos = getattr(self, "_S_pos_cache", None)
+            if _S_pos is None or len(_S_pos) != self.n_substeps:
+                self._S_pos_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=0
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
+                self._S_vel_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=1
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
+
+            all_U   = np.empty((E_n * N, self.n_bez), dtype=np.float32)
+            all_sub = np.empty(E_n * N, dtype=np.int32)
+            all_ori = np.empty((E_n * N, 3), dtype=np.float32)
+            flat = 0
+            for e in env_list:
+                origin_e = (origins_np[e] if origins_np is not None
+                            else np.zeros(3, dtype=np.float64))
+                for i in range(N):
+                    st = self._state[(e, i)]
+                    all_U[flat]   = st["U"].astype(np.float32)
+                    all_sub[flat] = st["steps"] % self.n_substeps
+                    all_ori[flat] = origin_e
+                    st["steps"] += 1
+                    flat += 1
+
+        # One batched matmul per unique substep index.
+        _tp3 = _time.perf_counter()
+        all_pos = np.empty((E_n * N, 3), dtype=np.float32)
+        all_vel = np.empty((E_n * N, 3), dtype=np.float32)
+        for k in range(self.n_substeps):
+            mask = all_sub == k
+            if not mask.any():
+                continue
+            # S_pos/vel: (1, n_bez) → squeeze for broadcast
+            all_pos[mask] = (all_U[mask] @ self._S_pos_cache[k].T).reshape(-1, 3) + all_ori[mask]
+            all_vel[mask] = (all_U[mask] @ self._S_vel_cache[k].T).reshape(-1, 3)
+        _t_phase3 = _time.perf_counter() - _tp3
+
+        # Write results back to ref tensors — two bulk CUDA transfers.
+        _tw = _time.perf_counter()
+        all_pos_t = torch.from_numpy(all_pos).to(device).reshape(E_n, N, 3)
+        all_vel_t = torch.from_numpy(all_vel).to(device).reshape(E_n, N, 3)
+        if env_ids is None:
+            ref_pos[:] = all_pos_t
+            ref_vel[:] = all_vel_t
+        else:
+            env_t = torch.tensor(env_list, dtype=torch.long, device=device)
+            ref_pos[env_t] = all_pos_t
+            ref_vel[env_t] = all_vel_t
+        _t_write = _time.perf_counter() - _tw
+
+        _tc3 = _time.perf_counter()
+
+        # ── per-call timing log (every 10 calls) ──────────────────────────
+        self._compute_calls = getattr(self, "_compute_calls", 0) + 1
+        if self._compute_calls % 10 == 1:
+            print(
+                f"[DMPC timing] call={self._compute_calls}"
+                f"  flag={_t_flag*1e3:.1f}ms"
+                f"  nbr={_t_nbr*1e3:.1f}ms"
+                f"  check={_t_check*1e3:.1f}ms"
+                f"  replan={(_tc2-_tc1)*1e3:.1f}ms"
+                f"  phase3={_t_phase3*1e3:.1f}ms"
+                f"  write={_t_write*1e3:.1f}ms"
+                f"  total={(_tc3-_tc0)*1e3:.1f}ms",
+                flush=True,
+            )
 
         return ref_pos, ref_vel
 
@@ -560,9 +846,305 @@ class DMPCExpert:
         """Drop per-agent cached state for the given envs (all by default)."""
         if env_ids is None:
             self._state.clear()
+            if self._gpu_solver is not None:
+                self._gpu_solver.reset_warm_start()
+                self._st_has[:]        = False
+                self._st_steps[:]      = 0
+                self._st_replanned[:]  = False
+                self._st_reset_mode[:] = False
+                self._st_fallback[:]   = False
+                self._st_coll_ts[:]    = -1
             return
-        ids = set(int(i) for i in env_ids.detach().cpu().tolist())
+        ids_list = [int(i) for i in env_ids.detach().cpu().tolist()]
+        ids = set(ids_list)
         self._state = {k: v for k, v in self._state.items() if k[0] not in ids}
+        if self._gpu_solver is not None:
+            ids_np = np.array(ids_list, dtype=np.intp)
+            self._st_has[ids_np]        = False
+            self._st_steps[ids_np]      = 0
+            self._st_replanned[ids_np]  = False
+            self._st_reset_mode[ids_np] = False
+            self._st_fallback[ids_np]   = False
+            self._st_coll_ts[ids_np]    = -1
+            flat = [e * self.N + i for e in ids for i in range(self.N)]
+            if flat:
+                self._gpu_solver.reset_warm_start(
+                    torch.tensor(flat, dtype=torch.long)
+                )
+
+    # ───────────────────────────────────────────────────────────────────
+    # GPU ADMM batch solver
+    # ───────────────────────────────────────────────────────────────────
+
+    def enable_gpu_admm(
+        self,
+        max_envs: int,
+        rho: float = 1.0,
+        admm_iters: int = 50,
+        alpha: float = 1.6,
+        device: str | torch.device | None = None,
+    ) -> None:
+        """Enable batched GPU ADMM solver.
+
+        Collision constraints are handled as a penalty term added to the linear
+        cost q (equivalent to eliminating the slack variable from the original
+        soft-constraint formulation).  All agents are solved on GPU — no CPU fallback.
+
+        Args:
+            max_envs:    Upper bound on the number of parallel environments.
+            rho:         ADMM penalty.  Default 1.0.
+            admm_iters:  ADMM iterations per window.  Default 50.
+            alpha:       Over-relaxation factor.  Range (1, 2).  Default 1.6.
+            device:      Target device.  Defaults to CUDA if available, else CPU.
+        """
+        if device is None:
+            device = (
+                self.device
+                if self.device.type == "cuda"
+                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            )
+        self._gpu_solver = BatchedGPUDMPC(
+            n_bez=self.n_bez,
+            H_bez=self._H_bez_free,
+            A_cont=self.A_continuity,
+            M_deriv_0=self._M_deriv_0,
+            M_pos_hor=self.M_pos_hor,
+            M_acc_hor=self.M_acc_hor,
+            pmin_vec=self._pmin,
+            pmax_vec=self._pmax,
+            amin_vec=self._amin,
+            amax_vec=self._amax,
+            max_B=max_envs * self.N,
+            rho=rho,
+            admm_iters=admm_iters,
+            alpha=alpha,
+            device=device,
+        )
+
+        # Numpy state arrays — GPU hot path reads/writes these instead of
+        # the Python dict, eliminating per-agent Python loop overhead.
+        K    = self.p.k_hor
+        deg1 = self.p.deg_poly + 1
+        N_   = self.N
+        self._st_has        = np.zeros((max_envs, N_), dtype=bool)
+        self._st_U          = np.zeros((max_envs, N_, self.n_bez), dtype=np.float64)
+        self._st_u_pred     = np.zeros((max_envs, N_, K, 3),       dtype=np.float64)
+        self._st_seeds      = np.zeros((max_envs, N_, deg1, 3),    dtype=np.float64)
+        self._st_steps      = np.zeros((max_envs, N_),             dtype=np.int32)
+        # Flag arrays for data logging — written per-replan, reset every compute() call
+        self._st_replanned  = np.zeros((max_envs, N_), dtype=bool)
+        self._st_reset_mode = np.zeros((max_envs, N_), dtype=bool)
+        self._st_fallback   = np.zeros((max_envs, N_), dtype=bool)
+        self._st_coll_ts    = np.full((max_envs, N_), -1, dtype=np.int32)
+
+        # Per-agent neighbor index table: row i = indices of all j ≠ i  (N, N-1)
+        self._neighbor_idx = np.array(
+            [[j for j in range(N_) if j != i] for i in range(N_)],
+            dtype=np.intp,
+        )
+
+    def _plan_batched_gpu(
+        self,
+        e_arr: np.ndarray,              # (B,) env indices
+        i_arr: np.ndarray,              # (B,) agent indices
+        nbr_preds_arr: np.ndarray,      # (E, N, N-1, K, 3) — prebuilt by compute()
+        valid_nbr_arr: np.ndarray,      # (E, N, N-1) bool
+        pos_np_local: np.ndarray,
+        vel_np: np.ndarray,
+        goal_np_local: np.ndarray,
+    ) -> None:
+        """Solve a batch of replanning QPs on GPU.
+
+        All phases are fully vectorised — zero per-agent Python loops:
+        - state read     : numpy fancy indexing into _st_* arrays
+        - goal-tracking q: one batched matmul
+        - collision      : numpy broadcast over (B, K-1, N-1, 3)
+        - collision grad : einsum
+        - result write   : batch fancy-index assignment to _st_* arrays
+        """
+        import time as _time
+        _t0 = _time.perf_counter()
+
+        K      = self.p.k_hor
+        n_bez  = self.n_bez
+        N      = self.N
+        gs     = self._gpu_solver
+        n_eq   = gs.n_eq
+        n_eq_c = gs.n_eq_cont
+        rmin   = self.p.rmin
+        g_thr  = self.p.g_factor * rmin
+        th_inv = np.diag(self._Theta_inv)        # (3,) diagonal of Theta_inv
+        qc     = self.p.quad_coll
+        B      = len(e_arr)
+        self._gpu_plan_calls = getattr(self, "_gpu_plan_calls", 0) + 1
+        _do_log = (self._gpu_plan_calls % 10 == 1)
+
+        # ── Phase A+B: zero-loop state read + vectorised init ─────────────
+        # All reads are numpy fancy indexing into _st_* arrays — no Python loop.
+        deg1   = self.p.deg_poly + 1
+        eps_v  = self.p.eps_velocity
+        amin_v = np.asarray(self.p.amin, dtype=np.float64)
+        amax_v = np.asarray(self.p.amax, dtype=np.float64)
+        h_dyn  = self.p.h
+
+        pos_b  = pos_np_local[e_arr, i_arr]    # (B, 3)
+        vel_b  = vel_np[e_arr, i_arr]          # (B, 3)
+        goal_b = goal_np_local[e_arr, i_arr]   # (B, 3)
+        x0_batch   = np.concatenate([pos_b, vel_b], axis=-1)  # (B, 6)
+        goal_batch = goal_b                                    # (B, 3)
+
+        has_prev       = self._st_has[e_arr, i_arr]            # (B,) bool
+        prev_seeds_all = self._st_seeds[e_arr, i_arr]          # (B, deg1, 3)
+        own_pred_batch = self._st_u_pred[e_arr, i_arr].copy()  # (B, K, 3)
+        U_prev_b       = self._st_U[e_arr, i_arr]              # (B, n_bez)
+
+        # nbr arrays from prebuilt (E, N, N-1, K, 3) — fancy index, no loop
+        nbr_batch = nbr_preds_arr[e_arr, i_arr]   # (B, N-1, K, 3)
+        valid_nbr = valid_nbr_arr[e_arr, i_arr]   # (B, N-1)
+        N_max     = N - 1
+
+        # PD rollout for new agents — vectorised over all new agents simultaneously
+        new_mask = ~has_prev
+        if new_mask.any():
+            p_new    = pos_b[new_mask].copy()         # (n_new, 3)
+            v_new    = np.zeros_like(p_new)           # (n_new, 3)
+            goal_new = goal_b[new_mask]               # (n_new, 3)
+            for k in range(K):
+                a = np.clip(2.0*(goal_new - p_new) - 1.5*v_new, amin_v, amax_v)
+                p_new = p_new + v_new*h_dyn + 0.5*a*(h_dyn*h_dyn)
+                v_new = v_new + a*h_dyn
+                own_pred_batch[new_mask, k] = p_new
+
+        # Vectorised event-triggered init (Eq. 15-17)
+        err   = pos_b - prev_seeds_all[:, 0]
+        denom = -(vel_b + np.sign(vel_b + 1e-12) * eps_v)
+        denom = np.where(np.abs(denom) < 1e-6,
+                         np.sign(denom) * 1e-6 + 1e-6, denom)
+        f_vec   = err**5 / denom
+        in_band = ((f_vec > self.p.f_min) & (f_vec < self.p.f_max)).all(-1)
+        do_reset = (~has_prev) | (~in_band)
+
+        seeds_batch = prev_seeds_all.copy()
+        seeds_batch[do_reset, 0]  = pos_b[do_reset]
+        seeds_batch[do_reset, 1:] = 0.0
+
+        n_seeds    = n_eq - n_eq_c
+        seeds_flat = seeds_batch.reshape(B, n_seeds).astype(np.float32)
+
+        _t_init = _time.perf_counter() - _t0
+
+        # ── Phase B: nbr arrays already built — no loop ────────────────────
+        _t1 = _time.perf_counter()
+        own_batch = own_pred_batch                  # (B, K, 3)
+        _t_assemble = _time.perf_counter() - _t1
+
+        # ── Phase C: vectorised q computation ─────────────────────────────
+        _t2 = _time.perf_counter()
+
+        # C1 — goal-tracking linear cost
+        # residual[b] = Fx x0[b] - tile(goal[b], K)    shape (B, 3K)
+        residual = (x0_batch @ self._Fx_pos_pred.T
+                    - np.tile(goal_batch, (1, K)))       # (B, 3K)
+        q_np = (2.0 * (residual * self._Q_diag_free) @ self._G_pos_pred
+                ).astype(np.float32)                     # (B, n_bez)
+
+        # C2 — collision detection (one broadcast over (B, K-1, N_max, 3))
+        diff  = (own_batch[:, :-1, np.newaxis, :]
+                 - nbr_batch[:, :, 1:, :].transpose(0, 2, 1, 3))  # (B,K-1,N_max,3)
+        d     = diff * th_inv                                       # scaled
+        norms = np.sqrt((d * d).sum(-1))                            # (B,K-1,N_max)
+        norms = np.where(valid_nbr[:, np.newaxis, :], norms, np.inf)
+
+        coll_step = norms < rmin                        # (B, K-1, N_max)
+        coll_any  = coll_step.any(-1)                   # (B, K-1)
+        has_coll  = coll_any.any(-1)                    # (B,)
+        kc_arr    = np.where(has_coll, coll_any.argmax(-1), -1)   # (B,) 0-indexed
+
+        # C3 — collision penalty gradient (vectorised, no per-agent loop)
+        coll_idx = np.where(has_coll)[0]
+        if coll_idx.size > 0:
+            kc_c  = kc_arr[coll_idx] + 1               # 1-indexed kc  (B_c,)
+            d_kc  = d[coll_idx, kc_c - 1, :, :]        # (B_c, N_max, 3)
+            n_kc  = norms[coll_idx, kc_c - 1, :]       # (B_c, N_max)
+
+            ns    = np.where(n_kc > 1e-6, n_kc, 1.0)
+            udir  = d_kc / ns[:, :, np.newaxis]         # (B_c, N_max, 3)
+            ut    = udir * th_inv                        # Theta_inv @ unit_dir
+
+            Phi_all = self.M_pos_hor.reshape(K, 3, n_bez)
+            Phi_kc  = Phi_all[kc_c - 1]                 # (B_c, 3, n_bez)
+            # dg_dU[b,j,:] = ut[b,j,:] @ Phi_kc[b]
+            dg_dU = np.einsum('bnk,bkm->bnm', ut, Phi_kc)  # (B_c, N_max, n_bez)
+
+            # nbr positions at kc (per-agent kc via advanced indexing)
+            bo = coll_idx[:, np.newaxis]                # (B_c, 1)
+            jo = np.arange(N_max)[np.newaxis, :]        # (1,  N_max)
+            ko = kc_c[:, np.newaxis]                    # (B_c, 1)
+            nbr_kc = nbr_batch[bo, jo, ko, :]           # (B_c, N_max, 3)
+
+            rhs = (ut * nbr_kc).sum(-1) + rmin          # (B_c, N_max)
+            active = valid_nbr[coll_idx] & (n_kc < g_thr)  # (B_c, N_max)
+
+            pred  = np.einsum('bnm,bm->bn', dg_dU, U_prev_b[coll_idx])  # (B_c,N_max)
+            viol  = np.where(active, np.maximum(0.0, rhs - pred), 0.0)
+
+            pg = (-2.0 * qc * np.einsum('bn,bnm->bm', viol, dg_dU)
+                  ).astype(np.float32)                   # (B_c, n_bez)
+            q_np[coll_idx] += pg
+
+        _t_q = _time.perf_counter() - _t2
+
+        # ── Phase D: GPU solve ────────────────────────────────────────────
+        _t3 = _time.perf_counter()
+        dev   = gs.device
+        b_eq  = np.zeros((B, n_eq), dtype=np.float32)
+        b_eq[:, n_eq_c:] = seeds_flat
+        idx_np = (e_arr * N + i_arr).astype(np.int64)
+
+        q_t   = torch.from_numpy(q_np).to(dev)
+        beq_t = torch.from_numpy(b_eq).to(dev)
+        idx_t = torch.from_numpy(idx_np).to(dev)
+        U_raw = gs.solve(q_t, beq_t, idx_t).cpu().numpy()  # (B, n_bez) float32
+        _t_gpu = _time.perf_counter() - _t3
+
+        # ── Phase E: result extraction (batched matmuls + batch numpy write)
+        _t4 = _time.perf_counter()
+        U_f64     = U_raw.astype(np.float64)                         # (B, n_bez)
+        u_pred_b  = (U_f64 @ self.M_pos_hor.T).reshape(B, K, 3)    # (B, K, 3)
+        deg1      = self.p.deg_poly + 1
+        seeds_new = np.stack(
+            [(U_f64 @ self._M_deriv_h[r].T).reshape(B, 3)
+             for r in range(deg1)], axis=1
+        )  # (B, deg1, 3)
+
+        kc_meta = np.where(has_coll, kc_arr + 1, -1)   # 1-indexed coll ts
+
+        # Batch write all fields to numpy arrays — zero per-agent loop
+        self._st_U[e_arr, i_arr]          = U_f64
+        self._st_u_pred[e_arr, i_arr]     = u_pred_b
+        self._st_seeds[e_arr, i_arr]      = seeds_new
+        self._st_steps[e_arr, i_arr]      = 0
+        self._st_has[e_arr, i_arr]        = True
+        self._st_replanned[e_arr, i_arr]  = True
+        self._st_reset_mode[e_arr, i_arr] = do_reset
+        self._st_fallback[e_arr, i_arr]   = False
+        self._st_coll_ts[e_arr, i_arr]    = kc_meta
+        _t_extract = _time.perf_counter() - _t4
+
+        if _do_log:
+            n_coll = int(has_coll.sum())
+            total  = (_t_init + _t_assemble + _t_q + _t_gpu + _t_extract) * 1e3
+            print(
+                f"[DMPC gpu_admm] call={self._gpu_plan_calls}  B={B}  coll={n_coll}"
+                f"  init={_t_init*1e3:.1f}ms"
+                f"  assemble={_t_assemble*1e3:.1f}ms"
+                f"  q+coll={_t_q*1e3:.1f}ms"
+                f"  gpu={_t_gpu*1e3:.1f}ms"
+                f"  extract={_t_extract*1e3:.1f}ms"
+                f"  total={total:.1f}ms",
+                flush=True,
+            )
+
 
     def get_vref_ctrl_pts(
         self,
@@ -877,10 +1459,10 @@ class DMPCExpert:
 
         U_sol = res.x[:n_bez]
         u_pred = (self.M_pos_hor @ U_sol).reshape(K, 3)
-        new_seeds = [
-            (self._M_deriv_h[r] @ U_sol).reshape(3)
-            for r in range(self.p.deg_poly + 1)
-        ]
+        new_seeds = np.stack(
+            [(self._M_deriv_h[r] @ U_sol).reshape(3)
+             for r in range(self.p.deg_poly + 1)]
+        )  # (deg1, 3) ndarray
         self._state[(env_idx, agent_idx)] = {
             "U": U_sol,
             "u_pred": u_pred,
@@ -1028,6 +1610,90 @@ class DMPCExpert:
 
         else:
             return None, None, None, kc, n_slack
+    def _collision_check_batch(
+        self,
+        own_pred_list: list[np.ndarray],
+        nbr_pred_list: list[np.ndarray],
+    ) -> list[tuple]:
+        """Vectorised collision check for a batch of agents.
+
+        Replaces calling :meth:`_build_collision_constraints` B times in a
+        Python loop.  All distance computations are done in one numpy broadcast
+        over shape ``(B, K-1, N_max, 3)``.
+
+        Returns a list of ``(A_coll_U, b_coll, kc, n_slack)`` per agent, where
+        ``A_coll_U`` is ``(n_slack, n_bez)`` float32 or ``None``.
+        """
+        B = len(own_pred_list)
+        K = self.p.k_hor
+        rmin = self.p.rmin
+        g_thresh = self.p.g_factor * rmin
+        theta_inv_diag = np.diag(self._Theta_inv)       # (3,)
+
+        N_max = max((p.shape[0] for p in nbr_pred_list), default=0)
+        if N_max == 0:
+            return [(None, None, -1, 0)] * B
+
+        # Pad neighbor predictions to uniform shape (B, N_max, K, 3).
+        own_batch = np.stack(own_pred_list, axis=0)      # (B, K, 3)
+        nbr_batch = np.zeros((B, N_max, K, 3), dtype=np.float64)
+        valid_nbr = np.zeros((B, N_max), dtype=bool)
+        for b, nbr in enumerate(nbr_pred_list):
+            n = nbr.shape[0]
+            if n > 0:
+                nbr_batch[b, :n] = nbr
+                valid_nbr[b, :n] = True
+
+        # Vectorised distance: d[b,k,j] = Theta_inv*(own[b,k-1] - nbr[b,j,k])
+        # own[:,:-1,:] : (B, K-1, 3)   →  expand to (B, K-1, 1, 3)
+        # nbr[:,:,1:,:]: (B,N_max,K-1,3) → transpose to (B, K-1, N_max, 3)
+        diff = (own_batch[:, :-1, np.newaxis, :]
+                - nbr_batch[:, :, 1:, :].transpose(0, 2, 1, 3))  # (B,K-1,N_max,3)
+        d = diff * theta_inv_diag                                  # broadcast last dim
+        norms = np.sqrt((d * d).sum(axis=-1))                      # (B, K-1, N_max)
+        # Invalid neighbors never trigger collision.
+        norms = np.where(valid_nbr[:, np.newaxis, :], norms, np.inf)
+
+        # First collision step per agent.
+        coll_at_step = norms < rmin                      # (B, K-1, N_max)
+        coll_any_nbr = coll_at_step.any(axis=-1)         # (B, K-1)
+        has_coll     = coll_any_nbr.any(axis=-1)         # (B,)
+        # argmax finds the FIRST True along axis; -1 when no collision.
+        kc_arr = np.where(has_coll, coll_any_nbr.argmax(axis=-1), -1)  # (B,)
+
+        results: list[tuple] = []
+        for b in range(B):
+            if not has_coll[b]:
+                results.append((None, None, -1, 0))
+                continue
+
+            kc = int(kc_arr[b]) + 1           # convert 0-indexed → 1-indexed kc
+            d_kc    = d[b, kc - 1]            # (N_max, 3)
+            norms_kc = norms[b, kc - 1]       # (N_max,)
+
+            active = np.where(valid_nbr[b] & (norms_kc < g_thresh))[0]
+            if len(active) == 0:
+                results.append((None, None, kc, 0))
+                continue
+
+            Phi_kc = self.M_pos_hor[3 * (kc - 1):3 * (kc - 1) + 3, :]  # (3, n_bez)
+            rows, lbs = [], []
+            for j in active:
+                dj   = d_kc[j]
+                nj   = norms_kc[j]
+                udir = dj / nj if nj > 1e-6 else np.array([1., 0., 0.])
+                dg_dU    = udir @ self._Theta_inv @ Phi_kc           # (n_bez,)
+                rhs_lower = udir @ self._Theta_inv @ nbr_batch[b, j, kc] + rmin
+                rows.append(dg_dU.astype(np.float32))
+                lbs.append(float(rhs_lower))
+
+            n_slack  = len(rows)
+            A_coll_U = np.vstack(rows)                    # (n_slack, n_bez)
+            b_coll   = np.array(lbs, dtype=np.float32)
+            results.append((A_coll_U, b_coll, kc, n_slack))
+
+        return results
+
     # ───────────────────────────────────────────────────────────────────
     # Fallback (solver failure)
     # ───────────────────────────────────────────────────────────────────
@@ -1056,10 +1722,10 @@ class DMPCExpert:
             U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
         except np.linalg.LinAlgError:
             U = np.zeros(self.n_bez)
-        seeds = [
-            (self._M_deriv_h[r] @ U).reshape(3)
-            for r in range(self.p.deg_poly + 1)
-        ]
+        seeds = np.stack(
+            [(self._M_deriv_h[r] @ U).reshape(3)
+             for r in range(self.p.deg_poly + 1)]
+        )  # (deg1, 3) ndarray
         self._state[(env_idx, agent_idx)] = {
             "U": U,
             "u_pred": u_pred,

@@ -516,7 +516,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self._just_succeeded[:] = False  # clear previous step's flag
+        self._just_succeeded[:] = False         # clear previous step's flag
+        self._drone_just_succeeded[:] = False   # cleared here, NOT in _reset_idx
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         pos_w = torch.stack([r.data.root_pos_w for r in self._robots], dim=1)
         z = pos_w[..., 2]
@@ -581,7 +582,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_acc_w[env_ids] = 0.0
         self._success_steps[env_ids] = 0
         self._drone_success_steps[env_ids] = 0
-        self._drone_just_succeeded[env_ids] = False
+        # _drone_just_succeeded is NOT cleared here — collection loop reads it
+        # after step() returns. It is cleared at the start of _get_dones instead.
         self._prev_R[env_ids] = torch.eye(3, device=self.device)
 
         # Random-exchange scenario (DMPC paper Section IV/VI): each drone on

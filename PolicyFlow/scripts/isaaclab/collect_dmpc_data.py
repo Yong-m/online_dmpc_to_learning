@@ -1,39 +1,41 @@
 """collect_dmpc_data.py — Offline DMPC expert data collection.
 
 Runs the DMPC expert across many IsaacLab environments in parallel and saves
-rich per-episode .npz datasets for offline / decoupled policy training.
+rich per-agent .npz datasets for offline / decoupled policy training.
+Each file contains one agent's trajectory from one episode — success is judged
+per-agent using env._drone_just_succeeded rather than env-level success.
 No learning happens here.
 
-Each saved file (one per episode) contains:
+Each saved file (one per agent per episode) contains:
 
   Per Bezier window  (T = windows in episode):
-    obs              (T, N, P)       per-drone obs at window start
-    pos_w            (T, N, 3)       world position
-    vel_w            (T, N, 3)       world velocity
-    quat_w           (T, N, 4)       body→world quaternion
-    ang_vel_b        (T, N, 3)       body-frame angular velocity
-    goal_w           (T, N, 3)       goal world position
-    R_goal           (T, N, 9)       goal-aligned rotation (world→goal), row-major
-    bezier_U         (T, N, n_bez)   DMPC Bezier control vector
-    free_ctrl_pts    (T, N, K-2, 3)  free position ctrl_pts, goal-aligned delta frame
-    ref_pos_w        (T, N, 3)       pos ref at first sub-step
-    ref_vel_w        (T, N, 3)       vel ref
-    ref_acc_w        (T, N, 3)       acc ref
-    mpc_replanned    (T, N)          bool — QP was solved this window
-    mpc_reset_mode   (T, N)          bool
-    mpc_fallback     (T, N)          bool
-    mpc_collision_ts (T, N)          int  — first collision substep (-1 = none)
+    obs              (T, P)       this agent's obs at window start
+    pos_w            (T, 3)       world position
+    vel_w            (T, 3)       world velocity
+    quat_w           (T, 4)       body→world quaternion
+    ang_vel_b        (T, 3)       body-frame angular velocity
+    goal_w           (T, 3)       goal world position
+    R_goal           (T, 9)       goal-aligned rotation (world→goal), row-major
+    bezier_U         (T, n_bez)   DMPC Bezier control vector
+    free_ctrl_pts    (T, K-2, 3)  free position ctrl_pts, goal-aligned delta frame
+    ref_pos_w        (T, 3)       pos ref at first sub-step
+    ref_vel_w        (T, 3)       vel ref
+    ref_acc_w        (T, 3)       acc ref
+    mpc_replanned    (T,)         bool — QP was solved this window
+    mpc_reset_mode   (T,)         bool
+    mpc_fallback     (T,)         bool
+    mpc_collision_ts (T,)         int  — first collision substep (-1 = none)
 
   Per substep within window  (S = n_substeps sub-steps):
-    substep_ref_pos_w  (T, S, N, 3)
-    substep_ref_vel_w  (T, S, N, 3)
-    substep_ref_acc_w  (T, S, N, 3)
-    substep_thrust_z   (T, S, N)     body-frame thrust z [N]
-    substep_torque_b   (T, S, N, 3)  body-frame torques [N·m]
+    substep_ref_pos_w  (T, S, 3)
+    substep_ref_vel_w  (T, S, 3)
+    substep_ref_acc_w  (T, S, 3)
+    substep_thrust_z   (T, S)     body-frame thrust z [N]
+    substep_torque_b   (T, S, 3)  body-frame torques [N·m]
 
   Episode metadata (scalars / small arrays):
-    init_pos_local  (N, 3)  drone start pos: xy relative to env origin, z absolute
-    goal_local      (N, 3)  goal: xy relative to env origin, z absolute
+    init_pos_local  (3,)   drone start pos: xy relative to env origin, z absolute
+    goal_local      (3,)   goal: xy relative to env origin, z absolute
     success         bool
     n_substeps      int
     bezier_k        int
@@ -57,10 +59,12 @@ import argparse
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 # ── path setup ──────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
@@ -73,14 +77,14 @@ for _p in (_POLICYFLOW_ROOT, _PROJECT_ROOT):
 
 # ── argument parser (must precede AppLauncher) ────────────────────────────
 parser = argparse.ArgumentParser(description="Collect DMPC expert data for offline training.")
-parser.add_argument("--num_envs", type=int, default=64)
-parser.add_argument("--num_drones", type=int, default=4)
+parser.add_argument("--num_envs", type=int, default=2048)
+parser.add_argument("--num_drones", type=int, default=10)
 parser.add_argument("--task", type=str, default="Isaac-MultiDrone-DMPC-Direct-v0")
 parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--save_dir", type=str, required=True,
                     help="Directory to write per-episode .npz files.")
-parser.add_argument("--target_episodes", type=int, default=1000,
+parser.add_argument("--target_episodes", type=int, default=3000,
                     help="Stop after this many episodes have been saved.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Hard env-step cap (0 = use --target_episodes only).")
@@ -92,11 +96,26 @@ parser.add_argument("--bezier_k", type=int, default=6,
 parser.add_argument("--episode_length_s", type=float, default=None)
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False)
 
+# GPU ADMM
+parser.add_argument("--gpu_admm", action="store_true", default=False,
+                    help="Use batched GPU ADMM instead of CPU OSQP threads.")
+parser.add_argument("--admm_iters", type=int, default=50,
+                    help="ADMM iterations per window (default 50).")
+
+# Video recording
+parser.add_argument("--video", action="store_true", default=False,
+                    help="Record video clips during collection.")
+parser.add_argument("--video_length", type=int, default=70,
+                    help="Frames per video clip.")
+parser.add_argument("--video_interval", type=int, default=210,
+                    help="Record a new clip every this many env steps.")
+
 from isaaclab.app import AppLauncher  # noqa: E402
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-args_cli.enable_cameras = False  # headless: no camera needed for data collection
+# Enable cameras only when video recording is requested.
+args_cli.enable_cameras = args_cli.video
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -272,6 +291,72 @@ class EpisodeCollector:
         )
         return True
 
+    def save_agent(
+        self,
+        path: str,
+        agent_idx: int,
+        init_pos_agent: "np.ndarray",  # (3,)
+        goal_agent: "np.ndarray",       # (3,)
+        success: bool,
+        h_window: float,
+    ) -> bool:
+        """Save a single agent's trajectory sliced from the accumulated windows.
+
+        Returns True if saved, False if there was nothing to save.
+        """
+        if self._curr is not None:
+            self._close_window()
+        T = len(self._wins)
+        if T == 0:
+            return False
+
+        i = agent_idx
+
+        def _sa(key: str) -> np.ndarray:
+            # window arrays have shape (N, ...) → stack → (T, N, ...) → [:,i] → (T, ...)
+            return np.stack([w[key] for w in self._wins], axis=0)[:, i]
+
+        def _sa_sub(key: str) -> np.ndarray:
+            # substep arrays have shape (S, N, ...) → stack → (T, S, N, ...) → [:,:,i]
+            return np.stack([w[key] for w in self._wins], axis=0)[:, :, i]
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        np.savez_compressed(
+            path,
+            # Per-window state (T, ...)
+            obs              = _sa("obs"),
+            pos_w            = _sa("pos_w"),
+            vel_w            = _sa("vel_w"),
+            quat_w           = _sa("quat_w"),
+            ang_vel_b        = _sa("ang_vel_b"),
+            goal_w           = _sa("goal_w"),
+            R_goal           = _sa("R_goal"),
+            bezier_U         = _sa("bezier_U"),
+            free_ctrl_pts    = _sa("free_ctrl_pts"),
+            ref_pos_w        = _sa("ref_pos_w"),
+            ref_vel_w        = _sa("ref_vel_w"),
+            ref_acc_w        = _sa("ref_acc_w"),
+            mpc_replanned    = _sa("mpc_replanned"),
+            mpc_reset_mode   = _sa("mpc_reset_mode"),
+            mpc_fallback     = _sa("mpc_fallback"),
+            mpc_collision_ts = _sa("mpc_collision_ts"),
+            # Per-substep (T, S, ...)
+            substep_ref_pos_w  = _sa_sub("substep_ref_pos_w"),
+            substep_ref_vel_w  = _sa_sub("substep_ref_vel_w"),
+            substep_ref_acc_w  = _sa_sub("substep_ref_acc_w"),
+            substep_thrust_z   = _sa_sub("substep_thrust_z"),
+            substep_torque_b   = _sa_sub("substep_torque_b"),
+            # Episode metadata
+            init_pos_local  = init_pos_agent,
+            goal_local      = goal_agent,
+            success         = np.array(success,         dtype=np.bool_),
+            n_substeps      = np.array(self.n_substeps, dtype=np.int32),
+            bezier_k        = np.array(self.bezier_k,   dtype=np.int32),
+            h_window        = np.array(h_window,        dtype=np.float32),
+            n_bez           = np.array(self.n_bez,       dtype=np.int32),
+        )
+        return True
+
     def reset(self) -> None:
         self._wins.clear()
         self._curr = None
@@ -308,11 +393,21 @@ def _read_expert_state(
     expert: DMPCExpert, E: int, N: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read DMPC expert state for all (e, i) pairs after a plan() call."""
-    bezier_U      = np.zeros((E, N, expert.n_bez), dtype=np.float32)
-    mpc_replanned = np.zeros((E, N), dtype=np.bool_)
+    if expert._gpu_solver is not None:
+        # GPU path: direct numpy array slice — no Python loop
+        return (
+            expert._st_U[:E, :N].astype(np.float32),
+            expert._st_replanned[:E, :N].copy(),
+            expert._st_reset_mode[:E, :N].copy(),
+            expert._st_fallback[:E, :N].copy(),
+            expert._st_coll_ts[:E, :N].copy(),
+        )
+    # OSQP path: read from state dict
+    bezier_U       = np.zeros((E, N, expert.n_bez), dtype=np.float32)
+    mpc_replanned  = np.zeros((E, N), dtype=np.bool_)
     mpc_reset_mode = np.zeros((E, N), dtype=np.bool_)
-    mpc_fallback  = np.zeros((E, N), dtype=np.bool_)
-    mpc_col_ts    = np.full((E, N), -1, dtype=np.int32)
+    mpc_fallback   = np.zeros((E, N), dtype=np.bool_)
+    mpc_col_ts     = np.full((E, N), -1, dtype=np.int32)
     for e in range(E):
         for i in range(N):
             st = expert._state.get((e, i))
@@ -345,8 +440,30 @@ def main() -> None:
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
 
-    env_gym = gym.make(args_cli.task, cfg=env_cfg)
-    env: MultiDroneDmpcEnv = env_gym.unwrapped
+    env_gym = gym.make(
+        args_cli.task,
+        cfg=env_cfg,
+        render_mode="rgb_array" if args_cli.video else None,
+    )
+    env: MultiDroneDmpcEnv = env_gym.unwrapped  # direct reference for attribute access
+
+    # ── optional video recording ──────────────────────────────────────────────
+    if args_cli.video:
+        video_dir = Path(args_cli.save_dir) / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        env_gym = gym.wrappers.RecordVideo(
+            env_gym,
+            video_folder=str(video_dir),
+            # Skip step 0 — SDG pipeline hangs on first render before sim is warm.
+            # Also only record from env 0 viewport by using episode_trigger if available;
+            # step_trigger fires every video_interval steps *after* warmup.
+            step_trigger=lambda step: step > 0 and step % args_cli.video_interval == 0,
+            video_length=args_cli.video_length,
+            disable_logger=True,
+        )
+        print(f"[collect_dmpc_data] video → {video_dir}  "
+              f"(every {args_cli.video_interval} steps, {args_cli.video_length} frames)")
+
     device = env.device
     E = env.num_envs
     N = env.cfg.num_drones
@@ -372,6 +489,10 @@ def main() -> None:
         ),
         device=device,
     )
+    if args_cli.gpu_admm:
+        expert.enable_gpu_admm(max_envs=E, admm_iters=args_cli.admm_iters)
+        print(f"[collect_dmpc_data] GPU ADMM enabled  "
+              f"(max_B={E*N}  iters={args_cli.admm_iters}  alpha=1.6  coll=penalty)")
 
     # ── output dir ───────────────────────────────────────────────────────────
     save_dir = Path(args_cli.save_dir)
@@ -409,7 +530,19 @@ def main() -> None:
     saved_count   = ep_count
     target        = ep_count + args_cli.target_episodes
     t0            = time.time()
-    log_interval  = max(1, args_cli.target_episodes // 20)
+
+    # Success rate tracking
+    total_done    = 0
+    total_success = 0
+    recent_outcomes: deque[int] = deque(maxlen=100)  # rolling 100-ep window
+
+    pbar = tqdm(
+        total=args_cli.target_episodes,
+        initial=0,
+        desc="collecting",
+        unit="ep",
+        dynamic_ncols=True,
+    )
 
     try:
         while saved_count < target:
@@ -529,22 +662,29 @@ def main() -> None:
                         ep_init_pos[e] = env._init_pos_w[e].detach().clone()
                         ep_goal[e]     = env._goal_pos_w[e].detach().clone()
 
-            # ── episode done: save and reset ─────────────────────────────────
+            # ── episode done: save per-agent and reset ───────────────────────
             if done.any():
                 done_ids = done.nonzero(as_tuple=False).flatten()
                 expert.reset(done_ids)
                 for e in done_ids.tolist():
-                    success = bool(env._just_succeeded[e].item())
-                    if args_cli.save_all or success:
-                        origin = env._terrain.env_origins[e].cpu()
-                        ip = ep_init_pos[e].cpu().numpy().astype(np.float32).copy()
-                        gp = ep_goal[e].cpu().numpy().astype(np.float32).copy()
-                        ip[:, :2] -= origin[:2].numpy()
-                        gp[:, :2] -= origin[:2].numpy()
-                        ep_path = str(save_dir / f"ep_{saved_count:07d}.npz")
-                        saved = collectors[e].save(ep_path, ip, gp, success, h_window)
-                        if saved:
-                            saved_count += 1
+                    origin = env._terrain.env_origins[e].cpu()
+                    ip = ep_init_pos[e].cpu().numpy().astype(np.float32).copy()
+                    gp = ep_goal[e].cpu().numpy().astype(np.float32).copy()
+                    ip[:, :2] -= origin[:2].numpy()
+                    gp[:, :2] -= origin[:2].numpy()
+                    for i in range(N):
+                        success_i = bool(env._drone_just_succeeded[e, i].item())
+                        total_done    += 1
+                        total_success += int(success_i)
+                        recent_outcomes.append(int(success_i))
+                        if args_cli.save_all or success_i:
+                            ep_path = str(save_dir / f"ep_{saved_count:07d}.npz")
+                            saved = collectors[e].save_agent(
+                                ep_path, i, ip[i], gp[i], success_i, h_window
+                            )
+                            if saved:
+                                saved_count += 1
+                                pbar.update(1)
                     collectors[e].reset()
                     env_step_cnt[e] = 0
                     ep_init_pos[e] = env._init_pos_w[e].detach().clone()
@@ -552,26 +692,32 @@ def main() -> None:
 
             total_steps += E
 
-            # ── progress log ──────────────────────────────────────────────────
-            done_this_step = int(done.sum().item()) if done.any() else 0
-            if saved_count % log_interval == 0 and done_this_step > 0:
-                elapsed = time.time() - t0
-                rate = (saved_count - ep_count) / max(elapsed, 1e-3)
-                eta = (target - saved_count) / max(rate, 1e-6)
-                print(
-                    f"[{saved_count:>7d}/{target}]  "
-                    f"total_steps={total_steps:>9d}  "
-                    f"rate={rate:.2f} ep/s  ETA={eta/60:.1f} min",
-                    flush=True,
-                )
+            # ── tqdm postfix (every step, lightweight) ────────────────────────
+            elapsed   = time.time() - t0
+            ep_rate   = (saved_count - ep_count) / max(elapsed, 1e-3)
+            sps       = total_steps / max(elapsed, 1e-3)
+            roll_n    = len(recent_outcomes)
+            roll_pct  = sum(recent_outcomes) / roll_n * 100 if roll_n else 0.0
+            total_pct = total_success / max(total_done, 1) * 100
+            pbar.set_postfix(
+                sps=f"{sps:.0f}",
+                ep_s=f"{ep_rate:.2f}",
+                succ=f"{total_pct:.1f}%",
+                roll=f"{roll_pct:.1f}%",
+                done=total_done,
+                refresh=False,
+            )
 
     except KeyboardInterrupt:
         print("\n[collect_dmpc_data] interrupted by user.")
     finally:
+        pbar.close()
+        total_pct = total_success / max(total_done, 1) * 100
         print(
             f"\n[collect_dmpc_data] done.  "
-            f"saved={saved_count - ep_count}  total_steps={total_steps}  "
-            f"elapsed={time.time()-t0:.1f}s"
+            f"saved={saved_count - ep_count}  "
+            f"success={total_success}/{total_done} ({total_pct:.1f}%)  "
+            f"steps={total_steps}  elapsed={time.time()-t0:.1f}s"
         )
         simulation_app.close()
 
