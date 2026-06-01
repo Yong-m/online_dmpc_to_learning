@@ -509,31 +509,6 @@ class PerEnvEpisodeBuffer:
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Expert wrapper: DMPC position/velocity/acceleration → env action        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-def expert_reference_acceleration(
-    env: MultiDroneDmpcEnv,
-    expert: DMPCExpert,
-    ref_pos_w: torch.Tensor,
-) -> torch.Tensor:
-    """Recover the acceleration sample matching the latest DMPC reference.
-
-    ``DMPCExpert.compute`` currently returns position and velocity. It also
-    keeps each agent's Bezier control points, so we sample the second
-    derivative at the same substep used for the returned reference.
-    """
-    ref_acc_w = torch.zeros_like(ref_pos_w)
-    h_total = (expert.p.k_hor - 1) * expert.p.h
-    for e in range(env.num_envs):
-        for i in range(env.cfg.num_drones):
-            st = expert._state.get((e, i))
-            if st is None:
-                continue
-            steps_before_sample = max(int(st["steps"]) - 1, 0)
-            t_sub = ((steps_before_sample % expert.n_substeps) + 1) * expert.p.ts
-            t_sub = min(t_sub, h_total)
-            ref_acc = expert.bezier.sample_matrix(np.array([t_sub]), deriv=2) @ st["U"]
-            ref_acc_w[e, i] = torch.from_numpy(ref_acc.astype(np.float32)).to(env.device)
-    return ref_acc_w
-
 
 def hover_action(
     env: MultiDroneDmpcEnv,
@@ -674,12 +649,11 @@ def expert_action(
     states:    World-frame state dict used for Bezier ctrl_pts fitting.
     """
     states = env.get_world_states()
-    ref_pos_w, ref_vel_w = expert.plan(
+    ref_pos_w, ref_vel_w, ref_acc_w = expert.plan(
         pos_w=states["pos_w"], vel_w=states["lin_vel_w"],
         goal_w=states["goal_w"], env_origins=env._terrain.env_origins,
     )
     _push_first_env_debug_trajectories(env, expert, states)
-    ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     E, N = ref_pos_w.shape[:2]
     action_flat = torch.cat([ref_pos_w, ref_vel_w, ref_acc_w], dim=-1).reshape(E, N * 9)
     if debug_logger is not None:

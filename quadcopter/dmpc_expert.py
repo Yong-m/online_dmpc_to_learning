@@ -624,6 +624,7 @@ class DMPCExpert:
         device = self.device
         ref_pos = pos_w.clone()
         ref_vel = torch.zeros_like(vel_w)
+        ref_acc = torch.zeros_like(vel_w)
 
         env_iter = range(E) if env_ids is None else env_ids.detach().cpu().tolist()
 
@@ -716,6 +717,11 @@ class DMPCExpert:
                         np.array([min((k + 1) * ts, h_total)]), deriv=1
                     ).astype(np.float32) for k in range(self.n_substeps)
                 ]
+                self._S_acc_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=2
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
 
             all_U   = self._st_U[e_all, i_all].astype(np.float32)    # (E_n*N, n_bez)
             all_sub = (self._st_steps[e_all, i_all] % self.n_substeps).astype(np.int32)
@@ -776,6 +782,11 @@ class DMPCExpert:
                         np.array([min((k + 1) * ts, h_total)]), deriv=1
                     ).astype(np.float32) for k in range(self.n_substeps)
                 ]
+                self._S_acc_cache = [
+                    self.bezier.sample_matrix(
+                        np.array([min((k + 1) * ts, h_total)]), deriv=2
+                    ).astype(np.float32) for k in range(self.n_substeps)
+                ]
 
             all_U   = np.empty((E_n * N, self.n_bez), dtype=np.float32)
             all_sub = np.empty(E_n * N, dtype=np.int32)
@@ -796,26 +807,30 @@ class DMPCExpert:
         _tp3 = _time.perf_counter()
         all_pos = np.empty((E_n * N, 3), dtype=np.float32)
         all_vel = np.empty((E_n * N, 3), dtype=np.float32)
+        all_acc = np.zeros( (E_n * N, 3), dtype=np.float32)
         for k in range(self.n_substeps):
             mask = all_sub == k
             if not mask.any():
                 continue
-            # S_pos/vel: (1, n_bez) → squeeze for broadcast
             all_pos[mask] = (all_U[mask] @ self._S_pos_cache[k].T).reshape(-1, 3) + all_ori[mask]
             all_vel[mask] = (all_U[mask] @ self._S_vel_cache[k].T).reshape(-1, 3)
+            all_acc[mask] = (all_U[mask] @ self._S_acc_cache[k].T).reshape(-1, 3)
         _t_phase3 = _time.perf_counter() - _tp3
 
-        # Write results back to ref tensors — two bulk CUDA transfers.
+        # Write results back to ref tensors — three bulk CUDA transfers.
         _tw = _time.perf_counter()
         all_pos_t = torch.from_numpy(all_pos).to(device).reshape(E_n, N, 3)
         all_vel_t = torch.from_numpy(all_vel).to(device).reshape(E_n, N, 3)
+        all_acc_t = torch.from_numpy(all_acc).to(device).reshape(E_n, N, 3)
         if env_ids is None:
             ref_pos[:] = all_pos_t
             ref_vel[:] = all_vel_t
+            ref_acc[:] = all_acc_t
         else:
             env_t = torch.tensor(env_list, dtype=torch.long, device=device)
             ref_pos[env_t] = all_pos_t
             ref_vel[env_t] = all_vel_t
+            ref_acc[env_t] = all_acc_t
         _t_write = _time.perf_counter() - _tw
 
         _tc3 = _time.perf_counter()
@@ -835,7 +850,7 @@ class DMPCExpert:
                 flush=True,
             )
 
-        return ref_pos, ref_vel
+        return ref_pos, ref_vel, ref_acc
 
     def plan(self, *args, **kwargs):
         """Alias for :py:meth:`compute`. The BC script + readers in the paper's

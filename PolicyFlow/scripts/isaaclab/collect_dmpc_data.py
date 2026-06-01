@@ -84,7 +84,7 @@ parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--save_dir", type=str, required=True,
                     help="Directory to write per-episode .npz files.")
-parser.add_argument("--target_episodes", type=int, default=100000,
+parser.add_argument("--target_episodes", type=int, default=250000,
                     help="Stop after this many episodes have been saved.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Hard env-step cap (0 = use --target_episodes only).")
@@ -366,28 +366,6 @@ class EpisodeCollector:
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Helpers                                                                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-def _get_ref_acc(
-    env: MultiDroneDmpcEnv,
-    expert: DMPCExpert,
-    ref_pos_w: torch.Tensor,
-) -> torch.Tensor:
-    """Sample DMPC Bezier second derivative at the current sub-step."""
-    ref_acc = torch.zeros_like(ref_pos_w)
-    E, N = ref_pos_w.shape[:2]
-    h_total = (expert.p.k_hor - 1) * expert.p.h
-    for e in range(E):
-        for i in range(N):
-            st = expert._state.get((e, i))
-            if st is None:
-                continue
-            steps_before = max(int(st["steps"]) - 1, 0)
-            t_sub = ((steps_before % expert.n_substeps) + 1) * expert.p.ts
-            t_sub = min(t_sub, h_total)
-            acc_np = (expert.bezier.sample_matrix(np.array([t_sub]), deriv=2)
-                      @ st["U"]).astype(np.float32)
-            ref_acc[e, i] = torch.from_numpy(acc_np).to(env.device)
-    return ref_acc
-
 
 def _read_expert_state(
     expert: DMPCExpert, E: int, N: int,
@@ -567,13 +545,12 @@ def main() -> None:
             states        = env.get_world_states()         # pos_w, vel_w, quat_w, ...
 
             # ── DMPC expert plan (handles sub-step scheduling internally) ───
-            ref_pos_w, ref_vel_w = expert.plan(
+            ref_pos_w, ref_vel_w, ref_acc_w = expert.plan(
                 pos_w=states["pos_w"],
                 vel_w=states["lin_vel_w"],
                 goal_w=states["goal_w"],
                 env_origins=env._terrain.env_origins,
             )
-            ref_acc_w   = _get_ref_acc(env, expert, ref_pos_w)
             action_flat = torch.cat(
                 [ref_pos_w, ref_vel_w, ref_acc_w], dim=-1
             ).reshape(E, N * 9)
