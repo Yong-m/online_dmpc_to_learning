@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 _HERE = Path(__file__).resolve().parent
 _POLICYFLOW_ROOT = _HERE.parent.parent / "policyflow"
@@ -102,6 +103,12 @@ from isaaclab.app import AppLauncher  # noqa: E402
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = False   # cameras only needed if recording eval video
+
+# Disable ROS2 sim_control extension when ROS2 is not sourced to avoid a noisy
+# [Error] from the extension manager at startup.
+if not os.environ.get("ROS_DISTRO"):
+    _ros_exclude = "--/app/extensions/excluded/0=isaacsim.ros2.sim_control"
+    args_cli.kit_args = (args_cli.kit_args + " " + _ros_exclude).strip()
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -558,13 +565,19 @@ def main() -> None:
         )
 
     # ── training loop ────────────────────────────────────────────────────────
-    for epoch in range(start_epoch, args_cli.n_epochs):
+    global_step = start_epoch * len(train_loader)
+    epoch_bar = tqdm(range(start_epoch, args_cli.n_epochs), desc="Epochs",
+                     unit="ep", dynamic_ncols=True)
+
+    for epoch in epoch_bar:
         policy.train()
         epoch_metrics: dict[str, list[float]] = {
             "loss/total": [], "loss/flow": [], "loss/vel_aux": [], "loss/acc_aux": []
         }
 
-        for batch in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"  Train ep{epoch+1}",
+                         unit="batch", leave=False, dynamic_ncols=True)
+        for batch in batch_bar:
             obs      = batch["obs"].to(device)
             ctrl_pts = batch["ctrl_pts"].to(device)
             ref_vel  = batch["ref_vel"].to(device)
@@ -581,19 +594,32 @@ def main() -> None:
             nn.utils.clip_grad_norm_(policy.parameters(), args_cli.grad_clip)
             optimizer.step()
             policy.cnf.update_proximal()
+            global_step += 1
 
             for k, v in metrics.items():
                 epoch_metrics[k].append(v)
 
-        scheduler.step()
+            batch_bar.set_postfix(
+                loss=f"{metrics['loss/total']:.4f}",
+                flow=f"{metrics['loss/flow']:.4f}",
+            )
 
+            if args_cli.wandb and _WANDB_AVAILABLE:
+                _wandb.log({"step/loss": metrics["loss/total"],
+                            "step/flow": metrics["loss/flow"],
+                            "step/vel_aux": metrics["loss/vel_aux"],
+                            "step/acc_aux": metrics["loss/acc_aux"]},
+                           step=global_step)
+
+        scheduler.step()
         avg = {k: float(np.mean(v)) for k, v in epoch_metrics.items()}
 
         # ── validation loss ─────────────────────────────────────────────
         val_losses: list[float] = []
         policy.eval()
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc="  Val", unit="batch",
+                              leave=False, dynamic_ncols=True):
                 obs      = batch["obs"].to(device)
                 ctrl_pts = batch["ctrl_pts"].to(device)
                 ref_vel  = batch["ref_vel"].to(device)
@@ -606,22 +632,13 @@ def main() -> None:
                 val_losses.append(vm["loss/total"])
         policy.train()
         avg["val/loss"] = float(np.mean(val_losses))
-
-        log_str = (f"[epoch {epoch+1:4d}/{args_cli.n_epochs}]"
-                   f"  loss={avg['loss/total']:.4f}"
-                   f"  flow={avg['loss/flow']:.4f}"
-                   f"  vel={avg['loss/vel_aux']:.4f}"
-                   f"  acc={avg['loss/acc_aux']:.4f}"
-                   f"  val={avg['val/loss']:.4f}")
+        avg["lr"] = float(scheduler.get_last_lr()[0])
 
         # ── eval every N epochs ──────────────────────────────────────────
         eval_metrics: dict[str, float] = {}
         if args_cli.eval_every > 0 and (epoch + 1) % args_cli.eval_every == 0:
             eval_metrics = evaluate(env, policy, args_cli.eval_steps, n_substeps, h_window)
             succ = eval_metrics["eval_success_rate"]
-            log_str += (f"  eval_succ={succ:.3f}"
-                        f"  eval_ret={eval_metrics['eval_return']:.2f}"
-                        f"  eval_eps={eval_metrics['eval_episodes']}")
             avg.update(eval_metrics)
 
             if succ > best_success:
@@ -636,11 +653,28 @@ def main() -> None:
                     "n_substeps":   n_substeps,
                     "h_window":     h_window,
                 }, str(best_path))
-                log_str += f"  ← best saved"
+                tqdm.write(f"  [best] epoch={epoch+1}  success={succ:.3f} → {best_path}")
 
-        print(log_str, flush=True)
+        # ── update epoch bar postfix ─────────────────────────────────────
+        pf: dict = dict(
+            loss=f"{avg['loss/total']:.4f}",
+            val=f"{avg['val/loss']:.4f}",
+            lr=f"{avg['lr']:.2e}",
+        )
+        if eval_metrics:
+            pf["succ"] = f"{eval_metrics['eval_success_rate']:.3f}"
+        epoch_bar.set_postfix(**pf)
+
         if args_cli.wandb and _WANDB_AVAILABLE:
-            _wandb.log({"epoch": epoch + 1, **avg})
+            _wandb.log({"epoch": epoch + 1,
+                        "epoch/loss_total":  avg["loss/total"],
+                        "epoch/loss_flow":   avg["loss/flow"],
+                        "epoch/loss_vel":    avg["loss/vel_aux"],
+                        "epoch/loss_acc":    avg["loss/acc_aux"],
+                        "epoch/val_loss":    avg["val/loss"],
+                        "epoch/lr":          avg["lr"],
+                        **{f"epoch/{k}": v for k, v in eval_metrics.items()}},
+                       step=global_step)
 
         # ── periodic checkpoint ──────────────────────────────────────────
         if (epoch + 1) % args_cli.save_every == 0:
