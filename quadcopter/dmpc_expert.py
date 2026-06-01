@@ -1268,77 +1268,96 @@ class DMPCExpert:
             Float32 tensor ``(E_max, N, K-2, 3)`` on ``self.device``.
         """
         env_list = list(env_list)
-        E_max = max(env_list) + 1
+        E_max  = max(env_list) + 1
         K_free = K - 2
         free_ctrl = np.zeros((E_max, self.N, K_free, 3), dtype=np.float32)
 
-        pos_np   = pos_w.detach().cpu().numpy().astype(np.float64)
-        vel_np   = vel_w.detach().cpu().numpy().astype(np.float64)
-        goal_np  = goal_w.detach().cpu().numpy().astype(np.float64)
-        orig_np  = env_origins.detach().cpu().numpy().astype(np.float64)
+        pos_np  = pos_w.detach().cpu().numpy().astype(np.float64)
+        vel_np  = vel_w.detach().cpu().numpy().astype(np.float64)
+        goal_np = goal_w.detach().cpu().numpy().astype(np.float64)
+        orig_np = env_origins.detach().cpu().numpy().astype(np.float64)
 
-        # Sampling taus in (0, 1] for the K-1 degree Bezier.
-        taus = np.linspace(1.0 / n_fit, 1.0, n_fit, dtype=np.float64)  # (n_fit,)
-        t_abs = taus * h  # absolute times in (0, h] for DMPC sampling
+        # Sampling taus in (0, 1] for the K-1 degree Bezier (fixed for given K, h, n_fit).
+        taus  = np.linspace(1.0 / n_fit, 1.0, n_fit, dtype=np.float64)
+        t_abs = taus * h
 
-        # Bernstein basis matrix: Phi[m, j] = B_{j, K-1}(taus[m])
-        Phi_all = np.column_stack([
+        Phi_all    = np.column_stack([
             comb(K - 1, j, exact=True) * (taus ** j) * ((1 - taus) ** (K - 1 - j))
             for j in range(K)
-        ])  # (n_fit, K)
-        Phi_free   = Phi_all[:, 2:].astype(np.float32)    # (n_fit, K-2) — free ctrl_pts
-        Phi_pinned = Phi_all[:, :2].astype(np.float32)    # (n_fit, 2)   — P_0, P_1
+        ]).astype(np.float64)                         # (n_fit, K)
+        Phi_free   = Phi_all[:, 2:]                   # (n_fit, K-2)
+        phi1_col   = Phi_all[:, 1]                    # (n_fit,) — P_1 column
+        Phi_pinv   = np.linalg.pinv(Phi_free)         # (K-2, n_fit)  — precomputed once
+        S          = self.bezier.sample_matrix(t_abs, deriv=0).astype(np.float64)  # (n_fit*3, n_bez)
 
-        for e in env_list:
-            origin_e = orig_np[e]
-            for i in range(self.N):
-                if self._gpu_solver is not None:
-                    if not self._st_has[e, i]:
-                        continue
-                    U = self._st_U[e, i]
-                else:
+        if self._gpu_solver is not None:
+            # ── GPU path: fully vectorised, no per-agent Python loop ─────────
+            env_arr = np.array(env_list, dtype=np.intp)
+            has_win = self._st_has[env_arr, :]          # (E_win, N)
+            e_loc, i_arr = np.where(has_win)            # local env index, agent index
+            e_arr = env_arr[e_loc]                      # global env index
+            B = len(e_arr)
+            if B == 0:
+                return torch.from_numpy(free_ctrl).to(self.device)
+
+            U_batch   = self._st_U[e_arr, i_arr].astype(np.float64)   # (B, n_bez)
+            p_curr    = pos_np[e_arr, i_arr]                            # (B, 3)
+            v_curr    = vel_np[e_arr, i_arr]
+            orig_b    = orig_np[e_arr]                                  # (B, 3) env origins
+
+            # DMPC positions in world frame: (S @ U_batch.T) → (n_fit*3, B)
+            # reshape to (B, n_fit, 3)
+            pos_dmpc = ((S @ U_batch.T).T).reshape(B, n_fit, 3) + orig_b[:, None, :]
+
+            # Goal-aligned R per agent (2-D yaw rotation only)
+            delta  = goal_np[e_arr, i_arr] - p_curr    # (B, 3)
+            horiz  = np.hypot(delta[:, 0], delta[:, 1])
+            ct     = np.where(horiz > 1e-3, delta[:, 0] / horiz, np.ones(B))
+            st_    = np.where(horiz > 1e-3, delta[:, 1] / horiz, np.zeros(B))
+
+            # P_1 = R @ v_curr * h/(K-1)
+            vx, vy, vz = v_curr[:, 0], v_curr[:, 1], v_curr[:, 2]
+            P_1 = np.stack([ct*vx + st_*vy, -st_*vx + ct*vy, vz], axis=-1) * (h / (K - 1))
+
+            # delta_w in world, then rotate to goal frame
+            dw  = pos_dmpc - p_curr[:, None, :]         # (B, n_fit, 3)
+            x_g = ct[:, None]*dw[:,:,0] + st_[:, None]*dw[:,:,1]
+            y_g = -st_[:, None]*dw[:,:,0] + ct[:, None]*dw[:,:,1]
+            p_goal = np.stack([x_g, y_g, dw[:,:,2]], axis=-1)  # (B, n_fit, 3)
+
+            # Residual: subtract P_1 contribution
+            residuals = p_goal - phi1_col[None, :, None] * P_1[:, None, :]  # (B, n_fit, 3)
+
+            # Batch least-squares via precomputed pseudoinverse
+            # Phi_pinv: (K-2, n_fit);  residuals: (B, n_fit, 3)
+            P_free_batch = np.einsum('kf,bfd->bkd', Phi_pinv, residuals)    # (B, K-2, 3)
+            free_ctrl[e_arr, i_arr] = P_free_batch.astype(np.float32)
+
+        else:
+            # ── OSQP path: original per-agent loop ───────────────────────────
+            for e in env_list:
+                origin_e = orig_np[e]
+                for i in range(self.N):
                     st = self._state.get((e, i))
                     if st is None:
                         continue
                     U = st["U"]
-
-                # Sample DMPC position Bezier at n_fit time points.
-                pos_dmpc = (
-                    self.bezier.sample_matrix(t_abs, deriv=0) @ U
-                ).reshape(n_fit, 3) + origin_e  # (n_fit, 3) world frame
-
-                # Current drone state.
-                p_curr = pos_np[e, i]    # (3,)
-                v_curr = vel_np[e, i]    # (3,)
-                g_curr = goal_np[e, i]   # (3,)
-
-                # Goal-aligned rotation R: world → goal frame.
-                delta = g_curr - p_curr
-                horiz = np.hypot(delta[0], delta[1])
-                if horiz < 1e-3:
-                    R = np.eye(3, dtype=np.float64)
-                else:
-                    cos_t, sin_t = delta[0] / horiz, delta[1] / horiz
-                    R = np.array([[cos_t, sin_t, 0.0],
-                                  [-sin_t, cos_t, 0.0],
-                                  [0.0, 0.0, 1.0]], dtype=np.float64)
-
-                # Pinned ctrl_pts in goal-aligned delta frame.
-                # P_0 = (0,0,0); P_1 = R @ v_curr * h / (K-1).
-                P_1 = R @ v_curr * (h / (K - 1))  # (3,)
-
-                # DMPC positions → goal-aligned delta frame.
-                delta_w = pos_dmpc - p_curr  # (n_fit, 3)
-                p_goal  = (R @ delta_w.T).T  # (n_fit, 3)
-
-                # Residual after subtracting P_0 (= 0) and P_1 contributions.
-                residual = p_goal - np.outer(Phi_pinned[:, 1], P_1)  # (n_fit, 3)
-
-                # Least-squares: Phi_free @ P_free = residual  → P_free (K-2, 3).
-                P_free, _, _, _ = np.linalg.lstsq(
-                    Phi_free.astype(np.float64), residual, rcond=None
-                )
-                free_ctrl[e, i] = P_free.astype(np.float32)
+                    pos_dmpc = (S @ U).reshape(n_fit, 3) + origin_e
+                    p_curr   = pos_np[e, i]
+                    v_curr   = vel_np[e, i]
+                    delta    = goal_np[e, i] - p_curr
+                    horiz    = np.hypot(delta[0], delta[1])
+                    if horiz < 1e-3:
+                        R = np.eye(3, dtype=np.float64)
+                    else:
+                        cos_t = delta[0] / horiz;  sin_t = delta[1] / horiz
+                        R = np.array([[cos_t, sin_t, 0.], [-sin_t, cos_t, 0.], [0., 0., 1.]])
+                    P_1      = R @ v_curr * (h / (K - 1))
+                    delta_w  = pos_dmpc - p_curr
+                    p_goal   = (R @ delta_w.T).T
+                    residual = p_goal - np.outer(phi1_col, P_1)
+                    P_free   = (Phi_pinv @ residual).astype(np.float32)
+                    free_ctrl[e, i] = P_free
 
         return torch.from_numpy(free_ctrl).to(self.device)
 
