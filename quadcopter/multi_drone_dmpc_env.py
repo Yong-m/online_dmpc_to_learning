@@ -78,7 +78,7 @@ class MultiDroneDmpcEnvWindow(BaseEnvWindow):
 class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4 # overwritten by cli args
-    episode_length_s: float = 10.0
+    episode_length_s: float = 20.0 #10.0
     decimation: int = 2
     # action_type: str = "full_traj" # "full_traj", "velocity", "wrench"
     action_space: int = None   # overwritten in __post_init__

@@ -723,6 +723,8 @@ def run_expert_test(
     device = env.device
     env.reset(seed=args_cli.seed) if args_cli.seed is not None else env.reset()
     expert.reset(obstacle_info=env.get_obstacle_info())
+    if hasattr(expert, "reset_qp_timing_stats"):
+        expert.reset_qp_timing_stats()
     if hasattr(env, "_last_reset_env_ids"):
         env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
     last_episode_length_buf = env.episode_length_buf.clone()
@@ -842,6 +844,7 @@ def run_expert_test(
             active_incomplete = int((~episode_success & ~episode_drone_collision & ~episode_obstacle_collision & ~episode_bounds_failure).sum().item())
             current_goal_max = goal_dist.max(dim=-1).values
             elapsed = time.time() - t0
+            qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {"avg_s": 0.0, "max_s": 0.0, "count": 0.0}
             print(
                 "[expert_test] progress "
                 f"step={step + 1}/{n_steps} "
@@ -854,6 +857,9 @@ def run_expert_test(
                 f"active_incomplete={active_incomplete} "
                 f"goal_dist_mean={current_goal_max.mean().item():.3f} "
                 f"goal_dist_max={current_goal_max.max().item():.3f} "
+                f"qp_avg={qp_stats['avg_s'] * 1e3:.2f}ms "
+                f"qp_max={qp_stats['max_s'] * 1e3:.2f}ms "
+                f"qp_n={int(qp_stats['count'])} "
                 f"wall={elapsed:.1f}s",
                 flush=True,
             )
@@ -862,6 +868,7 @@ def run_expert_test(
 
     active_incomplete = int((~episode_success & ~episode_drone_collision & ~episode_obstacle_collision & ~episode_bounds_failure).sum().item())
     denom = max(total_episodes, 1)
+    qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {"avg_s": 0.0, "max_s": 0.0, "total_s": 0.0, "count": 0.0}
     metrics = {
         "expert_success_rate": total_success / denom,
         "expert_clean_success_rate": total_clean_success / denom,
@@ -877,6 +884,10 @@ def run_expert_test(
         "expert_runtime_s": time.time() - t0,
         "expert_num_envs": float(E),
         "expert_steps": float(n_steps),
+        "expert_qp_avg_ms": float(qp_stats["avg_s"] * 1e3),
+        "expert_qp_max_ms": float(qp_stats["max_s"] * 1e3),
+        "expert_qp_total_s": float(qp_stats["total_s"]),
+        "expert_qp_count": float(qp_stats["count"]),
     }
     print(
         "[expert_test] "
@@ -887,7 +898,10 @@ def run_expert_test(
         f"obs_col={metrics['expert_obstacle_collision_rate']:.3f}  "
         f"bounds={metrics['expert_bounds_failure_rate']:.3f}  "
         f"incomplete_envs={active_incomplete}  "
-        f"mean_t_success={metrics['expert_mean_time_to_success_s']:.2f}s",
+        f"mean_t_success={metrics['expert_mean_time_to_success_s']:.2f}s  "
+        f"qp_avg={metrics['expert_qp_avg_ms']:.2f}ms  "
+        f"qp_max={metrics['expert_qp_max_ms']:.2f}ms  "
+        f"qp_n={int(metrics['expert_qp_count'])}",
         flush=True,
     )
     return metrics

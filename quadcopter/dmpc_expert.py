@@ -84,7 +84,9 @@ Public entry point::
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from dataclasses import dataclass
 
 import numpy as np
@@ -406,6 +408,40 @@ class DMPCExpert:
         # keep right-of-way until they clearly leave the goal ball.
         self._priority_hold: dict[tuple[int, int], bool] = {}
 
+        # Wall-time accounting for per-agent QP/replan calls. These values are
+        # updated from worker threads, so keep mutations behind a small lock.
+        self._timing_lock = Lock()
+        self._qp_wall_time_total = 0.0
+        self._qp_wall_time_count = 0
+        self._qp_wall_time_last = 0.0
+        self._qp_wall_time_max = 0.0
+
+    def reset_qp_timing_stats(self) -> None:
+        with self._timing_lock:
+            self._qp_wall_time_total = 0.0
+            self._qp_wall_time_count = 0
+            self._qp_wall_time_last = 0.0
+            self._qp_wall_time_max = 0.0
+
+    def get_qp_timing_stats(self) -> dict[str, float]:
+        with self._timing_lock:
+            count = self._qp_wall_time_count
+            total = self._qp_wall_time_total
+            return {
+                "count": float(count),
+                "total_s": float(total),
+                "avg_s": float(total / count) if count > 0 else 0.0,
+                "last_s": float(self._qp_wall_time_last),
+                "max_s": float(self._qp_wall_time_max),
+            }
+
+    def _record_qp_wall_time(self, elapsed_s: float) -> None:
+        with self._timing_lock:
+            self._qp_wall_time_total += float(elapsed_s)
+            self._qp_wall_time_count += 1
+            self._qp_wall_time_last = float(elapsed_s)
+            self._qp_wall_time_max = max(self._qp_wall_time_max, float(elapsed_s))
+
     # ───────────────────────────────────────────────────────────────────
     # Constant cost
     # ───────────────────────────────────────────────────────────────────
@@ -605,16 +641,20 @@ class DMPCExpert:
 
         def _do_replan(ei: tuple[int, int]) -> None:
             e, i = ei
-            self._replan_agent(
-                e, i,
-                nbr_ids=nbr_ids[(e, i)],
-                pos_local=pos_np_local[e, i],
-                vel=vel_np[e, i],
-                goal_local=goal_np_local[e, i],
-                own_priority_score=priority_scores[e][i],
-                nbr_pred=nbr_preds[(e, i)],
-                nbr_priority_scores=nbr_priorities[(e, i)],
-            )
+            t_qp0 = time.perf_counter()
+            try:
+                self._replan_agent(
+                    e, i,
+                    nbr_ids=nbr_ids[(e, i)],
+                    pos_local=pos_np_local[e, i],
+                    vel=vel_np[e, i],
+                    goal_local=goal_np_local[e, i],
+                    own_priority_score=priority_scores[e][i],
+                    nbr_pred=nbr_preds[(e, i)],
+                    nbr_priority_scores=nbr_priorities[(e, i)],
+                )
+            finally:
+                self._record_qp_wall_time(time.perf_counter() - t_qp0)
 
         if self._pool is not None and len(replan_tasks) > 1:
             list(self._pool.map(_do_replan, replan_tasks))
