@@ -1,43 +1,20 @@
 """online_bc_dmpc.py - Online BC with a DMPC expert and PolicyFlow's
 flow-matching student for the multi-drone DMPC env.
 
-This mirrors the *PolicyFlow* training stack used by
-``online_bc_curobo.py`` -- a rectified-flow policy built from
-``ContinuousNormalizingFlow`` + ``FlowMlp`` + ``EmpiricalNormalization`` --
-adapted to a multi-drone setting with two specific design choices that follow
-the paper "Online Trajectory Generation With Distributed Model Predictive
-Control for Multi-Robot Motion Planning" (Luis et al., RA-L 2020):
-
-1.  **Decentralised, parameter-shared student.** Each drone runs the same
-    flow-matching network on its own per-drone slice of the observation. The
-    env exposes ``get_per_drone_obs() -> (E, N, P)``; we reshape to
-    ``(E*N, P)``, run the shared condition + flow network, and reshape the
-    resulting per-drone action ``(E*N, A)`` (``A = 9`` -- normalised
-    ``[delta_p, v_ref, a_ref]`` per drone) back to ``(E, N*A)`` before sending to the env. The
-    same weights govern every drone, which is the natural permutation-
-    equivariant choice for a homogeneous team.
-
-2.  **Full PolicyFlow flow-matching head.** Action targets are ``atanh``-mapped
-    to the latent unit cube, paired with Gaussian ``x0``, and the model
-    regresses the rectified-flow velocity ``(x1 - x0)`` -- the same loss used
-    throughout PolicyFlow. Sampling at rollout time is the Heun-style ODE
-    integration of ``ContinuousNormalizingFlow.sample``. EMA / behaviour /
-    proximal copies of the flow weights are kept around (matches the curobo
-    script), making it easy to plug in PPO-EWMA / decoupled objectives later.
+Policy architecture:
+  Each drone predicts K=4 cubic Bezier control points (K×3 = 12D) for its
+  velocity reference over the next h=0.1s horizon.  The cascade controller
+  tracks the evaluated v_ref at each env step (3D action, existing v_ref mode).
+  Flow matching is done on the K×3 control-point latent.
 
 Pipeline per outer round:
 
-  1. *Collect*. Roll out ``--steps_per_batch`` env steps. For every step we
-     query the DMPC expert for a **world-frame position + velocity reference**
-     for *every* drone in *every* env, convert it to the env's 9-D normalised
-     reference action via :py:meth:`MultiDroneDmpcEnv.ref_to_action`, apply it,
-     and store ``(per_drone_obs, atanh(per_drone_action))`` for every drone
-     (each step contributes ``E * N`` BC samples).
-  2. *Train*. ``--bc_epochs_per_round`` flow-matching updates on a uniform
-     sample from the rolling per-drone buffer; loss is rectified-flow
-     velocity-MSE.
-  3. *Eval*. Every ``--eval_every_rounds`` rounds run a student rollout and
-     log mean episode return + success rate.
+  1. *Collect*. DMPC plans and steps the env with v_ref (3D per drone). After
+     each expert.plan(), fit cubic Bezier ctrl_pts to the velocity profile and
+     store (obs, ctrl_pts) in the BC buffer.
+  2. *Train*. Flow-matching on ctrl_pts given obs.
+  3. *Eval*. Policy predicts ctrl_pts, evaluates Bezier at each sub-step for
+     v_ref, steps the env.
 
 Run from anywhere::
 
@@ -55,6 +32,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+import imageio
 import numpy as np
 
 # Make the in-repo PolicyFlow + quadcopter packages importable without pip:
@@ -76,7 +54,7 @@ parser.add_argument("--seed", type=int, default=None) # Original default: 0
 
 parser.add_argument("--n_rounds", type=int, default=200,
                     help="Total outer iterations (0 = run forever).")
-parser.add_argument("--steps_per_batch", type=int, default=200,
+parser.add_argument("--steps_per_batch", type=int, default=1000,
                     help="Env steps per collection batch.")
 parser.add_argument("--bc_epochs_per_round", type=int, default=10)
 parser.add_argument("--batch_size", type=int, default=512)
@@ -85,7 +63,7 @@ parser.add_argument("--buffer_capacity", type=int, default=400_000,
 parser.add_argument("--min_buffer_transitions", type=int, default=4_000,
                     help="Skip BC updates until the buffer has at least this many transitions.")
 
-parser.add_argument("--eval_every_rounds", type=int, default=10)
+parser.add_argument("--eval_every_rounds", type=int, default=2)
 parser.add_argument("--eval_steps", type=int, default=200)
 parser.add_argument("--expert_test_only", action="store_true", default=False,
                     help="Run DMPC expert only, skip replay-buffer collection and BC training.")
@@ -97,8 +75,6 @@ parser.add_argument("--rmin_check", type=float, default=0.15,
                     help="Inter-agent collision judgement radius for test metrics (C++ simulator used 0.15).")
 parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds for debug rollouts.")
-parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
-                    help="Start episodes at t=0 instead of randomizing episode_length_buf.")
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
                     help="Disable z-bound termination for fixed-target debug rollouts.")
 parser.add_argument("--action_source", choices=["dmpc"], default="dmpc",
@@ -108,8 +84,20 @@ parser.add_argument("--dmpc_log_path", type=str, default=None,
 parser.add_argument("--dmpc_log_every", type=int, default=1,
                     help="Save one DMPC debug sample every N expert steps.")
 
+parser.add_argument("--traj_save_dir", type=str, default=None,
+                    help="Directory to save successful DMPC expert trajectories. "
+                         "If omitted, trajectories are not saved to disk.")
+parser.add_argument("--traj_load_dir", type=str, default=None,
+                    help="Directory of previously saved trajectories to pre-populate "
+                         "the BC buffer at startup (direct obs/act_latent load, no env).")
+parser.add_argument("--traj_replay_dir", type=str, default=None,
+                    help="Like --traj_load_dir but re-runs trajectories in the env to "
+                         "regenerate obs (use when obs definition has changed).")
+parser.add_argument("--traj_max_load", type=int, default=None,
+                    help="Cap on the number of trajectory files to load/replay.")
+
 # Flow-matching / model.
-parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--lr", type=float, default=5e-4)
 parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument("--hidden_dims", type=int, nargs="*", default=[256, 256, 256])
 parser.add_argument("--emb_dim", type=int, default=64,
@@ -117,10 +105,11 @@ parser.add_argument("--emb_dim", type=int, default=64,
                          "FlowMlp adds them, so they must share a size.")
 parser.add_argument("--sample_steps", type=int, default=10,
                     help="Number of Heun ODE integration steps used for sampling.")
-parser.add_argument("--action_clip", type=float, default=0.999,
-                    help="Atanh-cap so the inverse mapping into latent space stays finite.")
+parser.add_argument("--bezier_k", type=int, default=6,
+                    help="Total position Bezier ctrl_pts per drone (K). K-2 are free; degree = K-1.")
+
 parser.add_argument("--save_path", type=str, default="runs/online_bc_dmpc/model.pt")
-parser.add_argument("--save_every_rounds", type=int, default=20)
+parser.add_argument("--save_every_rounds", type=int, default=1)
 parser.add_argument("--resume", type=str, default=None)
 
 parser.add_argument("--wandb", action="store_true", default=False)
@@ -156,6 +145,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 import quadcopter  # noqa: F401, E402 - registers Isaac-MultiDrone-DMPC-Direct-v0
 from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
@@ -184,10 +174,50 @@ except Exception:
     _WANDB_AVAILABLE = False
 
 
-# Per-drone action dimension exposed by ``MultiDroneDmpcEnv``: a normalised
-# [delta_p_w, v_ref_w, a_ref_w] command in [-1, 1]^9. The env
-# unpacks it before the low-level wrench controller.
-PER_DRONE_ACTION_DIM = 9
+# Default total position Bezier ctrl_pts per drone.  K-2 are free (P_0/P_1 pinned).
+BEZIER_K = 6
+
+
+def eval_bezier(ctrl_pts: torch.Tensor, tau: float) -> torch.Tensor:
+    """Evaluate a degree-(K-1) Bezier curve at scalar tau ∈ (0, 1].
+
+    Args:
+        ctrl_pts: ``(..., K, 3)`` control points.
+        tau: parameter value in (0, 1].
+
+    Returns:
+        ``(..., 3)`` evaluated value.
+    """
+    import math as _math
+    K = ctrl_pts.shape[-2]
+    out = torch.zeros(*ctrl_pts.shape[:-2], 3, device=ctrl_pts.device, dtype=ctrl_pts.dtype)
+    for j in range(K):
+        c = _math.comb(K - 1, j) * (tau ** j) * ((1.0 - tau) ** (K - 1 - j))
+        out = out + c * ctrl_pts[..., j, :]
+    return out
+
+
+def eval_bezier_full(
+    ctrl_pts: torch.Tensor,  # (..., K, 3) position control points
+    tau: float,
+    h: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluate position Bezier and its first/second derivatives at tau ∈ (0, 1].
+
+    Args:
+        ctrl_pts: ``(..., K, 3)`` position ctrl_pts in goal-aligned delta frame.
+        tau:      Normalised time in (0, 1].
+        h:        Window duration in seconds (for physical units).
+
+    Returns:
+        pos ``(..., 3)``, vel ``(..., 3)`` [m/s], acc ``(..., 3)`` [m/s²].
+    """
+    K = ctrl_pts.shape[-2]
+    # velocity ctrl_pts from finite differences: (K-1, 3)
+    vel_ctrl = (K - 1) / h * (ctrl_pts[..., 1:, :] - ctrl_pts[..., :-1, :])
+    # acceleration ctrl_pts: (K-2, 3)
+    acc_ctrl = (K - 2) / h * (vel_ctrl[..., 1:, :] - vel_ctrl[..., :-1, :])
+    return eval_bezier(ctrl_pts, tau), eval_bezier(vel_ctrl, tau), eval_bezier(acc_ctrl, tau)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -196,33 +226,32 @@ PER_DRONE_ACTION_DIM = 9
 class SharedDronePolicy(nn.Module):
     """Per-drone flow-matching policy with a cross-attention neighbor encoder.
 
-    Architecture:
-        per_drone_obs (P) → [own_norm | neigh_norm] → NeighborEncoder
-                         → [own(OWN_DIM) ‖ neighbor_embed(emb_dim)]
-                         → ConditionMlp → ContinuousNormalizingFlow → action(A=3)
-
-    Own-state and neighbor observations are normalised with separate
-    EmpiricalNormalization instances (each of fixed dimension), so the policy
-    generalises across different values of N without retraining the normaliser.
-    The NeighborEncoder uses cross-attention (own as query, neighbors as
-    keys/values) to produce a fixed-size embedding regardless of N.
+    Predicts (K-2) free position control points in the goal-aligned delta frame.
+    P_0=(0,0,0) and P_1 are pinned at inference time from current pos/vel for C0/C1
+    continuity.  Evaluated via eval_bezier_full() to obtain (p_ref, v_ref, a_ref)
+    which are passed as a 9D world-frame action to the env cascade controller.
     """
 
     def __init__(
         self,
         per_drone_obs_dim: int,
-        per_drone_action_dim: int,
+        per_drone_action_dim: int,  # = (bezier_k - 2) * 3
         hidden_dims: list[int],
         emb_dim: int,
         sample_steps: int,
         device: torch.device,
+        v_max: float = 2.0,
+        ctrl_pts_max: float = 0.3,   # position ctrl_pts scale [m] (~delta_pos_max)
+        bezier_k: int = BEZIER_K,
         own_dim: int = PER_DRONE_OWN_DIM,
         neighbor_dim: int = PER_NEIGHBOUR_DIM,
         num_attn_heads: int = 4,
     ):
         super().__init__()
         self.P = per_drone_obs_dim
-        self.A = per_drone_action_dim
+        self.A = per_drone_action_dim  # (K-2)*3
+        self.bezier_k = bezier_k       # total K
+        self.bezier_k_free = bezier_k - 2  # free ctrl_pts count
         self.own_dim = own_dim
         self.neighbor_dim = neighbor_dim
         self.device = device
@@ -230,6 +259,10 @@ class SharedDronePolicy(nn.Module):
         # Separate normalizers so stats are independent of N.
         self.own_norm = EmpiricalNormalization(shape=own_dim, until=int(1e8))
         self.neigh_norm = EmpiricalNormalization(shape=neighbor_dim, until=int(1e8))
+        # Scale for normalising free position ctrl_pts to ~[-1, 1].
+        self.register_buffer("_ctrl_pts_max", torch.tensor(ctrl_pts_max, dtype=torch.float32))
+        # Kept for reference (used in 9D action construction externally).
+        self.register_buffer("_v_max", torch.tensor(v_max, dtype=torch.float32))
 
         # Cross-attention: own attends over variable-length neighbor set.
         self.neighbor_enc = NeighborEncoder(
@@ -266,6 +299,9 @@ class SharedDronePolicy(nn.Module):
         self.cnf_model = self.cnf.model
         self.cnf_ema = self.cnf.model_ema
         self.cnf_last = self.cnf.model_last
+        # Proximal copy for PPO-EWMA (same as curobo). Updated after each
+        # gradient step via update_proximal(); acts as trust-region anchor.
+        self.cnf.init_proximal(beta_prox=0.97)
 
     # ── obs encoding ───────────────────────────────────────────────────────
     def _encode_obs(self, obs_flat: torch.Tensor) -> torch.Tensor:
@@ -295,7 +331,7 @@ class SharedDronePolicy(nn.Module):
 
     # ── training-side helpers ──────────────────────────────────────────────
     def update_obs_norm(self, per_drone_obs_flat: torch.Tensor) -> None:
-        """Update running normalizer stats from a flat per-drone obs batch."""
+        """Update running obs normalizer stats from a flat per-drone obs batch."""
         own_raw = per_drone_obs_flat[:, : self.own_dim].detach()
         neigh_raw = per_drone_obs_flat[:, self.own_dim :].detach()
         self.own_norm.update(own_raw)
@@ -303,14 +339,24 @@ class SharedDronePolicy(nn.Module):
         if N_neigh > 0:
             self.neigh_norm.update(neigh_raw.reshape(-1, self.neighbor_dim))
 
+    def encode_action(self, ctrl_pts_flat: torch.Tensor) -> torch.Tensor:
+        """Free position ctrl_pts (B, K_free*3) → normalised latent (B, K_free*3)."""
+        return ctrl_pts_flat / self._ctrl_pts_max
+
+    def decode_action(self, latent_flat: torch.Tensor) -> torch.Tensor:
+        """Normalised latent → free position ctrl_pts in meters (B, K_free*3)."""
+        return latent_flat * self._ctrl_pts_max
+
     def flow_match_loss(
         self,
-        obs_flat: torch.Tensor,       # (B, P)
-        action_latent: torch.Tensor,  # (B, A) -- atanh'd target
+        obs_flat: torch.Tensor,       # (B, P) raw per-drone obs
+        ctrl_pts_flat: torch.Tensor,  # (B, K*3) Bezier control points [m/s]
     ) -> torch.Tensor:
-        """Rectified-flow velocity-MSE on a flat per-drone batch."""
+        """Rectified-flow velocity-MSE loss on Bezier control points."""
+        self.cnf.model["condition"].train()
+        self.cnf.model["flow"].train()
         cond_in = self._encode_obs(obs_flat)
-        x1 = action_latent
+        x1 = self.encode_action(ctrl_pts_flat)  # normalize to ~[-1, 1]
         x0 = torch.randn_like(x1)
         t = torch.rand(x1.shape[0], device=x1.device)
         xt = (1.0 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
@@ -322,26 +368,24 @@ class SharedDronePolicy(nn.Module):
     # ── inference ─────────────────────────────────────────────────────────
     @torch.no_grad()
     def sample_action(self, per_drone_obs: torch.Tensor) -> torch.Tensor:
-        """Integrate the rectified-flow ODE to draw a per-drone action.
-
-        Args:
-            per_drone_obs: ``(E, N, P)``.
-
-        Returns:
-            ``(E, N, A)`` tanh-squashed action in ``[-1, 1]``.
-        """
+        """ODE integration → free position ctrl_pts (E, N, K_free*3) in meters."""
         E, N, P = per_drone_obs.shape
         flat = per_drone_obs.reshape(E * N, P)
+        self.cnf.eval()
         cond_in = self._encode_obs(flat)
         x0 = torch.randn(cond_in.shape[0], self.A, device=cond_in.device)
         latent, _ = self.cnf.sample(x0=x0, condition=cond_in, n_samples=cond_in.shape[0])
-        return torch.tanh(latent).reshape(E, N, self.A)
+        free_ctrl = self.decode_action(latent)  # (E*N, K_free*3)
+        self.cnf.train()
+        return free_ctrl.reshape(E, N, self.A)
 
     # ── PolicyFlow bookkeeping ─────────────────────────────────────────────
     def step_after_optim(self) -> None:
-        self.cnf.ema_update()
+        """Update proximal model after each gradient step (curobo pattern)."""
+        self.cnf.update_proximal()
 
     def refresh_behaviour(self) -> None:
+        """Sync model_last ← model (needed when compute_flow_variation is used)."""
         self.cnf.update()
 
 
@@ -376,6 +420,98 @@ class PerDroneBuffer:
     def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         idx = torch.randint(0, self.size, (batch_size,), device=self.device)
         return self.obs[idx], self.act_latent[idx]
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Per-env episode buffer (filter truncated episodes before main buffer)    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+class PerEnvEpisodeBuffer:
+    """Accumulates per-env (obs, act_latent) transitions and flushes them to
+    the main ``PerDroneBuffer`` only when an episode ends with
+    ``terminated=True`` (success or crash).  Truncated episodes (timeout) are
+    silently discarded, keeping the training buffer free of time-cut data.
+
+    Memory: ``num_envs × max_ep_len × N × (P+A) × 4 bytes``.  For typical
+    settings (E=32, T=200, N=4, P=48, A=9) this is about 6 MB.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        max_ep_len: int,
+        N: int,
+        P: int,
+        A: int,
+        device: torch.device,
+    ):
+        self._E = num_envs
+        self._T = max_ep_len
+        self._device = device
+        # Pre-allocate; extra steps beyond max_ep_len are silently dropped.
+        self._obs = torch.zeros(num_envs, max_ep_len, N, P, device=device)
+        self._act = torch.zeros(num_envs, max_ep_len, N, A, device=device)
+        self._len = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    def push(self, obs: torch.Tensor, act_latent: torch.Tensor) -> None:
+        """Append one step for every env.
+
+        Args:
+            obs:        ``(E, N, P)`` raw per-drone observations.
+            act_latent: ``(E, N, A)`` atanh-mapped expert actions.
+        """
+        E = self._E
+        idx = self._len.clamp(max=self._T - 1)   # (E,)
+        env_idx = torch.arange(E, device=self._device)
+        self._obs[env_idx, idx] = obs
+        self._act[env_idx, idx] = act_latent
+        self._len = (self._len + 1).clamp(max=self._T)
+
+    def flush(
+        self,
+        main_buffer: PerDroneBuffer,
+        env_ids: torch.Tensor,
+        terminated: torch.Tensor,
+        drone_success: torch.Tensor | None = None,
+    ) -> int:
+        """Flush done envs.
+
+        Args:
+            main_buffer:   Destination ring buffer.
+            env_ids:       1-D tensor of env indices that are done.
+            terminated:    Bool tensor of same length — used when ``drone_success``
+                           is None; only terminated envs are flushed.
+            drone_success: Optional ``(len(env_ids), N)`` bool tensor.  When
+                           provided, ``terminated`` is ignored and each drone is
+                           flushed independently based on its individual success.
+                           Drones where the mask is False are silently skipped.
+
+        Returns:
+            Number of per-drone transitions flushed.
+        """
+        flushed = 0
+        for i, e in enumerate(env_ids.tolist()):
+            t = int(self._len[e].item())
+            if t == 0:
+                self._len[e] = 0
+                continue
+            if drone_success is not None:
+                dmask = drone_success[i]          # (N,) bool
+                good = dmask.nonzero(as_tuple=False).flatten()
+                if good.numel() > 0:
+                    main_buffer.add(
+                        self._obs[e, :t][:, good],    # (T, k, P)
+                        self._act[e, :t][:, good],    # (T, k, A)
+                    )
+                    flushed += t * good.numel()
+            elif terminated[i]:
+                main_buffer.add(self._obs[e, :t], self._act[e, :t])
+                flushed += t * self._obs.shape[2]  # t * N
+            self._len[e] = 0
+        return flushed
+
+    def clear(self, env_ids: torch.Tensor) -> None:
+        """Discard episodes for the given envs without flushing (e.g. external reset)."""
+        self._len[env_ids] = 0
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -538,32 +674,25 @@ def expert_action(
     expert: DMPCExpert,
     debug_logger: "DmpcExpertLogger | None" = None,
     debug_step: int = 0,
-) -> torch.Tensor:
-    """Run DMPC for every drone in every env and map its plan to the env action.
+) -> tuple[torch.Tensor, dict]:
+    """Run DMPC and return (action_9d, states).
 
-    DMPC returns the paper's ``u_i`` position-reference sample. We pack
-    that sample, its first derivative, and its second derivative into the
-    env's 9-D normalised ``[delta_p, v_ref, a_ref]`` action.
-
-    Returns ``(num_envs, num_drones * 9)``.
+    action_9d: ``(num_envs, N*9)`` absolute world-frame (ref_pos, ref_vel, ref_acc)
+               concatenated and passed directly to the cascade via the N×9 env mode.
+    states:    World-frame state dict used for Bezier ctrl_pts fitting.
     """
     states = env.get_world_states()
-    pos_w = states["pos_w"]
-    vel_w = states["lin_vel_w"]
-    goal_w = states["goal_w"]
-    origins = env._terrain.env_origins
-
     ref_pos_w, ref_vel_w = expert.plan(
-        pos_w=pos_w, vel_w=vel_w, goal_w=goal_w, env_origins=origins,
+        pos_w=states["pos_w"], vel_w=states["lin_vel_w"],
+        goal_w=states["goal_w"], env_origins=env._terrain.env_origins,
     )
-    ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
     _push_first_env_debug_trajectories(env, expert, states)
-    
-    action = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)   # i) Full trajectory command
-    # action = env.velocity_to_action(ref_vel_w)                      # ii) Recon from velocity command
+    ref_acc_w = expert_reference_acceleration(env, expert, ref_pos_w)
+    E, N = ref_pos_w.shape[:2]
+    action_flat = torch.cat([ref_pos_w, ref_vel_w, ref_acc_w], dim=-1).reshape(E, N * 9)
     if debug_logger is not None:
-        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action)
-    return action
+        debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action_flat)
+    return action_flat, states
 
 
 class DmpcExpertLogger:
@@ -591,11 +720,13 @@ class DmpcExpertLogger:
         pos_w = states["pos_w"][env_idx].detach().cpu().numpy().astype(np.float64)
         vel_w = states["lin_vel_w"][env_idx].detach().cpu().numpy().astype(np.float64)
         goal_w = states["goal_w"][env_idx].detach().cpu().numpy().astype(np.float64)
-        action_norm = action_flat.view(self.env.num_envs, N, PER_DRONE_ACTION_DIM)[env_idx]
+        # action_flat may be N*9 (ref_pos,ref_vel,ref_acc) or legacy N*3 (v_ref).
+        if action_flat.numel() == self.env.num_envs * N * 9:
+            action_norm = action_flat.view(self.env.num_envs, N, 9)[env_idx, :, 3:6]  # ref_vel
+        else:
+            action_norm = action_flat.view(self.env.num_envs, N, 3)[env_idx]
         action_norm_np = action_norm.detach().cpu().numpy().astype(np.float64)
-        desired_pos_w = pos_w + action_norm_np[:, 0:3] * float(self.env.cfg.delta_pos_max)
-        desired_vel_w = action_norm_np[:, 3:6] * float(self.env.cfg.v_max)
-        desired_acc_w = action_norm_np[:, 6:9] * float(self.env.cfg.accel_action_max)
+        thrust_cmd = np.zeros(N, dtype=np.float32)  # not used in v_ref mode
 
         planned_ref_pos_w = np.full((N, K, 3), np.nan, dtype=np.float64)
         planned_ref_vel_w = np.full((N, K, 3), np.nan, dtype=np.float64)
@@ -659,9 +790,7 @@ class DmpcExpertLogger:
                 "ref_vel_w": ref_vel_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "ref_acc_w": ref_acc_w[env_idx].detach().cpu().numpy().astype(np.float32),
                 "action_normalized": action_norm_np.astype(np.float32),
-                "desired_pos_cmd_w": desired_pos_w.astype(np.float32),
-                "desired_vel_cmd_w": desired_vel_w.astype(np.float32),
-                "desired_acc_cmd_w": desired_acc_w.astype(np.float32),
+                "thrust_cmd": thrust_cmd,
                 "planned_ref_pos_w": planned_ref_pos_w.astype(np.float32),
                 "planned_ref_vel_w": planned_ref_vel_w.astype(np.float32),
                 "planned_ref_acc_w": planned_ref_acc_w.astype(np.float32),
@@ -960,12 +1089,36 @@ def main():
     E = env_raw.num_envs
     N = env_raw.cfg.num_drones
     P = per_drone_obs_dim(N)
-    A = PER_DRONE_ACTION_DIM
+    bezier_k = args_cli.bezier_k          # total K (default 6)
+    A_pol = (bezier_k - 2) * 3            # (K-2)*3 — free ctrl_pts per drone
+    v_max = float(env_raw.cfg.v_max)
+    ctrl_pts_max = float(env_raw.cfg.delta_pos_max)
+    accel_action_max = float(env_raw.cfg.accel_action_max)
+    n_substeps = max(1, round(0.1 / (env_raw.cfg.sim.dt * env_raw.cfg.decimation)))
+    h_window = 0.1  # Bezier window duration [s]
     print(
         f"[online_bc_dmpc] num_envs={env_raw.num_envs}  num_drones={N}  "
-        f"per_drone_obs={P}  per_drone_action={A}  "
-        f"obs_total={env_raw.cfg.observation_space}  action_total={env_raw.cfg.action_space}"
+        f"per_drone_obs={P}  bezier_k={bezier_k}  pol_action={A_pol}  "
+        f"n_substeps={n_substeps}  ctrl_pts_max={ctrl_pts_max}  v_max={v_max}"
     )
+
+    policy = SharedDronePolicy(
+        per_drone_obs_dim=P,
+        per_drone_action_dim=A_pol,
+        hidden_dims=args_cli.hidden_dims,
+        emb_dim=args_cli.emb_dim,
+        sample_steps=args_cli.sample_steps,
+        device=device,
+        v_max=v_max,
+        ctrl_pts_max=ctrl_pts_max,
+        bezier_k=bezier_k,
+    ).to(device)
+    if args_cli.resume is not None and os.path.isfile(args_cli.resume):
+        policy.load_state_dict(torch.load(args_cli.resume, map_location=device))
+        print(f"[online_bc_dmpc] loaded checkpoint from {args_cli.resume}")
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args_cli.lr)
+
+    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A_pol, device)
 
     # The DMPC expert distinguishes the MPC replanning period ``h`` (default
     # 0.1 s, as in the paper) from the control / subsample rate ``ts``. We
@@ -1042,6 +1195,44 @@ def main():
     last_episode_length_buf = env_raw.episode_length_buf.clone()
     per_drone_obs = env_raw.get_per_drone_obs()  # (E, N, P)
 
+    max_ep_len = int(env_raw.max_episode_length) + 10
+    ep_buf = PerEnvEpisodeBuffer(env_raw.num_envs, max_ep_len, N, P, A_pol, device)
+
+    # Optional trajectory recorder + replay pool.
+    traj_save_dir = args_cli.traj_save_dir
+    traj_recorder: SuccessTrajectoryRecorder | None = None
+    replay_pool: ReplayPool | None = None
+    if traj_save_dir is not None:
+        traj_recorder = SuccessTrajectoryRecorder(
+            traj_save_dir, env_raw.num_envs, max_ep_len, N, P, A_pol, device
+        )
+        replay_pool = ReplayPool(
+            num_envs=env_raw.num_envs,
+            traj_dir=traj_save_dir,
+            device=device,
+        )
+        print(
+            f"[online_bc_dmpc] traj_save_dir={traj_save_dir}  "
+            f"replay_pool: {replay_pool.n_replay}/{env_raw.num_envs} envs "
+            f"(activates after {replay_pool._min_trajs} saved trajectories)"
+        )
+
+    # Pre-populate BC buffer from saved trajectories before training begins.
+    if args_cli.traj_load_dir is not None:
+        load_trajs_to_buffer(args_cli.traj_load_dir, buffer, device, args_cli.traj_max_load)
+    if args_cli.traj_replay_dir is not None:
+        replay_trajs_in_env(
+            args_cli.traj_replay_dir, env_raw, buffer,
+            args_cli.traj_max_load,
+        )
+        # Re-sync env state after replay.
+        env.reset()
+        expert.reset()
+        if hasattr(env_raw, "_last_reset_env_ids"):
+            env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+        last_episode_length_buf = env_raw.episode_length_buf.clone()
+        per_drone_obs = env_raw.get_per_drone_obs()
+
     recent_returns: deque[float] = deque(maxlen=20)
     episode_returns = torch.zeros(env_raw.num_envs, device=device)
     collect_success_count = 0
@@ -1054,13 +1245,33 @@ def main():
     save_dir = os.path.dirname(args_cli.save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
+    _stem = os.path.splitext(args_cli.save_path)
+    best_model_path = _stem[0] + "_best" + _stem[1]
+    best_eval_success = -1.0
 
     try:
         while round_idx < n_rounds:
             # ── 1. Collection ────────────────────────────────────────────
             t_collect = time.time()
 
+            # Activate replay pool once enough trajectories have been saved.
+            if replay_pool is not None:
+                replay_pool.refresh()
+                if replay_pool._just_activated:
+                    replay_pool._just_activated = False
+                    for _rid in sorted(replay_pool.replay_ids):
+                        replay_pool.load_next(_rid, env_raw, n_substeps=n_substeps,
+                                              h=h_window)
+                        env_raw._reset_idx(torch.tensor([_rid], device=device))
+                        expert.reset(torch.tensor([_rid], device=device))
+                        ep_buf.clear(torch.tensor([_rid], device=device))
+                        if traj_recorder is not None:
+                            traj_recorder.clear(torch.tensor([_rid], device=device))
+                    per_drone_obs = env_raw.get_per_drone_obs()
+
             collect_returns: list[float] = []
+            # Initialise free ctrl_pts to zeros; filled on first expert_action() call.
+            curr_ctrl_pts = torch.zeros(env_raw.num_envs, N, A_pol, device=device)
             for _collect_step in range(args_cli.steps_per_batch):
                 print(
                     f"  [collect {_collect_step + 1:>4d}/{args_cli.steps_per_batch}]",
@@ -1068,9 +1279,6 @@ def main():
                 )
                 with torch.no_grad():
                     # Keep the DMPC expert in lockstep with IsaacLab resets.
-                    # Normally the done branch below handles this, but this
-                    # also catches full/manual resets or env counters rewound
-                    # before this expert query.
                     rewound = env_raw.episode_length_buf < last_episode_length_buf
                     if rewound.any():
                         expert.reset(obstacle_info=env_raw.get_obstacle_info(),
@@ -1082,21 +1290,44 @@ def main():
                         and args_cli.dmpc_log_every > 0
                         and expert_collect_step % args_cli.dmpc_log_every == 0
                     )
-                    action_flat = expert_action(
+                    # expert_action returns 9D (ref_pos, ref_vel, ref_acc) world frame
+                    # + the state snapshot used for ctrl_pts fitting.
+                    action_flat, states_at_plan = expert_action(
                         env_raw, expert,
                         debug_logger=dmpc_logger if log_this_step else None,
                         debug_step=expert_collect_step,
-                    )  # (E, N*A)
+                    )  # (E, N*9), dict
 
-                action_per_drone = action_flat.view(env_raw.num_envs, N, A)
-                act_latent = action_to_latent(action_per_drone, args_cli.action_clip)
+                    # Fit free position ctrl_pts to DMPC plan (BC supervision target).
+                    _free = expert.get_pos_ctrl_pts(
+                        range(env_raw.num_envs),
+                        states_at_plan["pos_w"],
+                        states_at_plan["lin_vel_w"],
+                        states_at_plan["goal_w"],
+                        env_raw._terrain.env_origins,
+                        K=bezier_k,
+                        h=h_window,
+                    )  # (E, N, K-2, 3)
+                    curr_ctrl_pts = _free.reshape(env_raw.num_envs, N, A_pol)
 
-                # Update obs stats from the live rollout distribution and add to
-                # the per-drone buffer (E*N samples per env step).
-                policy.update_obs_norm(per_drone_obs.reshape(-1, P).detach())
-                buffer.add(per_drone_obs.detach(), act_latent.detach())
+                    # Override replay envs with stored 9D references.
+                    if replay_pool is not None and replay_pool.active:
+                        for _rid in sorted(replay_pool.replay_ids):
+                            _ra = replay_pool.step(_rid, env_raw=env_raw)  # (N, 9) or None
+                            if _ra is not None:
+                                action_flat[_rid] = _ra.reshape(N * 9)
+
+                obs_before = per_drone_obs  # obs at time t
+
+                # Update obs normaliser stats before stepping.
+                policy.update_obs_norm(obs_before.reshape(-1, P).detach())
 
                 _, reward, terminated, truncated, _ = env.step(action_flat)
+
+                # Store ctrl_pts (not v_ref) as the BC supervision target.
+                ep_buf.push(obs_before.detach(), curr_ctrl_pts.detach())
+                if traj_recorder is not None:
+                    traj_recorder.push(obs_before.detach(), curr_ctrl_pts.detach(), env_raw)
                 per_drone_obs = env_raw.get_per_drone_obs()
                 episode_returns += reward
                 done = terminated | truncated
@@ -1105,13 +1336,54 @@ def main():
                     expert.reset(obstacle_info=env_raw.get_obstacle_info(),
                                  env_ids=reset_env_ids)
                     env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+                    done_set = set(done.nonzero(as_tuple=False).flatten().tolist()) if done.any() else set()
+                    unexpected = torch.tensor(
+                        [e for e in reset_env_ids.tolist() if e not in done_set],
+                        dtype=torch.long, device=device,
+                    )
+                    if unexpected.numel() > 0:
+                        expert.reset(unexpected)
+                        ep_buf.clear(unexpected)
+                        if traj_recorder is not None:
+                            traj_recorder.clear(unexpected)
                 if done.any():
+                    done_ids = done.nonzero(as_tuple=False).flatten()
                     expert.reset(obstacle_info=env_raw.get_obstacle_info(),
                                  env_ids=done.nonzero(as_tuple=False).flatten())
+                    # Per-drone flush: use individual drone success signal so that
+                    # even partial successes (not all drones) contribute training data.
+                    drone_succ = env_raw._drone_just_succeeded[done_ids]  # (M, N)
+                    ep_buf.flush(buffer, done_ids, terminated[done_ids],
+                                 drone_success=drone_succ)
+                    # Save successful episodes (skip replay envs — would create duplicates).
+                    if traj_recorder is not None:
+                        _not_replay = torch.tensor(
+                            [not (replay_pool is not None
+                                  and replay_pool.is_replay_env(int(e)))
+                             for e in done_ids.tolist()],
+                            dtype=torch.bool, device=device,
+                        )
+                        traj_recorder.save_successes(
+                            done_ids,
+                            env_raw._just_succeeded[done_ids] & _not_replay,
+                        )
+                        traj_recorder.clear(done_ids)
+                    # For replay envs: double-reset to next pinned trajectory.
+                    _replay_reset_any = False
+                    for _eid in done_ids.tolist():
+                        if replay_pool is not None and replay_pool.is_replay_env(_eid):
+                            replay_pool.on_episode_done(
+                                _eid, env_raw, n_substeps=n_substeps, h=h_window,
+                            )
+                            expert.reset(torch.tensor([_eid], device=device))
+                            ep_buf.clear(torch.tensor([_eid], device=device))
+                            if traj_recorder is not None:
+                                traj_recorder.clear(torch.tensor([_eid], device=device))
+                            _replay_reset_any = True
+                    if _replay_reset_any:
+                        # Refresh obs so replay envs' initial-state obs are correct.
+                        per_drone_obs = env_raw.get_per_drone_obs()
                 if done.any():
-                    # _just_succeeded is set by _get_dones inside env.step() and
-                    # cleared at the start of the NEXT _get_dones call, so it is
-                    # safe to read here: True iff the env hit the success criterion.
                     collect_success_count += int(env_raw._just_succeeded[done].sum().item())
                     collect_episode_count += int(done.sum().item())
                     finished = episode_returns[done].detach().cpu().tolist()
@@ -1122,6 +1394,19 @@ def main():
                 expert_collect_step += 1
             print()  # end \r overwrite
             collect_dt = time.time() - t_collect
+
+            # Flush in-progress episodes (spanning multiple batches) without
+            # per-drone filtering — this keeps data flowing early in training
+            # when few drones have succeeded yet.  Per-drone filtering applies
+            # only to completed episodes (done handling above).
+            in_progress = (ep_buf._len > 0).nonzero(as_tuple=False).flatten()
+            if in_progress.numel() > 0:
+                ep_buf.flush(
+                    buffer,
+                    in_progress,
+                    torch.ones(in_progress.numel(), dtype=torch.bool, device=device),
+                )
+
             if collect_returns:
                 recent_returns.extend(collect_returns)
 
@@ -1131,26 +1416,36 @@ def main():
                 losses = []
                 for epoch_i in range(args_cli.bc_epochs_per_round):
                     b_obs, b_lat = buffer.sample(args_cli.batch_size)
-                    loss = policy.flow_match_loss(b_obs, b_lat)
+                    loss = policy.flow_match_loss(b_obs, b_lat)  # sets train mode internally
                     optimizer.zero_grad()
                     loss.backward()
                     if args_cli.grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(policy.parameters(), args_cli.grad_clip)
                     optimizer.step()
-                    policy.step_after_optim()
+                    policy.step_after_optim()  # update_proximal (curobo pattern)
                     losses.append(loss.item())
                     print(
                         f"  [BC epoch {epoch_i + 1}/{args_cli.bc_epochs_per_round}] "
                         f"loss={loss.item():.5f}",
                         flush=True,
                     )
+                # Sync model_last for future compute_flow_variation / PPO-EWMA use.
                 policy.refresh_behaviour()
                 bc_loss = float(np.mean(losses))
 
             # ── 3. Eval ─────────────────────────────────────────────────
             eval_metrics: dict[str, float] = {}
             if args_cli.eval_every_rounds > 0 and round_idx % args_cli.eval_every_rounds == 0:
-                eval_metrics = evaluate(env_raw, policy, args_cli.eval_steps, N, A)
+                _eval_video_path = None
+                if args_cli.video:
+                    _eval_video_path = os.path.join(
+                        args_cli.video_root, f"dmpc_eval_r{round_idx:04d}.mp4"
+                    )
+                eval_metrics = evaluate(
+                    env_raw, policy, args_cli.eval_steps, N,
+                    n_substeps=n_substeps, h_window=h_window,
+                    video_path=_eval_video_path,
+                )
                 env.reset()
                 expert.reset(obstacle_info=env_raw.get_obstacle_info())
                 if hasattr(env_raw, "_last_reset_env_ids"):
@@ -1195,6 +1490,13 @@ def main():
             if args_cli.save_every_rounds > 0 and round_idx % args_cli.save_every_rounds == 0:
                 torch.save(policy.state_dict(), args_cli.save_path)
 
+            if eval_metrics:
+                eval_succ = eval_metrics.get("eval_success_rate", 0.0)
+                if eval_succ > best_eval_success:
+                    best_eval_success = eval_succ
+                    torch.save(policy.state_dict(), best_model_path)
+                    print(f"  [best] eval_success_rate={eval_succ:.3f} → saved {best_model_path}", flush=True)
+
             round_idx += 1
     finally:
         torch.save(policy.state_dict(), args_cli.save_path)
@@ -1211,32 +1513,100 @@ def evaluate(
     policy: SharedDronePolicy,
     n_steps: int,
     N: int,
-    A: int,
+    n_substeps: int = 2,
+    h_window: float = 0.1,
+    video_path: str | None = None,
 ) -> dict[str, float]:
-    """Deterministic student rollout. Returns mean per-episode return and the
-    fraction of envs whose drones all ended within 0.3 m of their goals."""
-    device = env.device
-    env.reset()
-    per_drone_obs = env.get_per_drone_obs()
-    returns = torch.zeros(env.num_envs, device=device)
-    finished_returns: list[float] = []
-    print("Evaluation")
-    for _ in range(n_steps):
-        action_pd = policy.sample_action(per_drone_obs)             # (E, N, A)
-        action_flat = action_pd.reshape(env.num_envs, N * A)        # (E, N*A)
-        _, reward, terminated, truncated, _ = env.step(action_flat)
-        per_drone_obs = env.get_per_drone_obs()
-        returns += reward
-        done = terminated | truncated
-        if done.any():
-            finished_returns.extend(returns[done].detach().cpu().tolist())
-            returns[done] = 0.0
+    """Deterministic student rollout using position Bezier with p/v/a cascade.
 
-    pos_w = torch.stack([r.data.root_pos_w for r in env._robots], dim=1)
-    final_dist = torch.linalg.norm(pos_w - env._goal_pos_w, dim=-1)
-    success = (final_dist.max(dim=-1).values < 0.3).float().mean().item()
+    At each Bezier window start (every n_substeps steps) the policy predicts
+    K-2 free position ctrl_pts; P_0/P_1 are pinned from current state for C0/C1
+    continuity.  At each sub-step the full Bezier is evaluated → absolute world-frame
+    (ref_pos, ref_vel, ref_acc) sent as a 9D action to the cascade controller.
+
+    Returns mean per-episode return and episode success rate.
+    """
+    device = env.device
+    E = env.num_envs
+    K = policy.bezier_k        # total ctrl_pts
+    K_free = policy.bezier_k_free  # K-2 free ctrl_pts
+    policy.cnf.eval()
+    frames: list = []
+    # Per-window state (reset at window start and on episode end).
+    window_refs: list[torch.Tensor] | None = None  # list of n_substeps (E, N, 9) tensors
+    sub_step = 0
+    try:
+        env.reset()
+        per_drone_obs = env.get_per_drone_obs()
+        returns = torch.zeros(E, device=device)
+        finished_returns: list[float] = []
+        success_count = 0
+        episode_count = 0
+        for _ in range(n_steps):
+            if sub_step == 0 or window_refs is None:
+                # Predict free ctrl_pts at window start and build world-frame refs.
+                drone_st = env._stack_drone_state()
+                pos_w0 = drone_st["pos_w"]       # (E, N, 3) window-start positions
+                vel_w0 = drone_st["lin_vel_w"]   # (E, N, 3)
+                R   = env._compute_goal_aligned_R(pos_w0, env._goal_pos_w)  # (E, N, 3, 3)
+                R_T = R.transpose(-1, -2)
+
+                # P_0 = origin (0), P_1 from current velocity (C1 continuity).
+                P_1 = torch.bmm(
+                    R.reshape(E * N, 3, 3), vel_w0.reshape(E * N, 3, 1)
+                ).reshape(E, N, 3) * (h_window / (K - 1))
+                P_0 = torch.zeros_like(P_1)
+
+                # Policy → free ctrl_pts (already in metres, decoded internally).
+                P_free = policy.sample_action(per_drone_obs).reshape(E, N, K_free, 3)
+                full_ctrl = torch.cat(
+                    [P_0.unsqueeze(-2), P_1.unsqueeze(-2), P_free], dim=-2
+                )  # (E, N, K, 3) goal-aligned delta frame
+
+                window_refs = []
+                for j in range(n_substeps):
+                    tau_j = (j + 1) / n_substeps
+                    dp_g, v_g, a_g = eval_bezier_full(full_ctrl, tau_j, h_window)
+                    # dp_g, v_g, a_g: (E, N, 3) in goal-aligned delta frame
+                    R_T_flat = R_T.reshape(E * N, 3, 3)
+                    dp_w = torch.bmm(R_T_flat, dp_g.reshape(E * N, 3, 1)).reshape(E, N, 3)
+                    v_w  = torch.bmm(R_T_flat, v_g.reshape(E * N, 3, 1)).reshape(E, N, 3)
+                    a_w  = torch.bmm(R_T_flat, a_g.reshape(E * N, 3, 1)).reshape(E, N, 3)
+                    ref_pos_abs = pos_w0 + dp_w  # absolute world frame
+                    window_refs.append(
+                        torch.cat([ref_pos_abs, v_w, a_w], dim=-1)  # (E, N, 9)
+                    )
+
+            ref_9d = window_refs[sub_step]  # (E, N, 9)
+            action_flat = ref_9d.reshape(E, N * 9)
+            _, reward, terminated, truncated, _ = env.step(action_flat)
+            if video_path is not None:
+                frame = env.render()
+                if frame is not None:
+                    frames.append(frame)
+            per_drone_obs = env.get_per_drone_obs()
+            returns += reward
+            done = terminated | truncated
+            if done.any():
+                success_count += int(env._just_succeeded[done].sum().item())
+                episode_count += int(done.sum().item())
+                finished_returns.extend(returns[done].detach().cpu().tolist())
+                returns[done] = 0.0
+                sub_step = 0
+                window_refs = None
+                continue
+            sub_step = (sub_step + 1) % n_substeps
+    finally:
+        policy.cnf.train()
+
+    if video_path and frames:
+        os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+        fps = max(1, round(1.0 / env.step_dt)) if hasattr(env, "step_dt") else 30
+        imageio.mimsave(video_path, frames, fps=fps)
+
+    success_rate = success_count / max(episode_count, 1)
     mean_ret = float(np.mean(finished_returns)) if finished_returns else float("nan")
-    return {"eval_return": mean_ret, "eval_success_rate": success}
+    return {"eval_return": mean_ret, "eval_success_rate": success_rate}
 
 
 if __name__ == "__main__":
