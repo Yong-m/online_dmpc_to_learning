@@ -52,8 +52,6 @@ parser.add_argument("--data_dir", type=str, required=True,
                     help="Directory containing per-agent .npz files from collect_dmpc_data.py.")
 parser.add_argument("--max_files", type=int, default=None,
                     help="Cap on number of .npz files to load (None = all).")
-parser.add_argument("--val_fraction", type=float, default=0.05,
-                    help="Fraction of files held out as validation set.")
 
 # Env (for eval)
 parser.add_argument("--num_envs", type=int, default=32)
@@ -487,26 +485,18 @@ def main() -> None:
         all_files = all_files[:args_cli.max_files]
     assert all_files, f"No .npz files found in {args_cli.data_dir}"
 
-    np.random.shuffle(all_files := list(all_files))
-    n_val    = max(1, int(len(all_files) * args_cli.val_fraction))
-    val_files   = all_files[:n_val]
-    train_files = all_files[n_val:]
-    print(f"[Data] train={len(train_files)}  val={len(val_files)} files")
+    all_files = list(all_files)
+    np.random.shuffle(all_files)
+    print(f"[Data] {len(all_files)} files total")
 
-    train_ds = DMPCOfflineDataset(train_files)
-    val_ds   = DMPCOfflineDataset(val_files)
-
+    train_ds = DMPCOfflineDataset(all_files)
     train_loader = DataLoader(
         train_ds, batch_size=args_cli.batch_size,
         shuffle=True, drop_last=True, num_workers=4, pin_memory=True,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=args_cli.batch_size,
-        shuffle=False, drop_last=False, num_workers=2, pin_memory=True,
-    )
 
     # Infer dims from first file
-    sample_file = np.load(train_files[0])
+    sample_file = np.load(all_files[0])
     obs_dim   = int(sample_file["obs"].shape[1])
     bezier_k  = int(sample_file["bezier_k"])
     n_substeps = int(sample_file["n_substeps"])
@@ -613,25 +603,6 @@ def main() -> None:
 
         scheduler.step()
         avg = {k: float(np.mean(v)) for k, v in epoch_metrics.items()}
-
-        # ── validation loss ─────────────────────────────────────────────
-        val_losses: list[float] = []
-        policy.eval()
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="  Val", unit="batch",
-                              leave=False, dynamic_ncols=True):
-                obs      = batch["obs"].to(device)
-                ctrl_pts = batch["ctrl_pts"].to(device)
-                ref_vel  = batch["ref_vel"].to(device)
-                ref_acc  = batch["ref_acc"].to(device)
-                _, vm = policy.compute_loss(
-                    obs, ctrl_pts, ref_vel, ref_acc,
-                    lambda_vel=args_cli.lambda_vel,
-                    lambda_acc=args_cli.lambda_acc,
-                )
-                val_losses.append(vm["loss/total"])
-        policy.train()
-        avg["val/loss"] = float(np.mean(val_losses))
         avg["lr"] = float(scheduler.get_last_lr()[0])
 
         # ── eval every N epochs ──────────────────────────────────────────
@@ -658,7 +629,6 @@ def main() -> None:
         # ── update epoch bar postfix ─────────────────────────────────────
         pf: dict = dict(
             loss=f"{avg['loss/total']:.4f}",
-            val=f"{avg['val/loss']:.4f}",
             lr=f"{avg['lr']:.2e}",
         )
         if eval_metrics:
@@ -671,7 +641,6 @@ def main() -> None:
                         "epoch/loss_flow":   avg["loss/flow"],
                         "epoch/loss_vel":    avg["loss/vel_aux"],
                         "epoch/loss_acc":    avg["loss/acc_aux"],
-                        "epoch/val_loss":    avg["val/loss"],
                         "epoch/lr":          avg["lr"],
                         **{f"epoch/{k}": v for k, v in eval_metrics.items()}},
                        step=global_step)
