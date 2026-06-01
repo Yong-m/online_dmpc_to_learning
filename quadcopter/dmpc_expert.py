@@ -1277,10 +1277,15 @@ class DMPCExpert:
         for e in env_list:
             origin_e = orig_np[e]
             for i in range(self.N):
-                st = self._state.get((e, i))
-                if st is None:
-                    continue
-                U = st["U"]
+                if self._gpu_solver is not None:
+                    if not self._st_has[e, i]:
+                        continue
+                    U = self._st_U[e, i]
+                else:
+                    st = self._state.get((e, i))
+                    if st is None:
+                        continue
+                    U = st["U"]
 
                 # Sample DMPC position Bezier at n_fit time points.
                 pos_dmpc = (
