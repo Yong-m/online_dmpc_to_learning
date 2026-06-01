@@ -609,6 +609,108 @@ class DMPCExpert:
 
         return torch.from_numpy(ctrl_pts).to(self.device)
 
+    def get_pos_ctrl_pts(
+        self,
+        env_list: "Iterable[int]",
+        pos_w: "torch.Tensor",       # (E, N, 3) world frame
+        vel_w: "torch.Tensor",       # (E, N, 3) world frame
+        goal_w: "torch.Tensor",      # (E, N, 3) world frame
+        env_origins: "torch.Tensor", # (E, 3)
+        K: int = 6,
+        h: float = 0.1,
+        n_fit: int = 20,
+    ) -> "torch.Tensor":
+        """Fit K-point position Bezier free ctrl_pts to DMPC plan (goal-aligned delta frame).
+
+        The first two ctrl_pts are pinned for C0/C1 continuity:
+          P_0 = (0,0,0)  — current position = origin in delta frame
+          P_1 = R @ vel_current * h / (K-1)  — C1 velocity continuity
+
+        The remaining K-2 free ctrl_pts are returned.
+
+        Args:
+            env_list:    Env indices to process.
+            pos_w:       Current drone positions ``(E, N, 3)`` world frame.
+            vel_w:       Current drone velocities ``(E, N, 3)`` world frame.
+            goal_w:      Goal positions ``(E, N, 3)`` world frame.
+            env_origins: Per-env origin offsets ``(E, 3)``.
+            K:           Total number of position ctrl_pts (default 6).
+            h:           Bezier window duration in seconds (default 0.1).
+            n_fit:       Sample count for the least-squares fit (default 20).
+
+        Returns:
+            Float32 tensor ``(E_max, N, K-2, 3)`` on ``self.device``.
+        """
+        env_list = list(env_list)
+        E_max = max(env_list) + 1
+        K_free = K - 2
+        free_ctrl = np.zeros((E_max, self.N, K_free, 3), dtype=np.float32)
+
+        pos_np   = pos_w.detach().cpu().numpy().astype(np.float64)
+        vel_np   = vel_w.detach().cpu().numpy().astype(np.float64)
+        goal_np  = goal_w.detach().cpu().numpy().astype(np.float64)
+        orig_np  = env_origins.detach().cpu().numpy().astype(np.float64)
+
+        # Sampling taus in (0, 1] for the K-1 degree Bezier.
+        taus = np.linspace(1.0 / n_fit, 1.0, n_fit, dtype=np.float64)  # (n_fit,)
+        t_abs = taus * h  # absolute times in (0, h] for DMPC sampling
+
+        # Bernstein basis matrix: Phi[m, j] = B_{j, K-1}(taus[m])
+        Phi_all = np.column_stack([
+            comb(K - 1, j, exact=True) * (taus ** j) * ((1 - taus) ** (K - 1 - j))
+            for j in range(K)
+        ])  # (n_fit, K)
+        Phi_free   = Phi_all[:, 2:].astype(np.float32)    # (n_fit, K-2) — free ctrl_pts
+        Phi_pinned = Phi_all[:, :2].astype(np.float32)    # (n_fit, 2)   — P_0, P_1
+
+        for e in env_list:
+            origin_e = orig_np[e]
+            for i in range(self.N):
+                st = self._state.get((e, i))
+                if st is None:
+                    continue
+                U = st["U"]
+
+                # Sample DMPC position Bezier at n_fit time points.
+                pos_dmpc = (
+                    self.bezier.sample_matrix(t_abs, deriv=0) @ U
+                ).reshape(n_fit, 3) + origin_e  # (n_fit, 3) world frame
+
+                # Current drone state.
+                p_curr = pos_np[e, i]    # (3,)
+                v_curr = vel_np[e, i]    # (3,)
+                g_curr = goal_np[e, i]   # (3,)
+
+                # Goal-aligned rotation R: world → goal frame.
+                delta = g_curr - p_curr
+                horiz = np.hypot(delta[0], delta[1])
+                if horiz < 1e-3:
+                    R = np.eye(3, dtype=np.float64)
+                else:
+                    cos_t, sin_t = delta[0] / horiz, delta[1] / horiz
+                    R = np.array([[cos_t, sin_t, 0.0],
+                                  [-sin_t, cos_t, 0.0],
+                                  [0.0, 0.0, 1.0]], dtype=np.float64)
+
+                # Pinned ctrl_pts in goal-aligned delta frame.
+                # P_0 = (0,0,0); P_1 = R @ v_curr * h / (K-1).
+                P_1 = R @ v_curr * (h / (K - 1))  # (3,)
+
+                # DMPC positions → goal-aligned delta frame.
+                delta_w = pos_dmpc - p_curr  # (n_fit, 3)
+                p_goal  = (R @ delta_w.T).T  # (n_fit, 3)
+
+                # Residual after subtracting P_0 (= 0) and P_1 contributions.
+                residual = p_goal - np.outer(Phi_pinned[:, 1], P_1)  # (n_fit, 3)
+
+                # Least-squares: Phi_free @ P_free = residual  → P_free (K-2, 3).
+                P_free, _, _, _ = np.linalg.lstsq(
+                    Phi_free.astype(np.float64), residual, rcond=None
+                )
+                free_ctrl[e, i] = P_free.astype(np.float32)
+
+        return torch.from_numpy(free_ctrl).to(self.device)
+
     # ───────────────────────────────────────────────────────────────────
     # Neighbour broadcast retrieval
     # ───────────────────────────────────────────────────────────────────

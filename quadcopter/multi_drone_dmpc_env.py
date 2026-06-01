@@ -79,7 +79,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4
     episode_length_s: float = 10.0
-    decimation: int = 2
+    decimation: int = 5
     action_space: int = 3 * 4   # 3 (v_ref) per drone, overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
@@ -286,6 +286,22 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 "thrust_b_z": f_z.detach().clone(),
                 "tau_des_b":  tau.detach().clone(),
             }
+            return
+
+        if actions.shape[-1] == N * 9:
+            # ── Full-reference mode: (ref_pos_w, ref_vel_w, ref_acc_w) ───
+            # Absolute world-frame position, velocity, acceleration per drone.
+            # Passed directly to the cascade controller without normalization.
+            w = actions.view(E, N, 9)
+            ref_pos_w = w[:, :, 0:3]
+            ref_vel_w = w[:, :, 3:6]
+            ref_acc_w = w[:, :, 6:9]
+            self._last_ref_pos_w = ref_pos_w.detach().clone()
+            self._last_ref_vel_w = ref_vel_w.detach().clone()
+            self._last_ref_acc_w = ref_acc_w.detach().clone()
+            wrench_b = self._ref_to_thrust_moment(ref_pos_w, ref_vel_w, ref_acc_w)
+            self._thrust[:, :, 0, 2] = wrench_b[:, :, 0]
+            self._moment[:, :, 0, :] = wrench_b[:, :, 1:]
             return
 
         # ── v_ref mode (cascade) ──────────────────────────────────────────
