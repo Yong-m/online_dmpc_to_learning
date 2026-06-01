@@ -943,6 +943,19 @@ class DMPCExpert:
             dtype=np.intp,
         )
 
+        # Pre-cache float32 GPU tensors for Phase C — fixed matrices that never
+        # change between calls, uploaded once here to avoid repeated CPU→GPU transfers.
+        _dev = self._gpu_solver.device
+        self._t_Fx    = torch.from_numpy(self._Fx_pos_pred.astype(np.float32)).to(_dev)
+        self._t_Qd    = torch.from_numpy(self._Q_diag_free.astype(np.float32)).to(_dev)
+        self._t_Gp    = torch.from_numpy(self._G_pos_pred.astype(np.float32)).to(_dev)
+        self._t_Phi   = torch.from_numpy(
+            self.M_pos_hor.astype(np.float32).reshape(K, 3, self.n_bez)
+        ).to(_dev)  # (K, 3, n_bez)
+        self._t_thinv = torch.from_numpy(
+            np.diag(self._Theta_inv).astype(np.float32)
+        ).to(_dev)  # (3,)
+
     def _plan_batched_gpu(
         self,
         e_arr: np.ndarray,              # (B,) env indices
@@ -973,7 +986,6 @@ class DMPCExpert:
         n_eq_c = gs.n_eq_cont
         rmin   = self.p.rmin
         g_thr  = self.p.g_factor * rmin
-        th_inv = np.diag(self._Theta_inv)        # (3,) diagonal of Theta_inv
         qc     = self.p.quad_coll
         B      = len(e_arr)
         self._gpu_plan_calls = getattr(self, "_gpu_plan_calls", 0) + 1
@@ -1038,70 +1050,84 @@ class DMPCExpert:
         own_batch = own_pred_batch                  # (B, K, 3)
         _t_assemble = _time.perf_counter() - _t1
 
-        # ── Phase C: vectorised q computation ─────────────────────────────
+        # ── Phase C: q computation on GPU ─────────────────────────────────
         _t2 = _time.perf_counter()
+        dev = gs.device
+
+        # Upload per-call inputs once
+        x0_t    = torch.from_numpy(x0_batch.astype(np.float32)).to(dev)     # (B, 6)
+        goal_t  = torch.from_numpy(goal_batch.astype(np.float32)).to(dev)   # (B, 3)
+        own_t   = torch.from_numpy(own_batch.astype(np.float32)).to(dev)    # (B, K, 3)
+        nbr_t   = torch.from_numpy(nbr_batch.astype(np.float32)).to(dev)    # (B, N-1, K, 3)
+        valid_t = torch.from_numpy(valid_nbr).to(dev)                        # (B, N-1)
 
         # C1 — goal-tracking linear cost
-        # residual[b] = Fx x0[b] - tile(goal[b], K)    shape (B, 3K)
-        residual = (x0_batch @ self._Fx_pos_pred.T
-                    - np.tile(goal_batch, (1, K)))       # (B, 3K)
-        q_np = (2.0 * (residual * self._Q_diag_free) @ self._G_pos_pred
-                ).astype(np.float32)                     # (B, n_bez)
+        residual = x0_t @ self._t_Fx.T - goal_t.repeat(1, K)   # (B, 3K)
+        q_t = 2.0 * (residual * self._t_Qd) @ self._t_Gp       # (B, n_bez)
 
-        # C2 — collision detection (one broadcast over (B, K-1, N_max, 3))
-        diff  = (own_batch[:, :-1, np.newaxis, :]
-                 - nbr_batch[:, :, 1:, :].transpose(0, 2, 1, 3))  # (B,K-1,N_max,3)
-        d     = diff * th_inv                                       # scaled
-        norms = np.sqrt((d * d).sum(-1))                            # (B,K-1,N_max)
-        norms = np.where(valid_nbr[:, np.newaxis, :], norms, np.inf)
+        # C2 — collision detection: own[k] vs nbr[k+1] for k in [0, K-1)
+        # own_t[:,:-1]: (B,K-1,3) → (B,K-1,1,3)
+        # nbr_t[:,:,1:].permute(0,2,1,3): (B,N-1,K-1,3) → (B,K-1,N-1,3)
+        diff  = (own_t[:, :-1, None, :]
+                 - nbr_t[:, :, 1:, :].permute(0, 2, 1, 3))    # (B,K-1,N-1,3)
+        d     = diff * self._t_thinv                            # Theta-scaled
+        norms = torch.sqrt((d * d).sum(-1))                     # (B,K-1,N-1)
+        norms = torch.where(valid_t[:, None, :], norms,
+                            torch.full_like(norms, float('inf')))
 
-        coll_step = norms < rmin                        # (B, K-1, N_max)
-        coll_any  = coll_step.any(-1)                   # (B, K-1)
-        has_coll  = coll_any.any(-1)                    # (B,)
-        kc_arr    = np.where(has_coll, coll_any.argmax(-1), -1)   # (B,) 0-indexed
+        coll_any = (norms < rmin).any(-1)                       # (B, K-1)
+        has_coll = coll_any.any(-1)                             # (B,)
+        kc_arr   = torch.where(has_coll, coll_any.long().argmax(-1),
+                               has_coll.new_full((B,), -1))     # (B,) 0-indexed
 
-        # C3 — collision penalty gradient (vectorised, no per-agent loop)
-        coll_idx = np.where(has_coll)[0]
-        if coll_idx.size > 0:
-            kc_c  = kc_arr[coll_idx] + 1               # 1-indexed kc  (B_c,)
-            d_kc  = d[coll_idx, kc_c - 1, :, :]        # (B_c, N_max, 3)
-            n_kc  = norms[coll_idx, kc_c - 1, :]       # (B_c, N_max)
+        # C3 — collision penalty gradient for agents that have a collision
+        if has_coll.any():
+            coll_idx = has_coll.nonzero(as_tuple=True)[0]      # (B_c,)
+            B_c  = coll_idx.shape[0]
+            kc_c = kc_arr[coll_idx] + 1                        # 1-indexed (B_c,)
 
-            ns    = np.where(n_kc > 1e-6, n_kc, 1.0)
-            udir  = d_kc / ns[:, :, np.newaxis]         # (B_c, N_max, 3)
-            ut    = udir * th_inv                        # Theta_inv @ unit_dir
+            d_kc = d[coll_idx, kc_c - 1, :, :]                # (B_c, N-1, 3)
+            n_kc = norms[coll_idx, kc_c - 1, :]               # (B_c, N-1)
 
-            Phi_all = self.M_pos_hor.reshape(K, 3, n_bez)
-            Phi_kc  = Phi_all[kc_c - 1]                 # (B_c, 3, n_bez)
-            # dg_dU[b,j,:] = ut[b,j,:] @ Phi_kc[b]
-            dg_dU = np.einsum('bnk,bkm->bnm', ut, Phi_kc)  # (B_c, N_max, n_bez)
+            ns   = torch.where(n_kc > 1e-6, n_kc, torch.ones_like(n_kc))
+            udir = d_kc / ns.unsqueeze(-1)                     # (B_c, N-1, 3)
+            ut   = udir * self._t_thinv                        # (B_c, N-1, 3)
 
-            # nbr positions at kc (per-agent kc via advanced indexing)
-            bo = coll_idx[:, np.newaxis]                # (B_c, 1)
-            jo = np.arange(N_max)[np.newaxis, :]        # (1,  N_max)
-            ko = kc_c[:, np.newaxis]                    # (B_c, 1)
-            nbr_kc = nbr_batch[bo, jo, ko, :]           # (B_c, N_max, 3)
+            Phi_kc = self._t_Phi[kc_c - 1]                    # (B_c, 3, n_bez)
+            dg_dU  = torch.einsum('bnk,bkm->bnm', ut, Phi_kc) # (B_c, N-1, n_bez)
 
-            rhs = (ut * nbr_kc).sum(-1) + rmin          # (B_c, N_max)
-            active = valid_nbr[coll_idx] & (n_kc < g_thr)  # (B_c, N_max)
+            # neighbour positions at timestep kc_c[b] for each j
+            jo     = torch.arange(N_max, device=dev).unsqueeze(0).expand(B_c, N_max)
+            nbr_kc = nbr_t[
+                coll_idx.unsqueeze(1).expand(B_c, N_max),
+                jo,
+                kc_c.unsqueeze(1).expand(B_c, N_max),
+                :
+            ]                                                   # (B_c, N-1, 3)
 
-            pred  = np.einsum('bnm,bm->bn', dg_dU, U_prev_b[coll_idx])  # (B_c,N_max)
-            viol  = np.where(active, np.maximum(0.0, rhs - pred), 0.0)
+            rhs    = (ut * nbr_kc).sum(-1) + rmin              # (B_c, N-1)
+            active = valid_t[coll_idx] & (n_kc < g_thr)        # (B_c, N-1)
 
-            pg = (-2.0 * qc * np.einsum('bn,bnm->bm', viol, dg_dU)
-                  ).astype(np.float32)                   # (B_c, n_bez)
-            q_np[coll_idx] += pg
+            U_prev_c = torch.from_numpy(
+                U_prev_b[coll_idx.cpu().numpy()].astype(np.float32)
+            ).to(dev)                                           # (B_c, n_bez)
+            pred  = torch.einsum('bnm,bm->bn', dg_dU, U_prev_c)  # (B_c, N-1)
+            viol  = torch.where(active,
+                                torch.clamp(rhs - pred, min=0.0),
+                                torch.zeros_like(pred))
+
+            pg = -2.0 * qc * torch.einsum('bn,bnm->bm', viol, dg_dU)  # (B_c, n_bez)
+            q_t[coll_idx] += pg
 
         _t_q = _time.perf_counter() - _t2
 
         # ── Phase D: GPU solve ────────────────────────────────────────────
         _t3 = _time.perf_counter()
-        dev   = gs.device
         b_eq  = np.zeros((B, n_eq), dtype=np.float32)
         b_eq[:, n_eq_c:] = seeds_flat
         idx_np = (e_arr * N + i_arr).astype(np.int64)
 
-        q_t   = torch.from_numpy(q_np).to(dev)
+        # q_t already on GPU from Phase C
         beq_t = torch.from_numpy(b_eq).to(dev)
         idx_t = torch.from_numpy(idx_np).to(dev)
         U_raw = gs.solve(q_t, beq_t, idx_t).cpu().numpy()  # (B, n_bez) float32
@@ -1117,7 +1143,10 @@ class DMPCExpert:
              for r in range(deg1)], axis=1
         )  # (B, deg1, 3)
 
-        kc_meta = np.where(has_coll, kc_arr + 1, -1)   # 1-indexed coll ts
+        # has_coll / kc_arr are torch tensors from Phase C — convert to numpy
+        has_coll_np = has_coll.cpu().numpy()
+        kc_arr_np   = kc_arr.cpu().numpy()
+        kc_meta = np.where(has_coll_np, kc_arr_np + 1, -1)   # 1-indexed coll ts
 
         # Batch write all fields to numpy arrays — zero per-agent loop
         self._st_U[e_arr, i_arr]          = U_f64
@@ -1132,7 +1161,7 @@ class DMPCExpert:
         _t_extract = _time.perf_counter() - _t4
 
         if _do_log:
-            n_coll = int(has_coll.sum())
+            n_coll = int(has_coll_np.sum())
             total  = (_t_init + _t_assemble + _t_q + _t_gpu + _t_extract) * 1e3
             print(
                 f"[DMPC gpu_admm] call={self._gpu_plan_calls}  B={B}  coll={n_coll}"

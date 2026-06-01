@@ -84,7 +84,7 @@ parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--save_dir", type=str, required=True,
                     help="Directory to write per-episode .npz files.")
-parser.add_argument("--target_episodes", type=int, default=3000,
+parser.add_argument("--target_episodes", type=int, default=100000,
                     help="Stop after this many episodes have been saved.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Hard env-step cap (0 = use --target_episodes only).")
