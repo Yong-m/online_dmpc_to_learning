@@ -104,7 +104,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     static_obstacle_size: tuple[float, float, float] = (0.25, 1.25, 2.5)
     static_obstacle_ellipsoid_margin: float = 0.10
     static_obstacle_ellipsoid_mode: str = "outer_single"  # "outer_single" or "grid"
-    static_obstacle_outer_ellipsoid_axes: tuple[float, float, float] = (0.4, 1.3, 10.0)
+    static_obstacle_outer_ellipsoid_axes: tuple[float, float, float] = (0.4, 1.35, 10.0)
     static_obstacle_ellipsoid_grid: tuple[int, int, int] = (1, 4, 5)
     static_obstacle_goal_ellipsoid_clearance: float = 0.25
     fixed_static_obstacle_pos: tuple[tuple[float, float, float], ...] = (

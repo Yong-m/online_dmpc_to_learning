@@ -435,7 +435,8 @@ class DMPCExpert:
 
         self._Q_diag_free, self._H_bez_free = _make_mode(self.p.s_free, self.p.spd_f)
         self._Q_diag_obs, self._H_bez_obs = _make_mode(self.p.s_obs, self.p.spd_o)
-        self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.0, 0)
+        # self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.0, 0)
+        self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.001 * self.p.s_obs, self.p.spd_o)
 
     def _build_energy_quadratic(self) -> np.ndarray:
         """``H`` such that ``U^T H U = integral ||u''(t)||^2 dt``."""
@@ -891,7 +892,7 @@ class DMPCExpert:
                 polish=self.p.osqp_polish,
             )
         except ValueError:
-            self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
@@ -909,7 +910,7 @@ class DMPCExpert:
         res = solver.solve()
         if res.info.status_val not in (1, 2):
             print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
-            self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
@@ -1083,9 +1084,9 @@ class DMPCExpert:
         # Static obstacle
         for o in range(n_obs):
             obs_kc_o = []
-            for k in range(2, K): # range(1, K)
+            for k in range(1, K): 
                 Theta_inv_o = self._obs_theta_inv[env_idx, o]
-                d = Theta_inv_o @ (own_pred[k - 1] - self._obstacle_pos_local[env_idx, o])
+                d = Theta_inv_o @ (own_pred[k] - self._obstacle_pos_local[env_idx, o])
                 if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]: # more conservative collision checking for static obstacles #self._obs_rmin[env_idx, o]:
                     obs_kc_o.append(k)
             l_obs_kc.append(obs_kc_o)
@@ -1124,8 +1125,8 @@ class DMPCExpert:
             Theta_inv_o = self._obs_theta_inv[env_idx, o]
             obstacle_pos = self._obstacle_pos_local[env_idx, o]
             for kc_oi in obs_kc_o:
-                Phi_kc_oi = self.M_pos_hor[3 * (kc_oi - 1) : 3 * (kc_oi - 1) + 3, :]
-                d = Theta_inv_o @ (own_pred[kc_oi - 1] - obstacle_pos)
+                Phi_kc_oi = self.M_pos_hor[3 * kc_oi : 3 * kc_oi + 3, :]
+                d = Theta_inv_o @ (own_pred[kc_oi] - obstacle_pos)
                 if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]:
                     unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
                     dg_dU = unit_diff.transpose() @ Theta_inv_o @ Phi_kc_oi
@@ -1154,27 +1155,54 @@ class DMPCExpert:
         self,
         env_idx: int,
         agent_idx: int,
+        prev: dict | None,
         pos_seed: np.ndarray,
-        goal: np.ndarray,
+        vel_seed: np.ndarray,
+        prefer_previous: bool = True,
     ) -> None:
-        """If the QP fails, freeze the agent's plan to a PD-toward-goal seed
-        fitted onto the Bezier basis so subsequent samples remain
-        well-defined."""
+        """If the QP fails, reuse a safe previous plan or brake to hover.
+
+        Preferred fallback is the standard MPC choice: shift the previous
+        feasible plan forward by one replanning period. If that plan is missing,
+        malformed, or immediately enters a static-obstacle guard, fall back to a
+        conservative brake-to-hover reference around ``pos_seed``.
+        """
         K = self.p.k_hor
         h = self.p.h
-        p = pos_seed.copy()
-        v = np.zeros(3)
-        u_pred = np.zeros((K, 3))
-        for k in range(K):
-            a = np.clip(2.0 * (goal - p) - 1.5 * v, np.asarray(self.p.amin), np.asarray(self.p.amax))
-            p = p + v * h + 0.5 * a * h ** 2
-            v = v + a * h
-            u_pred[k] = p
-        # Least-squares fit Bezier control points to the K samples.
-        try:
-            U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
-        except np.linalg.LinAlgError:
-            U = np.zeros(self.n_bez)
+        U = None
+        u_pred = None
+        fallback_type = "brake_hover"
+
+        if prefer_previous and prev is not None:
+            U_prev = prev.get("U")
+            if U_prev is not None and U_prev.shape[0] == self.n_bez and np.isfinite(U_prev).all():
+                shifted_times = np.minimum(self._times_hor + h, self._times_hor[-1])
+                shifted_u_pred = (self.bezier.sample_matrix(shifted_times, deriv=0) @ U_prev).reshape(K, 3)
+                inside_static, _ = self._is_inside_static_obstacle(env_idx, shifted_u_pred[: max(1, self.p.emergency_prediction_steps)])
+                if np.isfinite(shifted_u_pred).all() and not inside_static:
+                    try:
+                        U = np.linalg.lstsq(self.M_pos_hor, shifted_u_pred.reshape(-1), rcond=None)[0]
+                        u_pred = shifted_u_pred
+                        fallback_type = "shift_previous"
+                    except np.linalg.LinAlgError:
+                        U = None
+                        u_pred = None
+
+        if U is None or u_pred is None:
+            p_hold = pos_seed.copy()
+            p = pos_seed.copy()
+            v = vel_seed.copy()
+            u_pred = np.zeros((K, 3))
+            for k in range(K):
+                a = np.clip(2.0 * (p_hold - p) - 2.0 * v, np.asarray(self.p.amin), np.asarray(self.p.amax))
+                p = p + v * h + 0.5 * a * h ** 2
+                v = v + a * h
+                u_pred[k] = p
+            try:
+                U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
+            except np.linalg.LinAlgError:
+                U = np.zeros(self.n_bez)
+
         seeds = [
             (self._M_deriv_h[r] @ U).reshape(3)
             for r in range(self.p.deg_poly + 1)
@@ -1188,4 +1216,6 @@ class DMPCExpert:
             "collision_timestep": -1,
             "collision_sample_indices": [],
             "priority_scores": np.zeros(0, dtype=np.float64),
+            "fallback_type": fallback_type,
         }
+        print(f"fallback_type: {fallback_type}")
