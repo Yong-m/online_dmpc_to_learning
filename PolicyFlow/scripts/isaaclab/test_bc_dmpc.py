@@ -460,6 +460,7 @@ def main():
         from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
         expert = DMPCExpert(
             num_drones=N,
+            num_envs=E,
             params=DMPCParams(
                 pmin=env_raw.cfg.pos_min,
                 pmax=env_raw.cfg.pos_max,

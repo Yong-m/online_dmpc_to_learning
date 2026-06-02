@@ -131,6 +131,7 @@ from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     per_drone_obs_dim,
 )
 from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
+from quadcopter.dmpc_gpu_expert import GPUDMPCExpert
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -393,7 +394,7 @@ def _read_expert_state(
     expert: DMPCExpert, E: int, N: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read DMPC expert state for all (e, i) pairs after a plan() call."""
-    if expert._gpu_solver is not None:
+    if getattr(expert, "_gpu_solver", None) is not None:
         # GPU path: direct numpy array slice — no Python loop
         return (
             expert._st_U[:E, :N].astype(np.float32),
@@ -479,20 +480,34 @@ def main() -> None:
     )
 
     # ── DMPC expert ───────────────────────────────────────────────────────────
-    expert = DMPCExpert(
-        num_drones=N,
-        params=DMPCParams(
-            pmin=env_cfg.pos_min,
-            pmax=env_cfg.pos_max,
-            rmin=env_cfg.rmin,
-            ts=env_cfg.sim.dt * env_cfg.decimation,
-        ),
-        device=device,
-    )
     if args_cli.gpu_admm:
-        expert.enable_gpu_admm(max_envs=E, admm_iters=args_cli.admm_iters)
-        print(f"[collect_dmpc_data] GPU ADMM enabled  "
+        expert = GPUDMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_cfg.pos_min,
+                pmax=env_cfg.pos_max,
+                rmin=env_cfg.rmin,
+                ts=env_cfg.sim.dt * env_cfg.decimation,
+                max_envs=E, admm_iters=args_cli.admm_iters
+            ),
+            device=device,
+        )
+        print(f"[collect_dmpc_data] GPU ADMM-based expert"
               f"(max_B={E*N}  iters={args_cli.admm_iters}  alpha=1.6  coll=penalty)")
+        
+    else:
+        expert = DMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_cfg.pos_min,
+                pmax=env_cfg.pos_max,
+                rmin=env_cfg.rmin,
+                ts=env_cfg.sim.dt * env_cfg.decimation,
+            ),
+            device=device,
+        )
 
     # ── output dir ───────────────────────────────────────────────────────────
     save_dir = Path(args_cli.save_dir)

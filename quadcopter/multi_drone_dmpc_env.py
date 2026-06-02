@@ -89,6 +89,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     debug_short_horizon_steps: int = 3
     randomize_episode_start: bool = False
     terminate_on_bounds: bool = True
+    terminate_on_success: bool = True
     collision_free_two_drone_reset: bool = False # For DMPC debugging
     task_spread_mode: str = "symmetric"  # "symmetric" for ring/opposite goals, "free" for spread sampling
     reset_min_separation: float = 0.45
@@ -352,7 +353,6 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         if actions.shape[-1] == N * 9:
             # ── Full-reference mode: (ref_pos_w, ref_vel_w, ref_acc_w) ───
             # Absolute world-frame position, velocity, acceleration per drone.
-            # Passed directly to the cascade controller without normalization.
             w = actions.view(E, N, 9)
             ref_pos_w = w[:, :, 0:3]
             ref_vel_w = w[:, :, 3:6]
@@ -604,7 +604,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._drone_success_steps[~per_close] = 0
         self._drone_just_succeeded[:] = self._drone_success_steps >= hold_steps
 
-        return died | succeeded, time_out
+        success_done = succeeded if self.cfg.terminate_on_success else torch.zeros_like(succeeded)
+        return died | success_done, time_out
 
     # ── resets ─────────────────────────────────────────────────────────────
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -745,69 +746,24 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 obstacle.write_root_velocity_to_sim(zero_vel, env_ids)
         elif self.cfg.num_static_obstacles > 0:
             self._static_obstacle_pos_w[env_ids] = 0.0
-            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(
+                goal_pos, self.cfg.reset_min_start_goal_distance, env_origins_w=origins, avoid_points=init_pos
+            )
             self._init_pos_w[env_ids] = init_pos
             self._goal_pos_w[env_ids] = goal_pos
         else:
-            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(
+                goal_pos, self.cfg.reset_min_start_goal_distance, env_origins_w=origins, avoid_points=init_pos
+            )
             self._init_pos_w[env_ids] = init_pos
             self._goal_pos_w[env_ids] = goal_pos
 
-        if self.cfg.enable_static_obstacles and self.cfg.num_static_obstacles > 0:
-            if self.cfg.randomize_static_obstacles:
-                xy_min = torch.tensor(self.cfg.static_obstacle_xy_min, device=device)
-                xy_max = torch.tensor(self.cfg.static_obstacle_xy_max, device=device)
-                obs_xy = xy_min + (xy_max - xy_min) * torch.rand(
-                    n, self.cfg.num_static_obstacles, 2, device=device
-                )
-                z_low, z_high = self.cfg.static_obstacle_z_range
-                obs_z = torch.empty(n, self.cfg.num_static_obstacles, device=device).uniform_(z_low, z_high)
-                obs_pos_local = torch.cat([obs_xy, obs_z.unsqueeze(-1)], dim=-1)
-            else:
-                obs_pos_local = torch.tensor(
-                    self.cfg.fixed_static_obstacle_pos, device=device, dtype=init_pos.dtype
-                ).unsqueeze(0).repeat(n, 1, 1)
-            obs_pos = obs_pos_local + origins[:, None, :]
-            self._static_obstacle_pos_w[env_ids] = obs_pos
-            z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
-            z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
-
-            init_pos = self._push_points_out_of_static_obstacle_ellipsoids(init_pos, obs_pos, origins)
-            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, obs_pos, origins)
-            init_pos[..., 2] = init_pos[..., 2].clamp(z_low, z_high)
-            self._init_pos_w[env_ids] = init_pos
-
-            goal_pos = self._push_points_out_of_static_obstacle_ellipsoids(goal_pos, obs_pos, origins)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, obs_pos, origins)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, obs_pos, origins, avoid_points=init_pos)
-            goal_pos[..., 2] = goal_pos[..., 2].clamp(z_low, z_high)
-            self._goal_pos_w[env_ids] = goal_pos
-
-            zero_vel = torch.zeros(n, 6, device=device)
-            obstacle_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
-            for i, obstacle in enumerate(self._static_obstacles):
-                default_root = obstacle.data.default_root_state[env_ids].clone()
-                default_root[:, :3] = obs_pos[:, i]
-                default_root[:, 3:7] = obstacle_quat
-                obstacle.write_root_pose_to_sim(default_root[:, :7], env_ids)
-                obstacle.write_root_velocity_to_sim(zero_vel, env_ids)
-        elif self.cfg.num_static_obstacles > 0:
-            self._static_obstacle_pos_w[env_ids] = 0.0
-            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
-            self._init_pos_w[env_ids] = init_pos
-            self._goal_pos_w[env_ids] = goal_pos
-        else:
-            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation)
-            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, avoid_points=init_pos)
-            self._init_pos_w[env_ids] = init_pos
-            self._goal_pos_w[env_ids] = goal_pos
+        self._last_ref_pos_w[env_ids] = init_pos
+        self._pos_history[env_ids] = init_pos.unsqueeze(2).expand(n, self.N, HISTORY_STEPS, 3)
 
         for i, robot in enumerate(self._robots):
             default_root = robot.data.default_root_state[env_ids].clone()

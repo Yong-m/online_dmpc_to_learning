@@ -29,6 +29,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -71,10 +72,12 @@ parser.add_argument("--expert_test_steps", type=int, default=None,
                     help="Expert-only rollout length. Defaults to 3 full episodes per env.")
 parser.add_argument("--expert_test_progress_every", type=int, default=100,
                     help="Print expert-test progress every N env steps (0 disables progress prints).")
-parser.add_argument("--rmin_check", type=float, default=0.15,
+parser.add_argument("--rmin_check", type=float, default=0.1,
                     help="Inter-agent collision judgement radius for test metrics (C++ simulator used 0.15).")
 parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds for debug rollouts.")
+parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
+                    help="Disable random initial episode progress offsets across envs.")
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
                     help="Disable z-bound termination for fixed-target debug rollouts.")
 parser.add_argument("--action_source", choices=["dmpc"], default="dmpc",
@@ -83,6 +86,11 @@ parser.add_argument("--dmpc_log_path", type=str, default=None,
                     help="Optional .npz path for first-env DMPC debug logging.")
 parser.add_argument("--dmpc_log_every", type=int, default=1,
                     help="Save one DMPC debug sample every N expert steps.")
+# GPU ADMM
+parser.add_argument("--gpu_admm", action="store_true", default=False,
+                    help="Use batched GPU ADMM instead of CPU OSQP threads.")
+parser.add_argument("--admm_iters", type=int, default=50,
+                    help="ADMM iterations per window (default 50).")
 
 parser.add_argument("--traj_save_dir", type=str, default=None,
                     help="Directory to save successful DMPC expert trajectories. "
@@ -156,6 +164,7 @@ from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     PER_NEIGHBOUR_DIM,
 )
 from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
+from quadcopter.dmpc_gpu_expert import GPUDMPCExpert
 
 # Full PolicyFlow flow-matching stack (same imports as online_bc_curobo.py).
 from policyflow_torch.modules import (  # noqa: E402
@@ -817,6 +826,377 @@ class DmpcExpertLogger:
             payload[key] = np.stack([r[key] for r in self.records], axis=0)
         np.savez_compressed(self.path, **payload)
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Success trajectory recorder / replayer                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+class SuccessTrajectoryRecorder:
+    """Records successful DMPC expert episodes to disk.
+
+    Per episode saves (in a single compressed .npz):
+      - init_pos_local (N, 3): drone start positions relative to env origin (XY)
+      - goal_local     (N, 3): goal positions relative to env origin (XY)
+      - act_latent     (T, N, A): atanh-mapped goal-frame v_ref sequence
+      - obs            (T, N, P): per-drone observations at each step
+
+    Local-frame storage makes files portable across different env tile layouts.
+    """
+
+    def __init__(
+        self,
+        save_dir: str,
+        num_envs: int,
+        max_ep_len: int,
+        N: int,
+        P: int,
+        A: int,
+        device: torch.device,
+    ):
+        self._dir = Path(save_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._E, self._T = num_envs, max_ep_len
+        self._N, self._P, self._A = N, P, A
+        self._device = device
+
+        self._obs = torch.zeros(num_envs, max_ep_len, N, P, device=device)
+        self._act = torch.zeros(num_envs, max_ep_len, N, A, device=device)
+        self._init_pos = torch.zeros(num_envs, N, 3, device=device)
+        self._goal     = torch.zeros(num_envs, N, 3, device=device)
+        self._len = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._traj_count = int(
+            max((int(f.stem.split("_")[1]) for f in self._dir.glob("traj_*.npz")),
+                default=-1) + 1
+        )
+
+    def push(
+        self,
+        obs: torch.Tensor,           # (E, N, P)
+        act_latent: torch.Tensor,    # (E, N, A)
+        env_raw: "MultiDroneDmpcEnv",
+    ) -> None:
+        """Stage one step. Captures initial conditions on the first step of each episode."""
+        new_ep = self._len == 0
+        if new_ep.any():
+            new_ids = new_ep.nonzero(as_tuple=False).flatten()
+            origins = env_raw._terrain.env_origins[new_ids]  # (n, 3)
+            ip = env_raw._init_pos_w[new_ids].detach().clone()
+            gp = env_raw._goal_pos_w[new_ids].detach().clone()
+            ip[..., :2] -= origins[:, None, :2]
+            gp[..., :2] -= origins[:, None, :2]
+            self._init_pos[new_ids] = ip
+            self._goal[new_ids] = gp
+
+        idx = self._len.clamp(max=self._T - 1)
+        env_idx = torch.arange(self._E, device=self._device)
+        self._obs[env_idx, idx] = obs.detach()
+        self._act[env_idx, idx] = act_latent.detach()
+        self._len = (self._len + 1).clamp(max=self._T)
+
+    def save_successes(
+        self,
+        env_ids: torch.Tensor,
+        just_succeeded: torch.Tensor,  # bool, same length as env_ids
+    ) -> int:
+        """Flush successful episodes to disk. Returns the number saved."""
+        saved = 0
+        for e, succ in zip(env_ids.tolist(), just_succeeded.tolist()):
+            if not succ:
+                continue
+            t = int(self._len[e].item())
+            if t == 0:
+                continue
+            np.savez_compressed(
+                str(self._dir / f"traj_{self._traj_count:06d}.npz"),
+                obs=self._obs[e, :t].cpu().numpy().astype(np.float32),
+                act_latent=self._act[e, :t].cpu().numpy().astype(np.float32),
+                init_pos_local=self._init_pos[e].cpu().numpy().astype(np.float32),
+                goal_local=self._goal[e].cpu().numpy().astype(np.float32),
+            )
+            self._traj_count += 1
+            saved += 1
+        return saved
+
+    def clear(self, env_ids: torch.Tensor) -> None:
+        self._len[env_ids] = 0
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Replay pool — replaces DMPC for a fraction of envs                       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+class ReplayPool:
+    """Dedicate the last ``num_envs // replay_denom`` envs to replaying saved
+    trajectories, reducing DMPC solver invocations.
+
+    Lifecycle:
+      - Activates once the trajectory directory contains ≥ ``num_envs`` files.
+      - On activation (and after each episode end), loads the next trajectory
+        (round-robin) and pins the env to its initial conditions.
+      - Each call to ``step(env_id)`` returns the pre-recorded action for that
+        step.  When the trajectory runs out (episode still in progress), returns
+        ``(None, None)`` so the DMPC action takes over for the remainder.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        traj_dir: str,
+        device: torch.device,
+        replay_denom: int = 5,
+    ):
+        self.n_replay = max(1, num_envs // replay_denom)
+        # Use the highest-indexed envs as replay envs (env 0 is kept for debug).
+        self.replay_ids: set[int] = set(range(num_envs - self.n_replay, num_envs))
+        self._dir = Path(traj_dir)
+        self.device = device
+        self._min_trajs = num_envs             # activate when ≥ num_envs files exist
+        self._files: list[Path] = []
+        self._rr_idx = 0                       # round-robin file pointer
+        self._state: dict[int, dict] = {}      # env_id → {actions, act_latent, step, T}
+        self.active = False
+        self._just_activated = False
+
+    def refresh(self) -> int:
+        """Rescan traj_dir.  Returns file count.  Sets ``active`` + ``_just_activated``
+        the first time enough files are available."""
+        self._files = sorted(self._dir.glob("traj_*.npz"))
+        n = len(self._files)
+        if not self.active and n >= self._min_trajs:
+            self.active = True
+            self._just_activated = True
+            print(
+                f"[ReplayPool] activated — {n} trajectories, "
+                f"{self.n_replay} replay envs: {sorted(self.replay_ids)}",
+                flush=True,
+            )
+        return n
+
+    def is_replay_env(self, env_id: int) -> bool:
+        return self.active and env_id in self.replay_ids
+
+    def load_next(
+        self,
+        env_id: int,
+        env_raw: "MultiDroneDmpcEnv",
+        n_substeps: int = 2,
+        h: float = 0.1,
+    ) -> None:
+        """Load the next trajectory (round-robin) and pin ``env_id`` to its
+        initial conditions via ``env_raw._pinned_reset_state``."""
+        if not self._files:
+            return
+        f = self._files[self._rr_idx % len(self._files)]
+        self._rr_idx = (self._rr_idx + 1) % len(self._files)
+
+        data = np.load(str(f))
+        # act_latent stores free position ctrl_pts ((K-2)*3 per drone per step).
+        act_lat = torch.from_numpy(data["act_latent"]).to(self.device)  # (T, N, K_free*3)
+
+        origin = env_raw._terrain.env_origins[env_id]   # (3,)
+        ip = torch.from_numpy(data["init_pos_local"]).to(self.device).clone()
+        gp = torch.from_numpy(data["goal_local"]).to(self.device).clone()
+        ip[..., :2] += origin[:2]
+        gp[..., :2] += origin[:2]
+        env_raw._pinned_reset_state[env_id] = {"init_pos": ip, "goal": gp}
+
+        K_free = act_lat.shape[-1] // 3
+        self._state[env_id] = {
+            "act_latent": act_lat,     # (T, N, K_free*3) free pos ctrl_pts [m]
+            "step": 0,
+            "T": act_lat.shape[0],
+            "n_substeps": n_substeps,
+            "bezier_k_free": K_free,
+            "h": h,
+            "window_refs": None,
+        }
+
+    def step(
+        self,
+        env_id: int,
+        env_raw: "MultiDroneDmpcEnv | None" = None,
+    ) -> torch.Tensor | None:
+        """Advance one step.  Returns absolute world-frame (N, 9) = [ref_pos, ref_vel, ref_acc]
+        or None when the trajectory is exhausted (caller falls back to DMPC)."""
+        s = self._state.get(env_id)
+        if s is None or s["step"] >= s["T"]:
+            return None
+
+        t = s["step"]
+        n_sub = s["n_substeps"]
+        sub = t % n_sub
+
+        if sub == 0 or s["window_refs"] is None:
+            if env_raw is None:
+                return None  # need env state to build window refs
+            K_free = s["bezier_k_free"]
+            K = K_free + 2
+            h = s["h"]
+            free_flat = s["act_latent"][t]    # (N, K_free*3)
+            N = free_flat.shape[0]
+
+            drone_st = env_raw._stack_drone_state()
+            pos_e  = drone_st["pos_w"][env_id]       # (N, 3)
+            vel_e  = drone_st["lin_vel_w"][env_id]   # (N, 3)
+            goal_e = env_raw._goal_pos_w[env_id]     # (N, 3)
+
+            R_e  = env_raw._compute_goal_aligned_R(
+                pos_e.unsqueeze(0), goal_e.unsqueeze(0)
+            )[0]  # (N, 3, 3)
+            R_T  = R_e.transpose(-1, -2)  # (N, 3, 3)
+
+            # Build full position ctrl_pts in goal-aligned delta frame.
+            P_free = free_flat.reshape(N, K_free, 3)      # (N, K_free, 3)
+            P_1    = torch.bmm(R_e, vel_e.unsqueeze(-1)).reshape(N, 3) * (h / (K - 1))
+            P_0    = torch.zeros_like(P_1)
+            full_ctrl = torch.cat(
+                [P_0.unsqueeze(1), P_1.unsqueeze(1), P_free], dim=1
+            )  # (N, K, 3)
+
+            # Pre-compute absolute world-frame refs for each sub-step.
+            refs = []
+            for j in range(n_sub):
+                tau_j = (j + 1) / n_sub
+                dp_g, v_g, a_g = eval_bezier_full(full_ctrl.unsqueeze(0), tau_j, h)
+                dp_g = dp_g.squeeze(0)  # (N, 3) goal-aligned delta
+                v_g  = v_g.squeeze(0)
+                a_g  = a_g.squeeze(0)
+                dp_w = torch.bmm(R_T, dp_g.unsqueeze(-1)).squeeze(-1)  # (N, 3) world
+                v_w  = torch.bmm(R_T, v_g.unsqueeze(-1)).squeeze(-1)
+                a_w  = torch.bmm(R_T, a_g.unsqueeze(-1)).squeeze(-1)
+                refs.append(torch.cat([pos_e + dp_w, v_w, a_w], dim=-1))  # (N, 9)
+            s["window_refs"] = refs
+
+        ref_9d = s["window_refs"][sub]  # (N, 9)
+        s["step"] += 1
+        return ref_9d
+
+    def on_episode_done(
+        self,
+        env_id: int,
+        env_raw: "MultiDroneDmpcEnv",
+        n_substeps: int = 2,
+        h: float = 0.1,
+    ) -> None:
+        """Called when a replay env's episode ends.  Loads the next trajectory
+        and force-resets the env to its initial conditions (double-reset)."""
+        self._state.pop(env_id, None)
+        self.load_next(env_id, env_raw, n_substeps=n_substeps, h=h)
+        # _pinned_reset_state is set; apply it now with an explicit _reset_idx call.
+        env_raw._reset_idx(torch.tensor([env_id], device=env_raw.device))
+
+
+def load_trajs_to_buffer(
+    traj_dir: str,
+    buffer: "PerDroneBuffer",
+    device: torch.device,
+    max_trajs: int | None = None,
+) -> int:
+    """Load saved trajectory files and add (obs, act_latent) pairs to the BC buffer.
+
+    Does NOT require the env — feeds saved data directly.  Use this when the
+    observation definition has not changed since the trajectories were saved.
+    """
+    files = sorted(Path(traj_dir).glob("traj_*.npz"))
+    if max_trajs is not None:
+        files = files[:max_trajs]
+    loaded = 0
+    for f in files:
+        data = np.load(str(f))
+        obs = torch.from_numpy(data["obs"]).to(device)         # (T, N, P)
+        act = torch.from_numpy(data["act_latent"]).to(device)  # (T, N, A)
+        buffer.add(obs, act)
+        loaded += 1
+    print(f"[traj_load] loaded {loaded} trajectories from {traj_dir}", flush=True)
+    return loaded
+
+
+def replay_trajs_in_env(
+    traj_dir: str,
+    env_raw: "MultiDroneDmpcEnv",
+    buffer: "PerDroneBuffer",
+    max_trajs: int | None = None,
+) -> int:
+    """Replay saved trajectories inside the running env to regenerate fresh obs.
+
+    For each saved trajectory:
+      1. Pin env 0 to the saved initial positions / goal.
+      2. Reset env 0 via _reset_idx.
+      3. Step through the saved raw-wrench actions and collect (new_obs, act_latent) pairs.
+
+    This is useful when the observation definition has changed since the
+    trajectories were saved, since it regenerates obs from the current code.
+    All other envs continue running normally.
+    """
+    files = sorted(Path(traj_dir).glob("traj_*.npz"))
+    if max_trajs is not None:
+        files = files[:max_trajs]
+    if not files:
+        return 0
+
+    device = env_raw.device
+    E = env_raw.num_envs
+    N = env_raw.cfg.num_drones
+    n_substeps = max(1, round(0.1 / (env_raw.cfg.sim.dt * env_raw.cfg.decimation)))
+    h = 0.1  # Bezier window duration [s]
+    replayed = 0
+
+    for traj_file in files:
+        data = np.load(str(traj_file))
+        init_local = torch.from_numpy(data["init_pos_local"]).to(device)  # (N, 3)
+        goal_local  = torch.from_numpy(data["goal_local"]).to(device)      # (N, 3)
+        act_lat     = torch.from_numpy(data["act_latent"]).to(device)      # (T, N, K_free*3)
+        T, _, K_free_times_3 = act_lat.shape
+        K_free = K_free_times_3 // 3  # infer from file
+        K = K_free + 2
+
+        # Pin env 0 to saved initial conditions.
+        origin = env_raw._terrain.env_origins[0]
+        ip = init_local.clone(); ip[..., :2] += origin[:2]
+        gp = goal_local.clone(); gp[..., :2] += origin[:2]
+        env_raw._pinned_reset_state[0] = {"init_pos": ip, "goal": gp}
+        env_raw._reset_idx(torch.tensor([0], device=device))
+
+        per_drone_obs = env_raw.get_per_drone_obs()  # (E, N, P)
+        window_refs: list[torch.Tensor] | None = None
+
+        for t in range(T):
+            sub = t % n_substeps
+            if sub == 0:
+                # Re-compute absolute world-frame refs from stored free ctrl_pts.
+                drone_st = env_raw._stack_drone_state()
+                pos_0  = drone_st["pos_w"][0]       # (N, 3) env-0
+                vel_0  = drone_st["lin_vel_w"][0]   # (N, 3)
+                goal_0 = env_raw._goal_pos_w[0]     # (N, 3)
+                R_0    = env_raw._compute_goal_aligned_R(
+                    pos_0.unsqueeze(0), goal_0.unsqueeze(0)
+                )[0]   # (N, 3, 3)
+                R_T    = R_0.transpose(-1, -2)
+                P_free = act_lat[t].reshape(N, K_free, 3)
+                P_1    = torch.bmm(R_0, vel_0.unsqueeze(-1)).reshape(N, 3) * (h / (K - 1))
+                P_0_   = torch.zeros_like(P_1)
+                full_c = torch.cat([P_0_.unsqueeze(1), P_1.unsqueeze(1), P_free], dim=1)
+                window_refs = []
+                for j in range(n_substeps):
+                    tau_j = (j + 1) / n_substeps
+                    dp_g, v_g, a_g = eval_bezier_full(full_c.unsqueeze(0), tau_j, h)
+                    dp_g = dp_g.squeeze(0); v_g = v_g.squeeze(0); a_g = a_g.squeeze(0)
+                    dp_w = torch.bmm(R_T, dp_g.unsqueeze(-1)).squeeze(-1)
+                    v_w  = torch.bmm(R_T, v_g.unsqueeze(-1)).squeeze(-1)
+                    a_w  = torch.bmm(R_T, a_g.unsqueeze(-1)).squeeze(-1)
+                    window_refs.append(torch.cat([pos_0 + dp_w, v_w, a_w], dim=-1))  # (N,9)
+
+            ref_9d = window_refs[sub]  # (N, 9)
+            act_flat = ref_9d.unsqueeze(0).expand(E, -1, -1).reshape(E, N * 9)
+            env_raw.step(act_flat)
+            new_obs = env_raw.get_per_drone_obs()
+
+            # Store free ctrl_pts as BC supervision target.
+            buffer.add(per_drone_obs[:1], act_lat[t : t + 1])   # (1, N, K_free*3)
+            per_drone_obs = new_obs
+
+        replayed += 1
+        print(f"  [replay] {traj_file.name}  T={T}", flush=True)
+
+    print(f"[traj_replay] replayed {replayed} trajectories", flush=True)
+    return replayed
 
 def action_to_latent(action: torch.Tensor, clip: float) -> torch.Tensor:
     """Map a tanh-squashed action in ``[-1, 1]^A`` to the unconstrained atanh
@@ -894,12 +1274,27 @@ def run_expert_test(
             episode_start_step[ids] = step
 
         log_this_step = debug_logger is not None and log_every > 0 and step % log_every == 0
-        action = expert_action(
-            env, expert,
-            debug_logger=debug_logger if log_this_step else None,
-            debug_step=step,
-        )
-        _, reward, terminated, truncated, _ = env.step(action)
+        try:
+            action, _ = expert_action(
+                env, expert,
+                debug_logger=debug_logger if log_this_step else None,
+                debug_step=step,
+            )
+        except Exception:
+            print(f"[expert_test] expert_action failed before env.step at step={step}", flush=True)
+            traceback.print_exc()
+            raise
+        try:
+            _, reward, terminated, truncated, _ = env.step(action)
+        except Exception:
+            action_shape = tuple(action.shape) if isinstance(action, torch.Tensor) else None
+            print(
+                f"[expert_test] env.step failed at step={step} "
+                f"action_type={type(action).__name__} action_shape={action_shape}",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise
         episode_returns += reward
 
         st = env.get_world_states()
@@ -1125,17 +1520,31 @@ def main():
     # bind ``ts`` to the env step (sim.dt * decimation) so every env step the
     # planner emits one sample of the current Bezier, and leave ``h`` at its
     # paper default so a full QP solve only fires every ``h / ts`` env steps.
-    expert = DMPCExpert(
-        num_drones=N,
-        num_envs=E,
-        params=DMPCParams(
-            pmin=env_raw.cfg.pos_min,
-            pmax=env_raw.cfg.pos_max,
-            rmin=env_raw.cfg.rmin,
-            ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
-        ),
-        device=device,
-    )
+    if args_cli.gpu_admm:
+        expert = GPUDMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_raw.cfg.pos_min,
+                pmax=env_raw.cfg.pos_max,
+                rmin=env_raw.cfg.rmin,
+                ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
+                max_envs=E, admm_iters=args_cli.admm_iters
+            ),
+            device=device,
+        )
+    else:
+        expert = DMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_raw.cfg.pos_min,
+                pmax=env_raw.cfg.pos_max,
+                rmin=env_raw.cfg.rmin,
+                ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
+            ),
+            device=device,
+        )
 
     dmpc_logger = (
         DmpcExpertLogger(args_cli.dmpc_log_path, env_raw, expert)
@@ -1177,7 +1586,7 @@ def main():
 
     policy = SharedDronePolicy(
         per_drone_obs_dim=P,
-        per_drone_action_dim=A,
+        per_drone_action_dim=A_pol,
         hidden_dims=args_cli.hidden_dims,
         emb_dim=args_cli.emb_dim,
         sample_steps=args_cli.sample_steps,
@@ -1188,7 +1597,7 @@ def main():
         print(f"[online_bc_dmpc] loaded checkpoint from {args_cli.resume}")
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args_cli.lr)
 
-    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A, device)
+    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A_pol, device)
 
     if hasattr(env_raw, "_last_reset_env_ids"):
         env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
@@ -1227,7 +1636,7 @@ def main():
         )
         # Re-sync env state after replay.
         env.reset()
-        expert.reset()
+        expert.reset(obstacle_info=env_raw.get_obstacle_info())
         if hasattr(env_raw, "_last_reset_env_ids"):
             env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
         last_episode_length_buf = env_raw.episode_length_buf.clone()
@@ -1263,7 +1672,7 @@ def main():
                         replay_pool.load_next(_rid, env_raw, n_substeps=n_substeps,
                                               h=h_window)
                         env_raw._reset_idx(torch.tensor([_rid], device=device))
-                        expert.reset(torch.tensor([_rid], device=device))
+                        expert.reset(env_ids=torch.tensor([_rid], device=device), obstacle_info=env_raw.get_obstacle_info())
                         ep_buf.clear(torch.tensor([_rid], device=device))
                         if traj_recorder is not None:
                             traj_recorder.clear(torch.tensor([_rid], device=device))
@@ -1342,7 +1751,7 @@ def main():
                         dtype=torch.long, device=device,
                     )
                     if unexpected.numel() > 0:
-                        expert.reset(unexpected)
+                        expert.reset(env_ids=unexpected)
                         ep_buf.clear(unexpected)
                         if traj_recorder is not None:
                             traj_recorder.clear(unexpected)
@@ -1375,7 +1784,7 @@ def main():
                             replay_pool.on_episode_done(
                                 _eid, env_raw, n_substeps=n_substeps, h=h_window,
                             )
-                            expert.reset(torch.tensor([_eid], device=device))
+                            expert.reset(env_ids=torch.tensor([_eid], device=device))
                             ep_buf.clear(torch.tensor([_eid], device=device))
                             if traj_recorder is not None:
                                 traj_recorder.clear(torch.tensor([_eid], device=device))
