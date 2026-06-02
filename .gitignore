@@ -26,3 +26,5 @@ matlab/data/
 *.pyc
 
 *.etli
+
+*.npz

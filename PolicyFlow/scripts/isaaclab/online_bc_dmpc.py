@@ -89,8 +89,6 @@ parser.add_argument("--dmpc_log_every", type=int, default=1,
 # GPU ADMM
 parser.add_argument("--gpu_admm", action="store_true", default=False,
                     help="Use batched GPU ADMM instead of CPU OSQP threads.")
-parser.add_argument("--admm_iters", type=int, default=50,
-                    help="ADMM iterations per window (default 50).")
 
 parser.add_argument("--traj_save_dir", type=str, default=None,
                     help="Directory to save successful DMPC expert trajectories. "
@@ -1529,7 +1527,7 @@ def main():
                 pmax=env_raw.cfg.pos_max,
                 rmin=env_raw.cfg.rmin,
                 ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
-                max_envs=E, admm_iters=args_cli.admm_iters
+                max_envs=E,
             ),
             device=device,
         )

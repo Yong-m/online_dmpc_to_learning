@@ -99,8 +99,6 @@ parser.add_argument("--no_terminate_on_bounds", action="store_true", default=Fal
 # GPU ADMM
 parser.add_argument("--gpu_admm", action="store_true", default=False,
                     help="Use batched GPU ADMM instead of CPU OSQP threads.")
-parser.add_argument("--admm_iters", type=int, default=50,
-                    help="ADMM iterations per window (default 50).")
 
 # Video recording
 parser.add_argument("--video", action="store_true", default=False,
@@ -489,12 +487,15 @@ def main() -> None:
                 pmax=env_cfg.pos_max,
                 rmin=env_cfg.rmin,
                 ts=env_cfg.sim.dt * env_cfg.decimation,
-                max_envs=E, admm_iters=args_cli.admm_iters
+                max_envs=E,
             ),
             device=device,
         )
+        coll_slots = expert.p.admm_collision_slots
+        admm_iters = expert.p.admm_iters
+        coll_mode = f"soft_slots:{coll_slots}" if coll_slots > 0 else "penalty"
         print(f"[collect_dmpc_data] GPU ADMM-based expert"
-              f"(max_B={E*N}  iters={args_cli.admm_iters}  alpha=1.6  coll=penalty)")
+              f"(max_B={E*N}  iters={admm_iters}  alpha=1.6  coll={coll_mode})")
         
     else:
         expert = DMPCExpert(
@@ -531,7 +532,7 @@ def main() -> None:
 
     # ── initial reset ─────────────────────────────────────────────────────────
     env_gym.reset(seed=args_cli.seed)
-    expert.reset()
+    expert.reset(obstacle_info=env.get_obstacle_info())
     if hasattr(env, "_last_reset_env_ids"):
         env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
@@ -569,7 +570,7 @@ def main() -> None:
             rewound = env.episode_length_buf < last_ep_len
             if rewound.any():
                 rw_ids = rewound.nonzero(as_tuple=False).flatten()
-                expert.reset(rw_ids)
+                expert.reset(env_ids=rw_ids, obstacle_info=env.get_obstacle_info())
                 for e in rw_ids.tolist():
                     collectors[e].reset()
                     env_step_cnt[e] = 0
@@ -670,7 +671,7 @@ def main() -> None:
                     dtype=torch.long, device=device,
                 )
                 if unexpected.numel() > 0:
-                    expert.reset(unexpected)
+                    expert.reset(env_ids=unexpected, obstacle_info=env.get_obstacle_info())
                     for e in unexpected.tolist():
                         collectors[e].reset()
                         env_step_cnt[e] = 0
@@ -680,7 +681,7 @@ def main() -> None:
             # ── episode done: save per-agent and reset ───────────────────────
             if done.any():
                 done_ids = done.nonzero(as_tuple=False).flatten()
-                expert.reset(done_ids)
+                expert.reset(env_ids=done_ids, obstacle_info=env.get_obstacle_info())
                 for e in done_ids.tolist():
                     origin = env._terrain.env_origins[e].cpu()
                     ip = ep_init_pos[e].cpu().numpy().astype(np.float32).copy()

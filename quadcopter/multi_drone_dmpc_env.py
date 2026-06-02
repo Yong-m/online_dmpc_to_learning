@@ -85,7 +85,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
-    show_mpc_solution_vis: bool = True
+    show_mpc_solution_vis: bool = False
     debug_short_horizon_steps: int = 3
     randomize_episode_start: bool = False
     terminate_on_bounds: bool = True
@@ -99,10 +99,10 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # Static obstacles
     enable_static_obstacles: bool = True
     randomize_static_obstacles: bool = False
-    show_static_obstacle_ellipsoid_vis: bool = True
+    show_static_obstacle_ellipsoid_vis: bool = False
     num_static_obstacles: int = 2
     static_obstacle_radius: float = 0.15
-    static_obstacle_size: tuple[float, float, float] = (0.25, 1.25, 2.5)
+    static_obstacle_size: tuple[float, float, float] = (0.25, 1.225, 2.5)
     static_obstacle_ellipsoid_margin: float = 0.10
     static_obstacle_ellipsoid_mode: str = "outer_single"  # "outer_single" or "grid"
     static_obstacle_outer_ellipsoid_axes: tuple[float, float, float] = (0.4, 1.35, 10.0)

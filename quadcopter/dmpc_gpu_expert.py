@@ -13,27 +13,19 @@ SOLVED_INACCURATE = 2
 MAX_ITER = -2
 NONFINITE = -3
 
+ADMM_SOLVED = SOLVED
+ADMM_SOLVED_INACCURATE = SOLVED_INACCURATE
+ADMM_MAX_ITER = MAX_ITER
+ADMM_NONFINITE = NONFINITE
+
 class BatchedGPUDMPC:
-    """Batched ADMM solver for the constant-structure DMPC QP.
+    """Batched ADMM solver with optional fixed soft-collision slots.
 
-    All (env, agent) pairs without active collision constraints share the same
-    constraint matrix  A_fixed = [A_cont ; M_deriv_0[0..d] ; M_pos_hor ; M_acc_hor]
-    and (in the free-cost mode) the same Hessian H.  The KKT factor L from
-    H + rho*A^T*A  is computed once at init; every GPU solve then needs only
-    two batched triangular solves plus element-wise clamp/axpy ops—all on GPU.
-
-    Warm-start tensors (z, y) are maintained per (env, agent) across replanning
-    windows, stored at flat index  e * N_agents + i  in pre-allocated buffers.
-
-    Agents with active collision constraints must be handled by the caller
-    (e.g., fall back to CPU OSQP).
-
-    ADMM iteration (OSQP formulation):
-        x-update:  (H + rho A^T A) x  =  -q + A^T (rho z - y)
-        z-update:  z  =  clip( A x + y/rho,  l,  u )
-        y-update:  y  =  y + rho (A x - z)
-
-    Equality constraints are handled as  l_i = u_i = b_eq_i  (box of width 0).
+    Decision variable is ``x = [U]`` when ``max_collision_slots == 0`` and
+    ``x = [U; eps]`` otherwise.  Soft collision rows use the same sign
+    convention as the CPU OSQP path: ``A_col U - eps >= rhs`` with ``eps <= 0``.
+    Dynamic collision row coefficients make the KKT matrix batch-dependent, so
+    this solver uses batched Cholesky each call instead of one fixed factor.
     """
 
     def __init__(
@@ -56,17 +48,22 @@ class BatchedGPUDMPC:
         reg: float = 1e-6,
         eps_abs: float = 1e-3,
         eps_rel: float = 1e-3,
+        max_collision_slots: int = 0,
+        quad_coll: float = 1.0,
+        lin_coll: float = -1.0e3,
     ) -> None:
         self.device = torch.device(device)
-        self.n_bez = n_bez
-        self.rho = rho
-        self.admm_iters = admm_iters
-        self.alpha = alpha  # OSQP-style over-relaxation (1.6 is OSQP default)
-        self.max_B = max_B
+        self.n_bez = int(n_bez)
+        self.max_collision_slots = max(0, int(max_collision_slots))
+        self.n_var = self.n_bez + self.max_collision_slots
+        self.rho = float(rho)
+        self.admm_iters = int(admm_iters)
+        self.alpha = float(alpha)
+        self.max_B = int(max_B)
+        self.reg = float(reg)
         self.eps_abs = float(eps_abs)
         self.eps_rel = float(eps_rel)
 
-        # ── Partition constraint rows ─────────────────────────────────────
         n_eq_cont = A_cont.shape[0]
         A_init_np = [M.astype(np.float64) for M in M_deriv_0]
         n_eq_init = sum(M.shape[0] for M in A_init_np)
@@ -75,35 +72,44 @@ class BatchedGPUDMPC:
         self.n_eq = n_eq_cont + n_eq_init
 
         A_ineq_np = np.vstack([M_pos_hor, M_acc_hor]).astype(np.float64)
-        self.n_ineq = A_ineq_np.shape[0]
-        self.m = self.n_eq + self.n_ineq
+        self.n_ineq_box = A_ineq_np.shape[0]
+        self.n_slack_rows = self.max_collision_slots
+        self.n_fixed = self.n_eq + self.n_ineq_box + self.n_slack_rows
+        self.n_coll = self.max_collision_slots
+        self.m = self.n_fixed + self.n_coll
 
-        # ── Constant A_fixed (m, n_bez) ───────────────────────────────────
-        A_fixed_np = np.vstack(
-            [A_cont.astype(np.float64)] + A_init_np + [A_ineq_np]
-        )
+        A_fixed_u = np.vstack([A_cont.astype(np.float64)] + A_init_np + [A_ineq_np])
+        # Allocate the full ADMM constraint matrix, including dynamic soft-collision
+        # rows.  The fixed rows are populated here; collision rows are filled per
+        # solve() call from A_col_batch.
+        A_fixed_np = np.zeros((self.m, self.n_var), dtype=np.float64)
+        A_fixed_np[: A_fixed_u.shape[0], : self.n_bez] = A_fixed_u
+        if self.max_collision_slots > 0:
+            row0 = self.n_eq + self.n_ineq_box
+            A_fixed_np[row0 : row0 + self.max_collision_slots, self.n_bez :] = np.eye(self.max_collision_slots)
 
-        # ── KKT = H + rho * A^T A, Cholesky-factored in float64 ──────────
-        KKT_np = H_bez.astype(np.float64) + rho * (A_fixed_np.T @ A_fixed_np)
-        KKT_np = 0.5 * (KKT_np + KKT_np.T) + reg * np.eye(n_bez)
-        KKT_t = torch.from_numpy(KKT_np).to(dtype=torch.float64, device=self.device)
-        self._L = torch.linalg.cholesky(KKT_t).float()  # (n, n), lower-triangular float32
-        self._L_T = self._L.T.contiguous()
+        H_np = np.zeros((self.n_var, self.n_var), dtype=np.float64)
+        H_np[: self.n_bez, : self.n_bez] = H_bez.astype(np.float64)
+        if self.max_collision_slots > 0:
+            H_np[self.n_bez :, self.n_bez :] = 2.0 * float(quad_coll) * np.eye(self.max_collision_slots)
+        self._H = torch.from_numpy(0.5 * (H_np + H_np.T)).float().to(self.device)
+        self._A_fixed = torch.from_numpy(A_fixed_np).float().to(self.device)
 
-        self._A = torch.from_numpy(A_fixed_np).float().to(self.device)  # (m, n)
+        q_slack = np.zeros(self.n_var, dtype=np.float32)
+        if self.max_collision_slots > 0:
+            q_slack[self.n_bez :] = float(lin_coll)
+        self._q_slack = torch.from_numpy(q_slack).to(self.device)
 
-        # ── Constant inequality bounds ────────────────────────────────────
         l_ineq = np.concatenate([pmin_vec, amin_vec]).astype(np.float32)
         u_ineq = np.concatenate([pmax_vec, amax_vec]).astype(np.float32)
         self._l_ineq = torch.from_numpy(l_ineq).to(self.device)
         self._u_ineq = torch.from_numpy(u_ineq).to(self.device)
 
-        # ── Warm-start buffers (max_B, m) ─────────────────────────────────
         self._z = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
         self._y = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
+        self._last_admm_stats: dict[str, np.ndarray] = {}
 
     def reset_warm_start(self, flat_indices: torch.Tensor | None = None) -> None:
-        """Zero warm-start for the given flat indices (all if None)."""
         if flat_indices is None:
             self._z.zero_()
             self._y.zero_()
@@ -115,57 +121,70 @@ class BatchedGPUDMPC:
     @torch.no_grad()
     def solve(
         self,
-        q_batch: torch.Tensor,       # (B, n_bez) float32 on device
-        b_eq_batch: torch.Tensor,    # (B, n_eq) float32 on device
-        flat_indices: torch.Tensor,  # (B,) int64
+        q_batch: torch.Tensor,
+        b_eq_batch: torch.Tensor,
+        flat_indices: torch.Tensor,
+        A_col_batch: torch.Tensor | None = None,
+        l_col_batch: torch.Tensor | None = None,
+        active_col_batch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Warm-started batched ADMM solve.
-
-        Solves, for each batch element b,
-
-            minimize    0.5 x_b^T H x_b + q_b^T x_b
-            subject to  l_b <= A x_b <= u_b,
-
-        where equality rows use l_b = u_b = b_eq_b and inequality rows are the
-        fixed position/acceleration boxes. ``flat_indices`` selects the warm
-        start slot for each (env, agent) problem.
-
-        Returns:
-            x: primal Bezier control-point solutions, shape (B, n_bez).
-            status: per-problem integer code: SOLVED, SOLVED_INACCURATE,
-                    MAX_ITER, or NONFINITE.
-        """
         B = q_batch.shape[0]
         rho = self.rho
-        A = self._A       # (m, n)
-        L = self._L       # (n, n) lower-triangular
-        L_T = self._L_T   # (n, n) upper-triangular
+        alpha = self.alpha
+        inv_rho = 1.0 / rho
+        one_minus_alpha = 1.0 - alpha
 
-        # Per-problem bounds (B, m): equality rows have l=u=b_eq.
+        A = self._A_fixed.unsqueeze(0).expand(B, -1, -1).clone()
         l = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
         u = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
         l[:, : self.n_eq] = b_eq_batch
         u[:, : self.n_eq] = b_eq_batch
-        l[:, self.n_eq :].copy_(self._l_ineq)
-        u[:, self.n_eq :].copy_(self._u_ineq)
+        box0 = self.n_eq
+        box1 = box0 + self.n_ineq_box
+        l[:, box0:box1].copy_(self._l_ineq)
+        u[:, box0:box1].copy_(self._u_ineq)
+        if self.max_collision_slots > 0:
+            slack0 = box1
+            slack1 = slack0 + self.max_collision_slots
+            l[:, slack0:slack1] = -float("inf")
+            u[:, slack0:slack1] = 0.0
+            coll0 = self.n_fixed
+            coll1 = coll0 + self.max_collision_slots
+            l[:, coll0:coll1] = -float("inf")
+            u[:, coll0:coll1] = float("inf")
+            if A_col_batch is not None and l_col_batch is not None and active_col_batch is not None:
+                S = min(self.max_collision_slots, A_col_batch.shape[1])
+                A[:, coll0 : coll0 + S, : self.n_bez] = A_col_batch[:, :S]
+                eye = torch.eye(self.max_collision_slots, device=self.device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
+                A[:, coll0:coll1, self.n_bez:] = -eye
+                active = active_col_batch[:, :S]
+                l[:, coll0 : coll0 + S] = torch.where(active, l_col_batch[:, :S], l[:, coll0 : coll0 + S])
+        q = torch.zeros(B, self.n_var, dtype=torch.float32, device=self.device)
+        q[:, : self.n_bez] = q_batch
+        q += self._q_slack
 
-        z = self._z[flat_indices].clone()  # (B, m)
+        z = self._z[flat_indices].clone()
         y = self._y[flat_indices].clone()
         z_prev = z.clone()
-        inv_rho = 1.0 / rho
-        alpha = self.alpha
-        one_minus_alpha = 1.0 - alpha
-        x = torch.zeros(B, self.n_bez, dtype=torch.float32, device=self.device)
-        Ax = x @ A.T
+        x = torch.zeros(B, self.n_var, dtype=torch.float32, device=self.device)
+        Ax = torch.bmm(A, x.unsqueeze(-1)).squeeze(-1)
+
+        At = A.transpose(1, 2).contiguous()
+        KKT = self._H.unsqueeze(0) + rho * torch.bmm(At, A)
+        eye = torch.eye(self.n_var, dtype=torch.float32, device=self.device).unsqueeze(0)
+        KKT = 0.5 * (KKT + KKT.transpose(1, 2)) + self.reg * eye
+        try:
+            L = torch.linalg.cholesky(KKT)
+        except RuntimeError:
+            jitter = 10.0 * self.reg * eye
+            L = torch.linalg.cholesky(KKT + jitter)
+        L_T = L.transpose(1, 2).contiguous()
 
         for _ in range(self.admm_iters):
-            # x-update: KKT x = -q + A^T(rho*z - y)  →  two triangular solves.
-            rhs = (-q_batch + (rho * z - y) @ A).T.contiguous()  # (n, B)
-            fwd = torch.linalg.solve_triangular(L, rhs, upper=False)  # (n, B)
-            x = torch.linalg.solve_triangular(L_T, fwd, upper=True).T  # (B, n)
-
-            # Over-relaxed z-update (Boyd 2011, Eq. 3.21-3.23 with unscaled dual y).
-            Ax = x @ A.T
+            rhs = -q + torch.bmm(At, (rho * z - y).unsqueeze(-1)).squeeze(-1)
+            fwd = torch.linalg.solve_triangular(L, rhs.unsqueeze(-1), upper=False)
+            x = torch.linalg.solve_triangular(L_T, fwd, upper=True).squeeze(-1)
+            Ax = torch.bmm(A, x.unsqueeze(-1)).squeeze(-1)
             z_prev = z
             z_hat = alpha * Ax + one_minus_alpha * z_prev
             z = torch.clamp(z_hat + y * inv_rho, l, u)
@@ -175,31 +194,38 @@ class BatchedGPUDMPC:
         self._y[flat_indices] = y
 
         pri_vec = Ax - z
-        dual_vec = rho * ((z - z_prev) @ A)
-        pri_res = torch.linalg.vector_norm(pri_vec, ord=float('inf'), dim=1)
-        dual_res = torch.linalg.vector_norm(dual_vec, ord=float('inf'), dim=1)
-
+        dual_vec = rho * torch.bmm(At, (z - z_prev).unsqueeze(-1)).squeeze(-1)
+        pri_res = torch.linalg.vector_norm(pri_vec, ord=float("inf"), dim=1)
+        dual_res = torch.linalg.vector_norm(dual_vec, ord=float("inf"), dim=1)
         ax_norm = torch.maximum(
-            torch.linalg.vector_norm(Ax, ord=float('inf'), dim=1),
-            torch.linalg.vector_norm(z, ord=float('inf'), dim=1),
+            torch.linalg.vector_norm(Ax, ord=float("inf"), dim=1),
+            torch.linalg.vector_norm(z, ord=float("inf"), dim=1),
         )
-        q_norm = torch.linalg.vector_norm(q_batch, ord=float('inf'), dim=1)
-        aty_norm = torch.linalg.vector_norm(y @ A, ord=float('inf'), dim=1)
+        q_norm = torch.linalg.vector_norm(q, ord=float("inf"), dim=1)
+        aty_norm = torch.linalg.vector_norm(torch.bmm(At, y.unsqueeze(-1)).squeeze(-1), ord=float("inf"), dim=1)
         pri_tol = self.eps_abs + self.eps_rel * ax_norm
         dual_tol = self.eps_abs + self.eps_rel * torch.maximum(q_norm, aty_norm)
-
-        finite = (
-            torch.isfinite(x).all(dim=1)
-            & torch.isfinite(pri_res)
-            & torch.isfinite(dual_res)
-        )
+        finite = torch.isfinite(x).all(dim=1) & torch.isfinite(pri_res) & torch.isfinite(dual_res)
         solved = finite & (pri_res <= pri_tol) & (dual_res <= dual_tol)
         inaccurate = finite & (~solved) & (pri_res <= 10.0 * pri_tol) & (dual_res <= 10.0 * dual_tol)
-        status = torch.full((B,), MAX_ITER, dtype=torch.int32, device=self.device)
-        status = torch.where(inaccurate, torch.full_like(status, SOLVED_INACCURATE), status)
-        status = torch.where(solved, torch.full_like(status, SOLVED), status)
-        status = torch.where(finite, status, torch.full_like(status, NONFINITE))
-        return x, status
+        status = torch.full((B,), ADMM_MAX_ITER, dtype=torch.int32, device=self.device)
+        status = torch.where(inaccurate, torch.full_like(status, ADMM_SOLVED_INACCURATE), status)
+        status = torch.where(solved, torch.full_like(status, ADMM_SOLVED), status)
+        status = torch.where(finite, status, torch.full_like(status, ADMM_NONFINITE))
+
+        pri_ratio = pri_res / torch.clamp(pri_tol, min=1.0e-12)
+        dual_ratio = dual_res / torch.clamp(dual_tol, min=1.0e-12)
+        self._last_admm_stats = {
+            "pri_res": pri_res.detach().cpu().numpy(),
+            "dual_res": dual_res.detach().cpu().numpy(),
+            "pri_tol": pri_tol.detach().cpu().numpy(),
+            "dual_tol": dual_tol.detach().cpu().numpy(),
+            "pri_ratio": pri_ratio.detach().cpu().numpy(),
+            "dual_ratio": dual_ratio.detach().cpu().numpy(),
+            "status": status.detach().cpu().numpy(),
+        }
+        return x[:, : self.n_bez], status
+
 
 
 
@@ -264,7 +290,10 @@ class GPUDMPCExpert(DMPCExpert):
                 device=device,
                 eps_abs=self.p.admm_eps_abs,
                 eps_rel=self.p.admm_eps_rel,
-                reg=self.p.reg
+                reg=self.p.reg,
+                max_collision_slots=self.p.admm_collision_slots,
+                quad_coll=self.p.quad_coll,
+                lin_coll=self.p.lin_coll,
             )
 
         self._gpu_solvers: dict[str, BatchedGPUDMPC] = {
@@ -548,6 +577,13 @@ class GPUDMPCExpert(DMPCExpert):
         # selected after collision/emergency mode detection below.
         residual = x0_t @ self._t_Fx.T - goal_t.repeat(1, K)   # (B, 3K)
         q_penalty_t = torch.zeros(B, n_bez, dtype=torch.float32, device=dev)
+        soft_slots = max(0, int(self.p.admm_collision_slots))
+        use_soft_slots = soft_slots > 0
+        A_col_np = np.zeros((B, soft_slots, n_bez), dtype=np.float32) if use_soft_slots else None
+        l_col_np = np.zeros((B, soft_slots), dtype=np.float32) if use_soft_slots else None
+        active_col_np = np.zeros((B, soft_slots), dtype=bool) if use_soft_slots else None
+        soft_slot_counts = np.zeros(B, dtype=np.int32)
+        soft_slot_overflow = 0
 
         # C2 — collision detection: own[k] vs nbr[k+1] for k in [0, K-1)
         # own_t[:,:-1]: (B,K-1,3) → (B,K-1,1,3)
@@ -611,8 +647,24 @@ class GPUDMPCExpert(DMPCExpert):
                                 torch.clamp(rhs - pred, min=0.0),
                                 torch.zeros_like(pred))
 
-            pg = -2.0 * qc * torch.einsum('bn,bnm->bm', viol, dg_dU)  # (B_c, n_bez)
-            q_penalty_t[coll_idx] += pg
+            if use_soft_slots:
+                coll_idx_np = coll_idx.cpu().numpy()
+                dg_np = dg_dU.detach().cpu().numpy().astype(np.float32)
+                rhs_np = rhs.detach().cpu().numpy().astype(np.float32)
+                active_np = active.detach().cpu().numpy()
+                for rr, b_local in enumerate(coll_idx_np):
+                    for jj in np.nonzero(active_np[rr])[0]:
+                        slot = int(soft_slot_counts[b_local])
+                        if slot >= soft_slots:
+                            soft_slot_overflow += 1
+                            continue
+                        A_col_np[b_local, slot] = dg_np[rr, jj]
+                        l_col_np[b_local, slot] = rhs_np[rr, jj]
+                        active_col_np[b_local, slot] = True
+                        soft_slot_counts[b_local] += 1
+            else:
+                pg = -2.0 * qc * torch.einsum('bn,bnm->bm', viol, dg_dU)  # (B_c, n_bez)
+                q_penalty_t[coll_idx] += pg
 
         # C4 — static-obstacle penalty. Unlike inter-agent CA, static obstacle
         # penalties are added for every predicted guard violation timestep.
@@ -657,10 +709,24 @@ class GPUDMPCExpert(DMPCExpert):
                 rhs_obs = (ut * obs_pos_t[b_idx, o_idx, :]).sum(-1) + obs_rmin_t[b_idx, o_idx]
 
                 U_prev_obs = torch.from_numpy(U_prev_b.astype(np.float32)).to(dev)
-                pred_obs = torch.einsum('rm,rm->r', dg_obs, U_prev_obs[b_idx])
-                viol_obs = torch.clamp(rhs_obs - pred_obs, min=0.0)
-                pg_obs = -2.0 * qc * viol_obs.unsqueeze(-1) * dg_obs
-                q_penalty_t.index_add_(0, b_idx, pg_obs)
+                if use_soft_slots:
+                    b_np = b_idx.cpu().numpy()
+                    dg_np = dg_obs.detach().cpu().numpy().astype(np.float32)
+                    rhs_np = rhs_obs.detach().cpu().numpy().astype(np.float32)
+                    for rr, b_local in enumerate(b_np):
+                        slot = int(soft_slot_counts[b_local])
+                        if slot >= soft_slots:
+                            soft_slot_overflow += 1
+                            continue
+                        A_col_np[b_local, slot] = dg_np[rr]
+                        l_col_np[b_local, slot] = rhs_np[rr]
+                        active_col_np[b_local, slot] = True
+                        soft_slot_counts[b_local] += 1
+                else:
+                    pred_obs = torch.einsum('rm,rm->r', dg_obs, U_prev_obs[b_idx])
+                    viol_obs = torch.clamp(rhs_obs - pred_obs, min=0.0)
+                    pg_obs = -2.0 * qc * viol_obs.unsqueeze(-1) * dg_obs
+                    q_penalty_t.index_add_(0, b_idx, pg_obs)
 
         has_coll_np = has_coll.cpu().numpy()
         mode_np = np.where(emergency_active, 2, np.where(has_coll_np | static_has_coll_np, 1, 0)).astype(np.int8)
@@ -691,15 +757,41 @@ class GPUDMPCExpert(DMPCExpert):
         idx_t = torch.from_numpy(idx_np).to(dev)
         U_raw = np.empty((B, n_bez), dtype=np.float32)
         solve_status = np.full(B, MAX_ITER, dtype=np.int32)
+        admm_diag = {
+            "pri_res": np.full(B, np.nan, dtype=np.float32),
+            "dual_res": np.full(B, np.nan, dtype=np.float32),
+            "pri_tol": np.full(B, np.nan, dtype=np.float32),
+            "dual_tol": np.full(B, np.nan, dtype=np.float32),
+            "pri_ratio": np.full(B, np.nan, dtype=np.float32),
+            "dual_ratio": np.full(B, np.nan, dtype=np.float32),
+        }
+        status_by_mode: dict[str, tuple[int, int, int, int]] = {}
         for mode_code, solver_name in ((0, "free"), (1, "obs"), (2, "emergency")):
             rows_np = np.nonzero(mode_np == mode_code)[0]
             if rows_np.size == 0:
                 continue
             rows_t = torch.from_numpy(rows_np.astype(np.int64)).to(dev)
             solver = self._gpu_solvers[solver_name]
-            U_t, solve_status_t = solver.solve(q_t[rows_t], beq_t[rows_t], idx_t[rows_t])
+            if use_soft_slots:
+                A_col_t = torch.from_numpy(A_col_np[rows_np]).to(dev)
+                l_col_t = torch.from_numpy(l_col_np[rows_np]).to(dev)
+                active_col_t = torch.from_numpy(active_col_np[rows_np]).to(dev)
+                U_t, solve_status_t = solver.solve(q_t[rows_t], beq_t[rows_t], idx_t[rows_t], A_col_t, l_col_t, active_col_t)
+            else:
+                U_t, solve_status_t = solver.solve(q_t[rows_t], beq_t[rows_t], idx_t[rows_t])
             U_raw[rows_np] = U_t.cpu().numpy()
             solve_status[rows_np] = solve_status_t.cpu().numpy().astype(np.int32)
+            stats = getattr(solver, "_last_admm_stats", {})
+            for key in admm_diag:
+                if key in stats:
+                    admm_diag[key][rows_np] = np.asarray(stats[key], dtype=np.float32)
+            status_mode = solve_status[rows_np]
+            status_by_mode[solver_name] = (
+                int((status_mode == SOLVED).sum()),
+                int((status_mode == SOLVED_INACCURATE).sum()),
+                int((status_mode == MAX_ITER).sum()),
+                int((status_mode == NONFINITE).sum()),
+            )
         _t_gpu = time.perf_counter() - _t3
 
         fallback_mask = (solve_status < 0) | (~np.isfinite(U_raw).all(axis=1))
@@ -784,15 +876,46 @@ class GPUDMPCExpert(DMPCExpert):
             n_fail = int((solve_status < 0).sum())
             n_total = n_fail + n_solved
             n_inaccurate = int((solve_status == SOLVED_INACCURATE).sum())
+            n_soft_rows = int(soft_slot_counts.sum()) if use_soft_slots else 0
             n_fb_shift = int((fallback_type == "shift_previous").sum())
             n_fb_brake = int((fallback_type == "brake_hover").sum())
             n_fb_other = int(fallback_mask.sum()) - n_fb_shift - n_fb_brake
+            n_max_iter = int((solve_status == MAX_ITER).sum())
+            n_nonfinite = int((solve_status == NONFINITE).sum())
+            slot_max = int(soft_slot_counts.max()) if use_soft_slots and soft_slot_counts.size else 0
+            slot_mean = float(soft_slot_counts.mean()) if use_soft_slots and soft_slot_counts.size else 0.0
+
+            def _nan_stats(vals: np.ndarray) -> tuple[float, float, float]:
+                finite_vals = vals[np.isfinite(vals)]
+                if finite_vals.size == 0:
+                    return float("nan"), float("nan"), float("nan")
+                return float(finite_vals.min()), float(finite_vals.mean()), float(finite_vals.max())
+
+            pri_r_min, pri_r_mean, pri_r_max = _nan_stats(admm_diag["pri_ratio"])
+            dual_r_min, dual_r_mean, dual_r_max = _nan_stats(admm_diag["dual_ratio"])
+            pri_min, pri_mean, pri_max = _nan_stats(admm_diag["pri_res"])
+            dual_min, dual_mean, dual_max = _nan_stats(admm_diag["dual_res"])
+            tol_p_min, tol_p_mean, tol_p_max = _nan_stats(admm_diag["pri_tol"])
+            tol_d_min, tol_d_mean, tol_d_max = _nan_stats(admm_diag["dual_tol"])
+            mode_status = "/".join(
+                f"{name}:s{vals[0]} i{vals[1]} m{vals[2]} n{vals[3]}"
+                for name, vals in status_by_mode.items()
+            )
             total  = (_t_init + _t_assemble + _t_q + _t_gpu + _t_extract) * 1e3
             print(
                 f"[DMPC gpu_admm] call={self._gpu_plan_calls}  B={B}  coll={n_coll}"
                 f"  mode=free:{n_free}/obs:{n_obs}/emg:{n_emerg}"
                 f"  solved={n_solved}/{n_total}  fail={n_fail}/{n_total}  inaccurate={n_inaccurate}/{n_total}"
+                f"  max_iter={n_max_iter}/{n_total}  nonfinite={n_nonfinite}/{n_total}"
+                f"  soft_slots={n_soft_rows}/{B * soft_slots if use_soft_slots else 0}  max={slot_max}  mean={slot_mean:.1f}  overflow={soft_slot_overflow}"
                 f"  fallback=shift:{n_fb_shift}/brake:{n_fb_brake}/other:{n_fb_other}"
+                f"  rho={self.p.rho:g}  alpha={self.p.alpha:g}  iters={self.p.admm_iters}"
+                f"  pri_ratio=min/mean/max:{pri_r_min:.2g}/{pri_r_mean:.2g}/{pri_r_max:.2g}"
+                f"  dual_ratio=min/mean/max:{dual_r_min:.2g}/{dual_r_mean:.2g}/{dual_r_max:.2g}"
+                f"  pri=min/mean/max:{pri_min:.2g}/{pri_mean:.2g}/{pri_max:.2g}"
+                f"  dual=min/mean/max:{dual_min:.2g}/{dual_mean:.2g}/{dual_max:.2g}"
+                f"  tol_p/tol_d_mean={tol_p_mean:.2g}/{tol_d_mean:.2g}"
+                f"  status_by_mode={mode_status}"
                 f"  init={_t_init*1e3:.1f}ms"
                 f"  assemble={_t_assemble*1e3:.1f}ms"
                 f"  q+coll={_t_q*1e3:.1f}ms"

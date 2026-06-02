@@ -185,14 +185,15 @@ class DMPCParams:
 
     # GPU ADMM parameters
     max_envs: int = 10
-    rho: float = 5.0
-    admm_iters: int = 400
-    alpha: float = 1.6
+    rho: float = 1.0
+    admm_iters: int = 100
+    alpha: float = 1.0
     reg: float = 1e-6
     admm_eps_abs: float = 1e-2
     admm_eps_rel: float = 1e-2
     admm_quad_coll: float = 1e3
-    enable_admm_fallback: bool = True
+    admm_collision_slots: int = 8 # 0 keeps penalty CA; >0 uses fixed-slot soft CA in GPU ADMM.
+    enable_admm_fallback: bool = False
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -327,7 +328,6 @@ def _build_state_propagator(A_d: np.ndarray, B_d: np.ndarray, K: int) -> tuple[n
         for j in range(k + 1):
             Lam[k * nx : (k + 1) * nx, j * nu : (j + 1) * nu] = A_pow[k - j] @ B_d
     return A0, Lam
-
 
 
 # ───────────────────────────────────────────────────────────────────────────
