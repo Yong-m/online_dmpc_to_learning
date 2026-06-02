@@ -185,13 +185,16 @@ class DMPCParams:
 
     # GPU ADMM parameters
     max_envs: int = 10
-    rho: float = 1.0
-    admm_iters: int = 100
+    rho: float = 1.5
+    admm_iters: int = 200
     alpha: float = 1.0
     reg: float = 1e-6
     admm_eps_abs: float = 1e-2
     admm_eps_rel: float = 1e-2
-    admm_quad_coll: float = 1e3
+    # Penalty-mode collision weight. In soft-slot mode, the slack cost uses
+    # admm_soft_quad_coll/admm_lin_coll below.
+    admm_quad_coll: float = 1.0
+    admm_lin_coll: float = -1.0e3
     admm_collision_slots: int = 8 # 0 keeps penalty CA; >0 uses fixed-slot soft CA in GPU ADMM.
     enable_admm_fallback: bool = False
 
@@ -1083,7 +1086,7 @@ class DMPCExpert:
         H = np.zeros((n_total, n_total))
         H[:n_bez, :n_bez] = H_bez_const
         if n_slack > 0:
-            H[n_bez:, n_bez:] = 2.0 * self.p.quad_coll * np.eye(n_slack)
+            H[n_bez:, n_bez:] = 2.0 * self.p.admm_quad_coll * np.eye(n_slack)
 
         # Linear term on U_bez:  2 G^T Q (Fx x0 - pd_stack)
         x0 = np.concatenate([pos_local, vel])
@@ -1093,7 +1096,7 @@ class DMPCExpert:
         q = np.zeros(n_total)
         q[:n_bez] = q_lin_bez
         if n_slack > 0:
-            q[n_bez:] = self.p.lin_coll
+            q[n_bez:] = self.p.admm_lin_coll
 
         # ── Equality constraints
         A_eq_rows = []

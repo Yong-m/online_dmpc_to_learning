@@ -611,29 +611,36 @@ def main() -> None:
                     K=bezier_k, h=h_window,
                 )  # (E_max, N, K-2, 3) on device
 
-                # Compute goal-aligned R for window-start envs.
+                # Batch GPU→CPU transfers once per window tensor, then slice on CPU.
                 R_goal_all = env._compute_goal_aligned_R(
                     states["pos_w"], states["goal_w"]
                 )  # (E, N, 3, 3)
+                obs_np = per_drone_obs.detach().cpu().numpy().astype(np.float32, copy=False)
+                pos_np = states["pos_w"].detach().cpu().numpy().astype(np.float32, copy=False)
+                vel_np = states["lin_vel_w"].detach().cpu().numpy().astype(np.float32, copy=False)
+                quat_np = states["quat_w"].detach().cpu().numpy().astype(np.float32, copy=False)
+                ang_np = states["ang_vel_b"].detach().cpu().numpy().astype(np.float32, copy=False)
+                goal_np = states["goal_w"].detach().cpu().numpy().astype(np.float32, copy=False)
+                R_goal_np = R_goal_all.reshape(E, N, 9).detach().cpu().numpy().astype(np.float32, copy=False)
+                free_ctrl_np = free_ctrl.detach().cpu().numpy().astype(np.float32, copy=False)
+                ref_pos_np = ref_pos_w.detach().cpu().numpy().astype(np.float32, copy=False)
+                ref_vel_np = ref_vel_w.detach().cpu().numpy().astype(np.float32, copy=False)
+                ref_acc_np = ref_acc_w.detach().cpu().numpy().astype(np.float32, copy=False)
 
                 for e in win_envs:
-                    obs_e      = per_drone_obs[e].cpu().numpy().astype(np.float32)
-                    R_goal_e   = R_goal_all[e].reshape(N, 9).cpu().numpy().astype(np.float32)
-                    fc_e       = free_ctrl[e].cpu().numpy().astype(np.float32)  # (N, K-2, 3)
-
                     collectors[e].begin_window(
-                        obs            = obs_e,
-                        pos_w          = states["pos_w"][e].cpu().numpy().astype(np.float32),
-                        vel_w          = states["lin_vel_w"][e].cpu().numpy().astype(np.float32),
-                        quat_w         = states["quat_w"][e].cpu().numpy().astype(np.float32),
-                        ang_vel_b      = states["ang_vel_b"][e].cpu().numpy().astype(np.float32),
-                        goal_w         = states["goal_w"][e].cpu().numpy().astype(np.float32),
-                        R_goal         = R_goal_e,
+                        obs            = obs_np[e],
+                        pos_w          = pos_np[e],
+                        vel_w          = vel_np[e],
+                        quat_w         = quat_np[e],
+                        ang_vel_b      = ang_np[e],
+                        goal_w         = goal_np[e],
+                        R_goal         = R_goal_np[e],
                         bezier_U       = bezier_U[e],
-                        free_ctrl_pts  = fc_e,
-                        ref_pos_w      = ref_pos_w[e].cpu().numpy().astype(np.float32),
-                        ref_vel_w      = ref_vel_w[e].cpu().numpy().astype(np.float32),
-                        ref_acc_w      = ref_acc_w[e].cpu().numpy().astype(np.float32),
+                        free_ctrl_pts  = free_ctrl_np[e],
+                        ref_pos_w      = ref_pos_np[e],
+                        ref_vel_w      = ref_vel_np[e],
+                        ref_acc_w      = ref_acc_np[e],
                         mpc_replanned  = mpc_replanned[e],
                         mpc_reset_mode = mpc_reset_mode[e],
                         mpc_fallback   = mpc_fallback[e],
@@ -645,16 +652,16 @@ def main() -> None:
             env_step_cnt += 1
 
             # ── record substep wrench + refs ─────────────────────────────────
+            thrust_z_np = env._thrust[:, :, 0, 2].detach().cpu().numpy().astype(np.float32, copy=False)
+            torque_b_np = env._moment[:, :, 0, :].detach().cpu().numpy().astype(np.float32, copy=False)
+            ref_9d_np = action_flat.reshape(E, N, 9).detach().cpu().numpy().astype(np.float32, copy=False)
             for e in range(E):
-                thrust_z = env._thrust[e, :, 0, 2].cpu().numpy().astype(np.float32)   # (N,)
-                torque_b = env._moment[e, :, 0, :].cpu().numpy().astype(np.float32)   # (N, 3)
-                ref_9d_e = action_flat[e].reshape(N, 9)
                 collectors[e].record_substep(
-                    ref_pos  = ref_9d_e[:, 0:3].cpu().numpy().astype(np.float32),
-                    ref_vel  = ref_9d_e[:, 3:6].cpu().numpy().astype(np.float32),
-                    ref_acc  = ref_9d_e[:, 6:9].cpu().numpy().astype(np.float32),
-                    thrust_z = thrust_z,
-                    torque_b = torque_b,
+                    ref_pos  = ref_9d_np[e, :, 0:3],
+                    ref_vel  = ref_9d_np[e, :, 3:6],
+                    ref_acc  = ref_9d_np[e, :, 6:9],
+                    thrust_z = thrust_z_np[e],
+                    torque_b = torque_b_np[e],
                 )
 
             # ── handle unexpected resets (non-done) ─────────────────────────
@@ -682,12 +689,15 @@ def main() -> None:
             if done.any():
                 done_ids = done.nonzero(as_tuple=False).flatten()
                 expert.reset(env_ids=done_ids, obstacle_info=env.get_obstacle_info())
-                for e in done_ids.tolist():
-                    origin = env._terrain.env_origins[e].cpu()
-                    ip = ep_init_pos[e].cpu().numpy().astype(np.float32).copy()
-                    gp = ep_goal[e].cpu().numpy().astype(np.float32).copy()
-                    ip[:, :2] -= origin[:2].numpy()
-                    gp[:, :2] -= origin[:2].numpy()
+                done_list = done_ids.detach().cpu().tolist()
+                origins_np = env._terrain.env_origins.detach().cpu().numpy().astype(np.float32, copy=False)
+                ep_init_np = ep_init_pos.detach().cpu().numpy().astype(np.float32, copy=False)
+                ep_goal_np = ep_goal.detach().cpu().numpy().astype(np.float32, copy=False)
+                for e in done_list:
+                    ip = ep_init_np[e].copy()
+                    gp = ep_goal_np[e].copy()
+                    ip[:, :2] -= origins_np[e, :2]
+                    gp[:, :2] -= origins_np[e, :2]
                     for i in range(N):
                         success_i = bool(env._drone_just_succeeded[e, i].item())
                         total_done    += 1

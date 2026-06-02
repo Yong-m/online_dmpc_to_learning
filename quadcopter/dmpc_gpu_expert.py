@@ -292,8 +292,8 @@ class GPUDMPCExpert(DMPCExpert):
                 eps_rel=self.p.admm_eps_rel,
                 reg=self.p.reg,
                 max_collision_slots=self.p.admm_collision_slots,
-                quad_coll=self.p.quad_coll,
-                lin_coll=self.p.lin_coll,
+                quad_coll=self.p.admm_quad_coll,
+                lin_coll=self.p.admm_lin_coll,
             )
 
         self._gpu_solvers: dict[str, BatchedGPUDMPC] = {
@@ -487,7 +487,7 @@ class GPUDMPCExpert(DMPCExpert):
         qc     = self.p.admm_quad_coll
         B      = len(e_arr)
         self._gpu_plan_calls = getattr(self, "_gpu_plan_calls", 0) + 1
-        _do_log = (self._gpu_plan_calls % 10 == 1)
+        _do_log = (self._gpu_plan_calls % 100 == 1)
 
         # ── Phase A+B: zero-loop state read + vectorised init ─────────────
         # All reads are numpy fancy indexing into _st_* arrays — no Python loop.
