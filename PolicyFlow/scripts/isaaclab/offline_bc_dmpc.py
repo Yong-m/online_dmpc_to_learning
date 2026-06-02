@@ -4,7 +4,7 @@ Loads per-agent .npz trajectories collected by collect_dmpc_data.py and trains
 a flow-matching policy (same architecture as online_bc_dmpc.py).
 
 Loss per batch:
-    total = flow_match(free_ctrl_pts)
+    total = flow_match(bezier_U_goal, temporal_weights)
           + λ_vel * MSE(vel_head(cond_emb), substep_ref_vel_w[:,0,:])
           + λ_acc * MSE(acc_head(cond_emb), substep_ref_acc_w[:,0,:])
 
@@ -67,8 +67,8 @@ def parse_args() -> argparse.Namespace:
 
     # Training
     parser.add_argument("--n_epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--lambda_vel", type=float, default=0.1)
     parser.add_argument("--lambda_acc", type=float, default=0.05)
@@ -78,7 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_dims", type=int, nargs="*", default=[256, 256, 256])
     parser.add_argument("--emb_dim", type=int, default=64)
     parser.add_argument("--sample_steps", type=int, default=10)
-    parser.add_argument("--ctrl_pts_max", type=float, default=0.3)
+    parser.add_argument("--ctrl_pts_max", type=float, default=2.0,
+                        help="Scale for normalising bezier_U_goal to ~[-1,1]. "
+                             "Set to ~95th-percentile of per-element abs value in your dataset.")
+    parser.add_argument("--ctrl_clip_threshold", type=float, default=1.0,
+                        help="Drop windows where any ctrl_pt element exceeds this [m]. "
+                             "Filters physically impossible DMPC plans (>10 m/s in 0.1s).")
     parser.add_argument("--own_dim", type=int, default=37,
                         help="PER_DRONE_OWN_DIM from multi_drone_dmpc_env.py.")
     parser.add_argument("--neighbor_dim", type=int, default=9,
@@ -88,6 +93,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_path", type=str, default="runs/offline_bc/model.pt")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--resume", type=str, default=None)
+
+    # Evaluation (calls eval_bc_dmpc.py in a subprocess)
+    parser.add_argument("--eval_every", type=int, default=0,
+                        help="Run sim eval every N epochs (0=disabled). Also runs on new best.")
+    parser.add_argument("--eval_on_best", action="store_true", default=True,
+                        help="Always run eval when a new best checkpoint is saved.")
+    parser.add_argument("--eval_script", type=str, default=None,
+                        help="Path to eval_bc_dmpc.py. Defaults to sibling file.")
+    parser.add_argument("--eval_num_envs", type=int, default=32)
+    parser.add_argument("--eval_num_drones", type=int, default=4)
+    parser.add_argument("--eval_steps", type=int, default=400)
+    parser.add_argument("--eval_task", type=str, default="Isaac-MultiDrone-DMPC-Direct-v0")
+    parser.add_argument("--eval_timeout", type=int, default=600,
+                        help="Max seconds to wait for one eval subprocess.")
 
     # Logging
     parser.add_argument("--wandb", action="store_true", default=False)
@@ -108,11 +127,10 @@ class DMPCOfflineDataset(Dataset):
         ref_vel_list:  list[np.ndarray] = []
         ref_acc_list:  list[np.ndarray] = []
 
-        for fpath in files:
+        for fpath in tqdm(files, desc="Loading", unit="file", leave=False, dynamic_ncols=True):
             d = np.load(fpath)
-            T = d["obs"].shape[0]
             obs_list.append(d["obs"].astype(np.float32))
-            ctrl_list.append(d["free_ctrl_pts"].reshape(T, -1).astype(np.float32))
+            ctrl_list.append(d["bezier_U_goal"].astype(np.float32))  # (T, n_bez)
             if "substep_ref_vel_w" in d:
                 ref_vel_list.append(d["substep_ref_vel_w"][:, 0, :].astype(np.float32))
                 ref_acc_list.append(d["substep_ref_acc_w"][:, 0, :].astype(np.float32))
@@ -125,7 +143,7 @@ class DMPCOfflineDataset(Dataset):
         self.ref_vel_w = torch.from_numpy(np.concatenate(ref_vel_list, axis=0))
         self.ref_acc_w = torch.from_numpy(np.concatenate(ref_acc_list, axis=0))
 
-        print(f"[Dataset] {len(files)} files → {len(self.obs)} windows  "
+        print(f"[Dataset] {len(files)} files → {len(self.obs):,} windows  "
               f"obs={tuple(self.obs.shape[1:])}  ctrl={tuple(self.ctrl_pts.shape[1:])}")
 
     def __len__(self) -> int:
@@ -146,19 +164,19 @@ class DMPCOfflineDataset(Dataset):
 class OfflineDronePolicy(nn.Module):
     def __init__(
         self,
-        bezier_k: int,
+        n_bez: int,
         hidden_dims: list[int],
         emb_dim: int,
         sample_steps: int,
         device: torch.device,
-        ctrl_pts_max: float = 0.3,
+        ctrl_pts_max: float = 2.0,
         own_dim: int = 37,
         neighbor_dim: int = 9,
+        n_segments: int = 3,
     ):
         super().__init__()
-        self.bezier_k      = bezier_k
-        self.bezier_k_free = bezier_k - 2
-        self.A             = self.bezier_k_free * 3
+        self.n_bez         = n_bez
+        self.A             = n_bez
         self.own_dim       = own_dim
         self.neighbor_dim  = neighbor_dim
         self.device        = device
@@ -167,6 +185,14 @@ class OfflineDronePolicy(nn.Module):
         self.neigh_norm = EmpiricalNormalization(shape=neighbor_dim, until=int(1e8))
         self.register_buffer("_ctrl_pts_max",
                              torch.tensor(ctrl_pts_max, dtype=torch.float32))
+
+        # Temporal weights: higher weight for earlier segments (closer in time).
+        # n_bez = n_segments × n_per_seg. Weight decays linearly across segments.
+        n_per_seg = n_bez // n_segments
+        seg_weights = torch.linspace(float(n_segments), 1.0, n_segments)  # [3,2,1] for 3 segs
+        seg_weights = seg_weights * (n_segments / seg_weights.sum())        # normalize mean=1
+        flow_weights = seg_weights.repeat_interleave(n_per_seg)             # (n_bez,)
+        self.register_buffer("_flow_weights", flow_weights)
 
         self.neighbor_enc = NeighborEncoder(
             own_dim=own_dim, neighbor_dim=neighbor_dim,
@@ -217,6 +243,26 @@ class OfflineDronePolicy(nn.Module):
         if N_neigh > 0:
             self.neigh_norm.update(neigh_r.reshape(-1, self.neighbor_dim))
 
+    @torch.no_grad()
+    def sample_action(self, per_drone_obs: torch.Tensor) -> torch.Tensor:
+        """ODE integration → bezier_U_goal (E, N, n_bez) in goal-aligned relative frame [m].
+
+        Args:
+            per_drone_obs: ``(E, N, P)`` raw per-drone observations.
+
+        Returns:
+            ``(E, N, n_bez)`` Bezier control points in goal-aligned relative frame [m].
+        """
+        E, N, P = per_drone_obs.shape
+        flat = per_drone_obs.reshape(E * N, P)
+        self.cnf.eval()
+        cond_in = self._encode_obs(flat)
+        x0 = torch.randn(cond_in.shape[0], self.A, device=cond_in.device)
+        latent, _ = self.cnf.sample(x0=x0, condition=cond_in, n_samples=cond_in.shape[0])
+        bezier_U_goal = latent * self._ctrl_pts_max
+        self.cnf.train()
+        return bezier_U_goal.reshape(E, N, self.A)
+
     def compute_loss(
         self,
         obs: torch.Tensor,
@@ -237,7 +283,9 @@ class OfflineDronePolicy(nn.Module):
         xt       = (1.0 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
         cond_emb = self.cnf.model["condition"](cond_in)
         vel_pred = self.cnf.model["flow"](xt, t, cond_emb)
-        flow_loss = (vel_pred - (x1 - x0).detach()).pow(2).mean()
+        target   = (x1 - x0).detach()
+        # Weight earlier (closer-in-time) segments more heavily.
+        flow_loss = ((vel_pred - target).pow(2) * self._flow_weights).mean()
 
         vel_aux   = self.vel_head(cond_emb)
         acc_aux   = self.acc_head(cond_emb)
@@ -292,15 +340,15 @@ def main() -> None:
     # Infer dims from first file
     d0         = np.load(all_files[0])
     obs_dim    = int(d0["obs"].shape[1])
-    bezier_k   = int(d0["bezier_k"])
+    n_bez      = int(d0["n_bez"])
     n_substeps = int(d0["n_substeps"])
     h_window   = float(d0["h_window"])
-    print(f"[Config] obs_dim={obs_dim}  bezier_k={bezier_k}  "
+    print(f"[Config] obs_dim={obs_dim}  n_bez={n_bez}  "
           f"n_substeps={n_substeps}  h_window={h_window:.3f}s")
 
     # ── policy ───────────────────────────────────────────────────────────────
     policy = OfflineDronePolicy(
-        bezier_k=bezier_k,
+        n_bez=n_bez,
         hidden_dims=args.hidden_dims,
         emb_dim=args.emb_dim,
         sample_steps=args.sample_steps,
@@ -331,15 +379,67 @@ def main() -> None:
 
     def _save(path: Path, epoch: int) -> None:
         torch.save({
-            "policy":    policy.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch":     epoch,
-            "best_val":  best_val,
-            "obs_dim":   obs_dim,
-            "bezier_k":  bezier_k,
-            "n_substeps": n_substeps,
-            "h_window":  h_window,
+            "policy":      policy.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "epoch":       epoch,
+            "best_val":    best_val,
+            # env / data config
+            "obs_dim":     obs_dim,
+            "n_bez":       n_bez,
+            "n_substeps":  n_substeps,
+            "h_window":    h_window,
+            # model architecture (needed to rebuild at eval time)
+            "own_dim":     args.own_dim,
+            "neighbor_dim": args.neighbor_dim,
+            "hidden_dims": args.hidden_dims,
+            "emb_dim":     args.emb_dim,
+            "sample_steps": args.sample_steps,
+            "ctrl_pts_max": args.ctrl_pts_max,
         }, str(path))
+
+    # ── eval subprocess helper ────────────────────────────────────────────────
+    _eval_script = args.eval_script or str(Path(__file__).parent / "eval_bc_dmpc.py")
+
+    def run_eval(checkpoint_path: Path) -> dict[str, float] | None:
+        """Launch eval_bc_dmpc.py in a subprocess. Returns metrics or None."""
+        import json
+        import subprocess
+        import tempfile
+        if not Path(_eval_script).exists():
+            print(f"[Eval] script not found: {_eval_script}", flush=True)
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            json_path = f.name
+        cmd = [
+            sys.executable, _eval_script,
+            "--checkpoint",  str(checkpoint_path),
+            "--num_envs",    str(args.eval_num_envs),
+            "--num_drones",  str(args.eval_num_drones),
+            "--eval_steps",  str(args.eval_steps),
+            "--task",        args.eval_task,
+            "--n_substeps",  str(n_substeps),
+            "--output_json", json_path,
+            "--headless",
+        ]
+        print(f"[Eval] launching: {' '.join(cmd)}", flush=True)
+        try:
+            proc = subprocess.run(
+                cmd, timeout=args.eval_timeout,
+                capture_output=False,  # show stdout/stderr live
+            )
+            if proc.returncode != 0:
+                print(f"[Eval] subprocess exited with code {proc.returncode}", flush=True)
+                return None
+            with open(json_path) as f:
+                return json.load(f)
+        except subprocess.TimeoutExpired:
+            print(f"[Eval] timed out after {args.eval_timeout}s", flush=True)
+            return None
+        except Exception as e:
+            print(f"[Eval] error: {e}", flush=True)
+            return None
+        finally:
+            Path(json_path).unlink(missing_ok=True)
 
     # ── wandb ────────────────────────────────────────────────────────────────
     if args.wandb and _WANDB_AVAILABLE:
@@ -411,10 +511,27 @@ def main() -> None:
         val_loss = float(np.mean(val_losses))
 
         # ── best checkpoint ────────────────────────────────────────────────
-        if val_loss < best_val:
+        is_new_best = val_loss < best_val
+        if is_new_best:
             best_val = val_loss
             _save(best_path, epoch + 1)
             tqdm.write(f"  [best] epoch={epoch+1}  val={val_loss:.4f} → {best_path}")
+
+        # ── sim eval (optional) ───────────────────────────────────────────
+        eval_metrics: dict[str, float] = {}
+        should_eval = (
+            (args.eval_every > 0 and (epoch + 1) % args.eval_every == 0)
+            or (args.eval_on_best and is_new_best)
+        )
+        if should_eval and Path(_eval_script).exists():
+            tqdm.write(f"  [eval] running sim eval at epoch {epoch+1} …")
+            _em = run_eval(best_path)
+            if _em is not None:
+                eval_metrics = _em
+                tqdm.write(
+                    f"  [eval] success={eval_metrics.get('eval_success_rate', 0):.3f}"
+                    f"  return={eval_metrics.get('eval_return', float('nan')):.2f}"
+                )
 
         # ── epoch bar postfix ──────────────────────────────────────────────
         epoch_bar.set_postfix(
@@ -424,14 +541,18 @@ def main() -> None:
         )
 
         if args.wandb and _WANDB_AVAILABLE:
-            _wandb.log({"epoch":             epoch + 1,
+            log_dict = {"epoch":             epoch + 1,
                         "epoch/loss_total":  t_avg["loss/total"],
                         "epoch/loss_flow":   t_avg["loss/flow"],
                         "epoch/loss_vel":    t_avg["loss/vel_aux"],
                         "epoch/loss_acc":    t_avg["loss/acc_aux"],
                         "epoch/val_loss":    val_loss,
-                        "epoch/lr":          t_avg["lr"]},
-                       step=global_step)
+                        "epoch/lr":          t_avg["lr"]}
+            if eval_metrics:
+                log_dict["eval/success_rate"] = eval_metrics.get("eval_success_rate", 0.0)
+                log_dict["eval/return"]        = eval_metrics.get("eval_return", float("nan"))
+                log_dict["eval/episodes"]      = eval_metrics.get("eval_episodes", 0)
+            _wandb.log(log_dict, step=global_step)
 
         # ── periodic checkpoint ────────────────────────────────────────────
         if (epoch + 1) % args.save_every == 0:

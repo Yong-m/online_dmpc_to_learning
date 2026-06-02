@@ -16,8 +16,8 @@ Each saved file (one per agent per episode) contains:
     ang_vel_b        (T, 3)       body-frame angular velocity
     goal_w           (T, 3)       goal world position
     R_goal           (T, 9)       goal-aligned rotation (world→goal), row-major
-    bezier_U         (T, n_bez)   DMPC Bezier control vector
-    free_ctrl_pts    (T, K-2, 3)  free position ctrl_pts, goal-aligned delta frame
+    bezier_U         (T, n_bez)   DMPC Bezier control vector (env-local frame)
+    bezier_U_goal    (T, n_bez)   DMPC ctrl pts, goal-aligned relative frame (policy target)
     ref_pos_w        (T, 3)       pos ref at first sub-step
     ref_vel_w        (T, 3)       vel ref
     ref_acc_w        (T, 3)       acc ref
@@ -84,15 +84,16 @@ parser.add_argument("--seed", type=int, default=0)
 
 parser.add_argument("--save_dir", type=str, required=True,
                     help="Directory to write per-episode .npz files.")
-parser.add_argument("--target_episodes", type=int, default=250000,
+parser.add_argument("--target_episodes", type=int, default=500000,
                     help="Stop after this many episodes have been saved.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Hard env-step cap (0 = use --target_episodes only).")
 parser.add_argument("--save_all", action="store_true", default=False,
                     help="Save all episodes, not just successful ones.")
+parser.add_argument("--min_safe_dist", type=float, default=0.08,
+                    help="Filter episodes where any drone pair came closer than this [m]. "
+                         "Defaults to 0.08m (~Crazyflie body diameter). Use 0 to disable.")
 
-parser.add_argument("--bezier_k", type=int, default=6,
-                    help="Total position Bezier ctrl_pts K. K-2 are free.")
 parser.add_argument("--episode_length_s", type=float, default=None)
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False)
 
@@ -146,13 +147,10 @@ class EpisodeCollector:
     - ``reset()``         — discard in-progress data (e.g. on mid-episode reset)
     """
 
-    def __init__(self, env_idx: int, N: int, P: int, bezier_k: int,
-                 n_bez: int, n_substeps: int):
+    def __init__(self, env_idx: int, N: int, P: int, n_bez: int, n_substeps: int):
         self.env_idx = env_idx
         self.N = N
         self.P = P
-        self.bezier_k = bezier_k
-        self.K_free = bezier_k - 2
         self.n_bez = n_bez
         self.n_substeps = n_substeps
 
@@ -163,29 +161,29 @@ class EpisodeCollector:
     # ── window lifecycle ────────────────────────────────────────────────────
     def begin_window(
         self,
-        obs: "np.ndarray",           # (N, P)
-        pos_w: "np.ndarray",         # (N, 3)
+        obs: "np.ndarray",                # (N, P)
+        pos_w: "np.ndarray",              # (N, 3)
         vel_w: "np.ndarray",
-        quat_w: "np.ndarray",        # (N, 4)
+        quat_w: "np.ndarray",             # (N, 4)
         ang_vel_b: "np.ndarray",
         goal_w: "np.ndarray",
-        R_goal: "np.ndarray",        # (N, 9) row-major
-        bezier_U: "np.ndarray",      # (N, n_bez)
-        free_ctrl_pts: "np.ndarray", # (N, K-2, 3)
-        ref_pos_w: "np.ndarray",     # (N, 3) — first sub-step ref
+        R_goal: "np.ndarray",             # (N, 9) row-major
+        bezier_U: "np.ndarray",           # (N, n_bez)
+        bezier_U_goal: "np.ndarray",      # (N, n_bez) goal-aligned relative frame
+        ref_pos_w: "np.ndarray",          # (N, 3) — first sub-step ref
         ref_vel_w: "np.ndarray",
         ref_acc_w: "np.ndarray",
-        mpc_replanned: "np.ndarray",     # (N,) bool
+        mpc_replanned: "np.ndarray",      # (N,) bool
         mpc_reset_mode: "np.ndarray",
         mpc_fallback: "np.ndarray",
-        mpc_collision_ts: "np.ndarray",  # (N,) int
+        mpc_collision_ts: "np.ndarray",   # (N,) int
     ) -> None:
         if self._curr is not None:
             self._close_window()
         self._curr = dict(
             obs=obs, pos_w=pos_w, vel_w=vel_w, quat_w=quat_w,
             ang_vel_b=ang_vel_b, goal_w=goal_w, R_goal=R_goal,
-            bezier_U=bezier_U, free_ctrl_pts=free_ctrl_pts,
+            bezier_U=bezier_U, bezier_U_goal=bezier_U_goal,
             ref_pos_w=ref_pos_w, ref_vel_w=ref_vel_w, ref_acc_w=ref_acc_w,
             mpc_replanned=mpc_replanned, mpc_reset_mode=mpc_reset_mode,
             mpc_fallback=mpc_fallback, mpc_collision_ts=mpc_collision_ts,
@@ -266,7 +264,7 @@ class EpisodeCollector:
             R_goal           = _stack("R_goal"),
             # Per-window expert outputs
             bezier_U         = _stack("bezier_U"),
-            free_ctrl_pts    = _stack("free_ctrl_pts"),
+            bezier_U_goal    = _stack("bezier_U_goal"),
             ref_pos_w        = _stack("ref_pos_w"),
             ref_vel_w        = _stack("ref_vel_w"),
             ref_acc_w        = _stack("ref_acc_w"),
@@ -285,7 +283,7 @@ class EpisodeCollector:
             goal_local      = goal_local,
             success         = np.array(success,           dtype=np.bool_),
             n_substeps      = np.array(self.n_substeps,   dtype=np.int32),
-            bezier_k        = np.array(self.bezier_k,     dtype=np.int32),
+            bezier_k        = np.array(self.n_bez,         dtype=np.int32),  # kept for compat
             h_window        = np.array(h_window,          dtype=np.float32),
             n_bez           = np.array(self.n_bez,         dtype=np.int32),
         )
@@ -332,7 +330,7 @@ class EpisodeCollector:
             goal_w           = _sa("goal_w"),
             R_goal           = _sa("R_goal"),
             bezier_U         = _sa("bezier_U"),
-            free_ctrl_pts    = _sa("free_ctrl_pts"),
+            bezier_U_goal    = _sa("bezier_U_goal"),
             ref_pos_w        = _sa("ref_pos_w"),
             ref_vel_w        = _sa("ref_vel_w"),
             ref_acc_w        = _sa("ref_acc_w"),
@@ -351,7 +349,7 @@ class EpisodeCollector:
             goal_local      = goal_agent,
             success         = np.array(success,         dtype=np.bool_),
             n_substeps      = np.array(self.n_substeps, dtype=np.int32),
-            bezier_k        = np.array(self.bezier_k,   dtype=np.int32),
+            bezier_k        = np.array(self.n_bez,       dtype=np.int32),  # kept for compat
             h_window        = np.array(h_window,        dtype=np.float32),
             n_bez           = np.array(self.n_bez,       dtype=np.int32),
         )
@@ -414,6 +412,9 @@ def main() -> None:
         env_cfg.episode_length_s = args_cli.episode_length_s
     if args_cli.no_terminate_on_bounds and hasattr(env_cfg, "terminate_on_bounds"):
         env_cfg.terminate_on_bounds = False
+    # Collision termination is handled via had_collision filter at save time,
+    # not by terminating episodes early (which would interrupt the DMPC expert).
+    env_cfg.terminate_on_collision = False
     env_cfg.__post_init__()
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
@@ -446,13 +447,12 @@ def main() -> None:
     E = env.num_envs
     N = env.cfg.num_drones
     P = per_drone_obs_dim(N)
-    bezier_k = args_cli.bezier_k
     h_window: float = 0.1
     n_substeps = max(1, round(h_window / (env_cfg.sim.dt * env_cfg.decimation)))
 
     print(
         f"[collect_dmpc_data] num_envs={E}  num_drones={N}  "
-        f"obs_dim={P}  bezier_k={bezier_k}  n_substeps={n_substeps}  "
+        f"obs_dim={P}  n_substeps={n_substeps}  "
         f"h_window={h_window}s  dt={env_cfg.sim.dt*env_cfg.decimation:.3f}s"
     )
 
@@ -483,7 +483,7 @@ def main() -> None:
 
     # ── per-env collectors + step trackers ───────────────────────────────────
     collectors = [
-        EpisodeCollector(e, N, P, bezier_k, expert.n_bez, n_substeps)
+        EpisodeCollector(e, N, P, expert.n_bez, n_substeps)
         for e in range(E)
     ]
     # Per-env: position and goal at the start of the current episode.
@@ -491,6 +491,15 @@ def main() -> None:
     ep_goal     = torch.zeros(E, N, 3, device=device)
     # Per-env step counter (reset to 0 on each episode start).
     env_step_cnt = torch.zeros(E, dtype=torch.long, device=device)
+
+    # ── collision filter setup ────────────────────────────────────────────────
+    col_threshold = float(args_cli.min_safe_dist)
+    filter_collisions = (N > 1 and col_threshold > 0.0)
+    if filter_collisions:
+        print(f"[collect] collision filter: min_safe_dist={col_threshold:.3f}m")
+    # Per-env flag: True if any physical collision occurred this episode.
+    had_collision = torch.zeros(E, dtype=torch.bool, device=device)
+    col_filtered  = 0   # total episodes dropped by collision filter
 
     # ── initial reset ─────────────────────────────────────────────────────────
     env_gym.reset(seed=args_cli.seed)
@@ -536,6 +545,7 @@ def main() -> None:
                 for e in rw_ids.tolist():
                     collectors[e].reset()
                     env_step_cnt[e] = 0
+                    had_collision[e] = False
                     ep_init_pos[e] = env._init_pos_w[e].detach().clone()
                     ep_goal[e]     = env._goal_pos_w[e].detach().clone()
             last_ep_len = env.episode_length_buf.clone()
@@ -565,45 +575,62 @@ def main() -> None:
                 if env_step_cnt[e].item() % n_substeps == 0
             ]
             if win_envs:
-                free_ctrl = expert.get_pos_ctrl_pts(
-                    win_envs,
-                    states["pos_w"], states["lin_vel_w"],
-                    states["goal_w"], env._terrain.env_origins,
-                    K=bezier_k, h=h_window,
-                )  # (E_max, N, K-2, 3) on device
-
                 # Compute goal-aligned R for window-start envs.
                 R_goal_all = env._compute_goal_aligned_R(
                     states["pos_w"], states["goal_w"]
                 )  # (E, N, 3, 3)
 
+                n_ctrl = expert.n_bez // 3  # 18 control points (3 segments × 6 pts)
+
                 for e in win_envs:
                     obs_e      = per_drone_obs[e].cpu().numpy().astype(np.float32)
-                    R_goal_e   = R_goal_all[e].reshape(N, 9).cpu().numpy().astype(np.float32)
-                    fc_e       = free_ctrl[e].cpu().numpy().astype(np.float32)  # (N, K-2, 3)
+                    R_goal_e   = R_goal_all[e].cpu().numpy().astype(np.float32)  # (N, 3, 3)
+                    pos_w_e    = states["pos_w"][e].cpu().numpy().astype(np.float32)   # (N, 3)
+                    origin_e   = env._terrain.env_origins[e].cpu().numpy().astype(np.float32)  # (3,)
+                    pos_local_e = pos_w_e - origin_e[None, :]  # (N, 3) env-local
+
+                    # Transform bezier_U (env-local absolute) → goal-aligned relative.
+                    # U.reshape(N, n_ctrl, 3) gives ctrl pts in env-local frame.
+                    # V_pts = (U_pts - pos_local) @ R^T  (row vectors: world→goal-aligned)
+                    U_e = bezier_U[e]  # (N, n_bez) numpy
+                    U_pts = U_e.reshape(N, n_ctrl, 3)
+                    U_pts_rel = U_pts - pos_local_e[:, None, :]  # (N, n_ctrl, 3)
+                    R_T = R_goal_e.transpose(0, 2, 1)  # (N, 3, 3) transposed
+                    V_pts = np.matmul(U_pts_rel, R_T)  # (N, n_ctrl, 3) goal-aligned relative
+                    bezier_U_goal_e = V_pts.reshape(N, expert.n_bez).astype(np.float32)
 
                     collectors[e].begin_window(
-                        obs            = obs_e,
-                        pos_w          = states["pos_w"][e].cpu().numpy().astype(np.float32),
-                        vel_w          = states["lin_vel_w"][e].cpu().numpy().astype(np.float32),
-                        quat_w         = states["quat_w"][e].cpu().numpy().astype(np.float32),
-                        ang_vel_b      = states["ang_vel_b"][e].cpu().numpy().astype(np.float32),
-                        goal_w         = states["goal_w"][e].cpu().numpy().astype(np.float32),
-                        R_goal         = R_goal_e,
-                        bezier_U       = bezier_U[e],
-                        free_ctrl_pts  = fc_e,
-                        ref_pos_w      = ref_pos_w[e].cpu().numpy().astype(np.float32),
-                        ref_vel_w      = ref_vel_w[e].cpu().numpy().astype(np.float32),
-                        ref_acc_w      = ref_acc_w[e].cpu().numpy().astype(np.float32),
-                        mpc_replanned  = mpc_replanned[e],
-                        mpc_reset_mode = mpc_reset_mode[e],
-                        mpc_fallback   = mpc_fallback[e],
+                        obs              = obs_e,
+                        pos_w            = pos_w_e,
+                        vel_w            = states["lin_vel_w"][e].cpu().numpy().astype(np.float32),
+                        quat_w           = states["quat_w"][e].cpu().numpy().astype(np.float32),
+                        ang_vel_b        = states["ang_vel_b"][e].cpu().numpy().astype(np.float32),
+                        goal_w           = states["goal_w"][e].cpu().numpy().astype(np.float32),
+                        R_goal           = R_goal_e.reshape(N, 9),
+                        bezier_U         = U_e,
+                        bezier_U_goal    = bezier_U_goal_e,
+                        ref_pos_w        = ref_pos_w[e].cpu().numpy().astype(np.float32),
+                        ref_vel_w        = ref_vel_w[e].cpu().numpy().astype(np.float32),
+                        ref_acc_w        = ref_acc_w[e].cpu().numpy().astype(np.float32),
+                        mpc_replanned    = mpc_replanned[e],
+                        mpc_reset_mode   = mpc_reset_mode[e],
+                        mpc_fallback     = mpc_fallback[e],
                         mpc_collision_ts = mpc_col_ts[e],
                     )
 
             # ── step env ────────────────────────────────────────────────────
             _, reward, terminated, truncated, _ = env_gym.step(action_flat)
             env_step_cnt += 1
+
+            # ── physical collision tracking (post-step positions) ────────────
+            if filter_collisions:
+                pos_now = env.get_world_states()["pos_w"]          # (E, N, 3)
+                diff    = pos_now.unsqueeze(2) - pos_now.unsqueeze(1)
+                pdist   = torch.linalg.norm(diff, dim=-1)          # (E, N, N)
+                eye_m   = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+                pdist   = pdist.masked_fill(eye_m, float("inf"))
+                min_dist = pdist.amin(dim=(1, 2))                  # (E,)
+                had_collision |= (min_dist < col_threshold)
 
             # ── record substep wrench + refs ─────────────────────────────────
             for e in range(E):
@@ -649,12 +676,14 @@ def main() -> None:
                     gp = ep_goal[e].cpu().numpy().astype(np.float32).copy()
                     ip[:, :2] -= origin[:2].numpy()
                     gp[:, :2] -= origin[:2].numpy()
+                    ep_had_collision = bool(had_collision[e].item())
                     for i in range(N):
                         success_i = bool(env._drone_just_succeeded[e, i].item())
                         total_done    += 1
                         total_success += int(success_i)
                         recent_outcomes.append(int(success_i))
-                        if args_cli.save_all or success_i:
+                        should_save = (args_cli.save_all or success_i) and not ep_had_collision
+                        if should_save:
                             ep_path = str(save_dir / f"ep_{saved_count:07d}.npz")
                             saved = collectors[e].save_agent(
                                 ep_path, i, ip[i], gp[i], success_i, h_window
@@ -663,6 +692,7 @@ def main() -> None:
                                 saved_count += 1
                                 pbar.update(1)
                     collectors[e].reset()
+                    had_collision[e] = False
                     env_step_cnt[e] = 0
                     ep_init_pos[e] = env._init_pos_w[e].detach().clone()
                     ep_goal[e]     = env._goal_pos_w[e].detach().clone()

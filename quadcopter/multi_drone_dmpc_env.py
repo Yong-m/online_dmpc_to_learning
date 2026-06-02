@@ -54,8 +54,9 @@ from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 # Per-drone observation layout sizes.
 HISTORY_STEPS = 5        # own position history length (steps)
 TIME_EMB_DIM = 4         # sinusoidal episode-progress embedding
-PER_DRONE_OWN_DIM = 37   # goal_rel_w(3) + lin_vel_w(3) + R_wb(9) + ang_vel_b(3)
+PER_DRONE_OWN_DIM = 40   # goal_rel_w(3) + lin_vel_w(3) + R_wb(9) + ang_vel_b(3)
                           # + past_rel_pos_w(HISTORY_STEPS*3) + time_emb(TIME_EMB_DIM)
+                          # + pos_local(3)  [env-relative position; needed for OOB awareness]
 PER_NEIGHBOUR_DIM = 9    # rel_pos_w(3) + rel_vel_w(3) + neigh_goal_dir_w(3)
 
 
@@ -87,6 +88,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     debug_short_horizon_steps: int = 3
     randomize_episode_start: bool = False
     terminate_on_bounds: bool = True
+    terminate_on_collision: bool = True
+    hard_collision_dist: float = 0.15  # metres centre-to-centre; ~1.5× propeller sweep radius
     collision_free_two_drone_reset: bool = False # For DMPC debugging
     success_dist_threshold: float = 0.05   # metres; all drones must be within this
     success_hold_s: float = 1.0            # seconds all drones must hold the threshold
@@ -411,6 +414,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             * **15-17** angular velocity, body frame
             * **18-32** past 5-step own positions relative to current, world frame
             * **33-36** sinusoidal episode-progress embedding (TIME_EMB_DIM=4)
+            * **37-39** drone position in env-local frame (needed for OOB penalty awareness)
             * For each neighbour ``j``:
               * relative position world frame (3)
               * relative velocity world frame (3)
@@ -426,6 +430,9 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         rot_wb    = matrix_from_quat(quat_w)          # (E, N, 3, 3)
         R_wb_flat = rot_wb.reshape(E, N, 9)           # (E, N, 9) row-major
 
+        # Env-local positions: subtract per-env origin so all envs share the same frame.
+        pos_local = pos_w - self._terrain.env_origins.unsqueeze(1)  # (E, N, 3)
+
         # Episode-progress sinusoidal embedding (E, TIME_EMB_DIM).
         t = (self.episode_length_buf.float() / self.max_episode_length).clamp(0.0, 1.0)
         t_emb = torch.stack([
@@ -438,11 +445,12 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         out = torch.empty((E, N, self.per_drone_obs_dim), device=self.device, dtype=pos_w.dtype)
 
         for i in range(N):
-            # Own features (all world frame except ang_vel_b).
+            # Own features (all world frame except ang_vel_b and pos_local).
             goal_rel_w  = self._goal_pos_w[:, i] - pos_w[:, i]  # (E, 3)
             lin_vel_w_i = lin_vel_w[:, i]                        # (E, 3)
             R_wb_flat_i = R_wb_flat[:, i]                        # (E, 9)
             ang_vel_b_i = ang_vel_b[:, i]                        # (E, 3)
+            pos_local_i = pos_local[:, i]                        # (E, 3)
 
             # Past HISTORY_STEPS positions relative to current, world frame.
             past_feats = []
@@ -451,9 +459,9 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             past_rel_w = torch.cat(past_feats, dim=-1)  # (E, HISTORY_STEPS*3)
 
             own = torch.cat(
-                [goal_rel_w, lin_vel_w_i, R_wb_flat_i, ang_vel_b_i, past_rel_w, t_emb],
+                [goal_rel_w, lin_vel_w_i, R_wb_flat_i, ang_vel_b_i, past_rel_w, t_emb, pos_local_i],
                 dim=-1,
-            )  # (E, 37)
+            )  # (E, 40)
             out[:, i, :PER_DRONE_OWN_DIM] = own
 
             # Neighbour features (world frame).
@@ -525,6 +533,14 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             died = ((z < self.cfg.z_min) | (z > self.cfg.z_max)).any(dim=-1)
         else:
             died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        if self.cfg.terminate_on_collision and self.N > 1:
+            diff = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)          # (E, N, N, 3)
+            pair_dist = torch.linalg.norm(diff, dim=-1)              # (E, N, N)
+            eye_m = torch.eye(self.N, device=self.device, dtype=torch.bool).unsqueeze(0)
+            pair_dist = pair_dist.masked_fill(eye_m, float("inf"))
+            crashed = pair_dist.amin(dim=(1, 2)) < self.cfg.hard_collision_dist
+            died = died | crashed
 
         # Success termination: all drones within threshold for hold duration.
         dist = torch.linalg.norm(pos_w - self._goal_pos_w, dim=-1)  # (E, N)

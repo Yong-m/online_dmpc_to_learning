@@ -38,3 +38,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_dmpc_cfg:MultiDroneDmpcPPORunnerCfg",
     },
 )
+
+# RL variant: DMPC runs in parallel as dense reward guide; policy trained with PPO.
+gym.register(
+    id="Isaac-MultiDrone-DMPC-RL-Direct-v0",
+    entry_point=f"{__name__}.multi_drone_dmpc_rl_env:MultiDroneDmpcRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.multi_drone_dmpc_rl_env:MultiDroneDmpcRLEnvCfg",
+    },
+)

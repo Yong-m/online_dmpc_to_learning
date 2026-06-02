@@ -84,6 +84,7 @@ class PolicyFlow(PolicyFlowBase):
 
         # KL-based LR scheduling (disable for EWMA — constant LR recommended)
         self._use_kl_lr_schedule = cfg.get("use_kl_lr_schedule", True)
+        self._use_kl_lr_schedule_critic_only = cfg.get("use_kl_lr_schedule_critic_only", False)
 
         # Actor LR linear warmup: ramp from _actor_lr_warmup_start to _learning_rate
         # over _actor_lr_warmup_steps PPO update() calls.
@@ -118,16 +119,14 @@ class PolicyFlow(PolicyFlowBase):
             ],
             **optim_params,
         )
-        if self._use_kl_lr_schedule:
-            self.lr_schedule = KLAdaptiveLR(
-                self.optimizer,
-                **cfg.get(
-                    "learning_rate_scheduler_kwargs",
-                    {
-                        "kl_threshold": self._desired_kl,
-                    },
-                ),
+        if self._use_kl_lr_schedule or self._use_kl_lr_schedule_critic_only:
+            scheduler_kwargs = cfg.get(
+                "learning_rate_scheduler_kwargs",
+                {"kl_threshold": self._desired_kl},
             )
+            if self._use_kl_lr_schedule_critic_only:
+                scheduler_kwargs = {**scheduler_kwargs, "group_names": ["critic"]}
+            self.lr_schedule = KLAdaptiveLR(self.optimizer, **scheduler_kwargs)
         else:
             self.lr_schedule = None
         self._register_serializable("optimizer")
@@ -293,7 +292,7 @@ class PolicyFlow(PolicyFlowBase):
             # time-limit (truncation) boostrapping
             truncated = environement_info.get("time_outs", torch.zeros_like(dones))
             if self._time_limit_bootstrap:
-                rewards += self._discount_factor * values * truncated
+                rewards += self._discount_factor * values.view(rewards.shape) * truncated
 
             # Lazily register per-env auxiliary tensors (zeros as fallback for non-TRO mode)
             _n_envs = rewards.shape[0]

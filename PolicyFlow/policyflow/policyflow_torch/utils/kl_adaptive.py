@@ -17,6 +17,7 @@ class KLAdaptiveLR(_LRScheduler):
         lr_factor: float = 1.5,
         last_epoch: int = -1,
         verbose: bool = False,
+        group_names: list | None = None,
     ) -> None:
         """Adaptive KL scheduler
 
@@ -63,6 +64,7 @@ class KLAdaptiveLR(_LRScheduler):
         self.max_lr = max_lr
         self._kl_factor = kl_factor
         self._lr_factor = lr_factor
+        self._group_names = set(group_names) if group_names is not None else None
 
         self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
 
@@ -93,6 +95,8 @@ class KLAdaptiveLR(_LRScheduler):
         """
         if kl is not None:
             for group in self.optimizer.param_groups:
+                if self._group_names is not None and group.get("name") not in self._group_names:
+                    continue
                 if kl > self.kl_threshold * self._kl_factor:
                     group["lr"] = max(group["lr"] / self._lr_factor, self.min_lr)
                 elif kl < self.kl_threshold / self._kl_factor:

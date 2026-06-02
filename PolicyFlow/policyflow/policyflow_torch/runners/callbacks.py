@@ -111,6 +111,8 @@ def make_tensorboard_cb(directory):
 
         info: dict = stat["info"]
 
+        if not info:
+            return
         for key in info[0]:
             info_tensor = torch.tensor([], device=runner._device)
             for ep_info in info:

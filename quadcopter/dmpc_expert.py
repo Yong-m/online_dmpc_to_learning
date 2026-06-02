@@ -144,7 +144,7 @@ class DMPCParams:
     spd_o: int = 1
     acc_cost: float = 1.0 #10.0 #8e-3
     lin_coll: float = -1.0e3
-    quad_coll: float = 1.0
+    quad_coll: float = 1000.0
 
     # Collision parameters
     rmin: float = 0.5 #0.3
@@ -453,9 +453,10 @@ class DMPCExpert:
     control rate via :py:meth:`compute`."""
 
     def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu",
-                 num_workers: int | None = None):
+                 num_workers: int | None = None, verbose: bool = True):
         self.N = num_drones
         self.p = params or DMPCParams()
+        self.verbose = verbose
         if self.p.t_segment is None:
             self.p.t_segment = (self.p.k_hor - 1) * self.p.h / self.p.num_segments
         self.device = torch.device(device)
@@ -837,7 +838,7 @@ class DMPCExpert:
 
         # ── per-call timing log (every 10 calls) ──────────────────────────
         self._compute_calls = getattr(self, "_compute_calls", 0) + 1
-        if self._compute_calls % 10 == 1:
+        if self.verbose and self._compute_calls % 10 == 1:
             print(
                 f"[DMPC timing] call={self._compute_calls}"
                 f"  flag={_t_flag*1e3:.1f}ms"
@@ -1175,7 +1176,7 @@ class DMPCExpert:
         self._st_coll_ts[e_arr, i_arr]    = kc_meta
         _t_extract = _time.perf_counter() - _t4
 
-        if _do_log:
+        if _do_log and self.verbose:
             n_coll = int(has_coll_np.sum())
             total  = (_t_init + _t_assemble + _t_q + _t_gpu + _t_extract) * 1e3
             print(
