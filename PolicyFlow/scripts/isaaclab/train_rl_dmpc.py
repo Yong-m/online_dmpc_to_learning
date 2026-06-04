@@ -22,6 +22,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import datetime
 from pathlib import Path
@@ -61,6 +62,19 @@ parser.add_argument("--bc_ref_kl_coef0",    type=float, default=1.0,
                     help="Initial KL coef toward frozen BC policy in RL phase.")
 parser.add_argument("--bc_ref_kl_decay_steps", type=float, default=500.0,
                     help="PPO updates to decay KL coef to ~1/100 of initial.")
+# N curriculum
+parser.add_argument("--n_min", type=int, default=0, 
+                    help="Min active drones for N curriculum (0 = disabled, use --num_drones throughout).") #1
+# Resume with N change
+parser.add_argument("--critic_warmup_iters", type=int, default=10,
+                    help="When resuming with a different num_drones, freeze the actor for this many "
+                         "PPO updates so the new critic can warm up before joint training.")
+# Play / eval mode
+parser.add_argument("--play", action="store_true", default=False,
+                    help="Eval mode: load --resume checkpoint, run policy without training, "
+                         "print success stats. Combine with --n_min to test with inactive drones.")
+parser.add_argument("--eval_episodes", type=int, default=50,
+                    help="Number of complete episodes to evaluate in --play mode.")
 # Wandb
 parser.add_argument("--wandb",           action="store_true", default=False)
 parser.add_argument("--wandb_project",   type=str,   default="dmpc_rl")
@@ -86,6 +100,7 @@ from quadcopter.multi_drone_dmpc_rl_env import (  # noqa: E402
 )
 from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     PER_DRONE_OWN_DIM,
+    PER_DRONE_SDF_DIM,
     PER_NEIGHBOUR_DIM,
 )
 
@@ -233,39 +248,82 @@ class PerAgentActorWrapper:
         x0=None,
         **kwargs,
     ):
-        """(batch, N*3) + (batch, N*P) → per-agent forward; outputs reshaped to (batch, N*3)."""
+        """(batch, N*3) + (batch, N*P) → per-agent forward; outputs reshaped to (batch, N*3).
+
+        Inactive drone slots (curriculum masking) have all-zero obs because the
+        rotation matrix — always non-zero for a real drone — is zeroed along with
+        every other feature.  Those slots are excluded from the CNF forward pass so
+        they do not contribute to the actor loss or the proximal KL term.
+        Per-drone output tensors (velocities) are scattered back to the full (BN, 3)
+        shape with zeros at inactive positions before the final reshape.
+        """
         batch = condition.shape[0]
+        BN    = batch * self.N
+        obs_per = self._split_obs(condition)                    # (BN, P)
+        x1_per  = x1.reshape(BN, 3)                            # (BN, 3)
+        x0_per  = x0.reshape(BN, 3) if x0 is not None else None
+
+        # Detect inactive drones: all features (incl. rotation matrix) are zeroed.
+        active      = obs_per.norm(dim=-1) > 1e-6              # (BN,) bool
+        has_inactive = not active.all().item()
+
+        if has_inactive:
+            obs_in = obs_per[active]
+            x1_in  = x1_per[active]
+            x0_in  = x0_per[active] if x0_per is not None else None
+        else:
+            obs_in, x1_in, x0_in = obs_per, x1_per, x0_per
+
         result = self._cnf.compute_flow_variation(
-            x1        = x1.reshape(batch * self.N, 3),
-            condition = self._split_obs(condition),
-            x0        = x0.reshape(batch * self.N, 3) if x0 is not None else None,
-            **kwargs,
+            x1=x1_in, condition=obs_in, x0=x0_in, **kwargs
         )
 
-        per_agent_shape = (batch * self.N, 3)
+        M = int(active.sum().item()) if has_inactive else BN
 
-        def _r(t: torch.Tensor) -> torch.Tensor:
-            # Only reshape per-agent action tensors (BN, 3) → (B, N*3).
-            # Scalar losses and other shapes pass through unchanged.
-            if t.shape == per_agent_shape:
+        # Precompute scatter index once for all (M, 3) output tensors.
+        idx_3 = active.nonzero(as_tuple=True)[0].unsqueeze(1).expand(-1, 3) if has_inactive else None
+
+        def _out(t: torch.Tensor, inactive_fill: float = 0.0) -> torch.Tensor:
+            """Scatter active-only (M, 3) → (BN, 3) → (B, N*3) differentiably.
+
+            Uses torch.Tensor.scatter (non-in-place) so the autograd graph is
+            preserved from the CNF output to the policy loss.  In-place masked
+            assignment (full[active] = t) would sever the gradient path because
+            `full` is created without requires_grad.
+
+            inactive_fill: value written at inactive drone positions.  Must be
+            a valid float for std-like tensors to prevent NaN in Normal.log_prob.
+            """
+            if t.dim() >= 2 and t.shape[0] == M and has_inactive:
+                base = t.new_full((BN, *t.shape[1:]), inactive_fill)
+                t = base.scatter(0, idx_3, t)   # differentiable scatter
+            if t.shape == (BN, 3):
                 return t.reshape(batch, self.N * 3)
             return t
 
         if not isinstance(result, tuple):
-            return _r(result)
+            return _out(result)
 
         out = []
-        for item in result:
+        for i, item in enumerate(result):
             if isinstance(item, torch.Tensor):
-                out.append(_r(item))
+                if i == 1 and item.dim() >= 2 and item.shape[0] == M and has_inactive:
+                    # result[1] is always std.  Inactive positions must receive a
+                    # valid positive value so Normal(delta_vel, std).log_prob()
+                    # does not produce NaN.  Use the mean of active stds (detached
+                    # constant — no unintended gradient on variance parameter).
+                    with torch.no_grad():
+                        fill_std = float(item.mean().clamp(min=1e-3))
+                    out.append(_out(item, inactive_fill=fill_std))
+                else:
+                    out.append(_out(item))
             elif isinstance(item, tuple):
-                # proximal_info = (vel_tensor (BN,3), std_vec (D,))
-                # Tile per-drone std (3,) → (N*3,) so Normal broadcasts with (batch, N*3).
-                vel = _r(item[0])
+                # proximal_info = (prox_delta_vel (M, 3) detached, prox_std scalar)
+                vel = _out(item[0])
                 std = item[1].repeat(self.N) if item[1].dim() == 1 else item[1]
                 out.append((vel, std))
             else:
-                out.append(item)   # None
+                out.append(item)   # None or scalar
         return tuple(out)
 
     def __getattr__(self, name: str):
@@ -360,8 +418,17 @@ def run_bc_phase(
     num_envs = env.num_envs
     gamma    = AGENT_CFG["discount_factor"]
 
-    bc_expert = DMPCExpert(num_drones=N, params=DMPCParams(), device=device, verbose=False)
-    bc_expert.enable_gpu_admm(max_envs=num_envs)
+    env_cfg_uw = env_uw.cfg
+    ts_bc = env_cfg_uw.sim.dt * env_cfg_uw.decimation
+    bc_expert = DMPCExpert(
+        num_drones=N, num_envs=num_envs, device=device, verbose=False,
+        params=DMPCParams(
+            pmin=env_cfg_uw.pos_min,
+            pmax=env_cfg_uw.pos_max,
+            rmin=env_cfg_uw.rmin,
+            ts=ts_bc,
+        ),
+    )
 
     # Ring buffer (per-drone)
     BUF = 200_000
@@ -491,6 +558,127 @@ def run_bc_phase(
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Play / eval loop                                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+def _run_play(
+    env,            # IsaacLabEnvWrapper
+    actor: PerAgentActorWrapper,
+    N: int,
+    args_cli,
+    device,
+) -> None:
+    """Evaluation loop — runs policy without gradient updates.
+
+    Tracks per-episode success (terminated = all active drones reached goal)
+    and breaks results down by number of active drones when N-curriculum is on.
+    """
+    from collections import defaultdict
+
+    env_uw = env.unwrapped
+    E = env.num_envs
+    curriculum_on = getattr(env_uw, "_curriculum_enabled", False)
+
+    actor._cnf.model.eval()
+
+    ep_results: list[tuple[int, bool]] = []   # (n_active, success)
+    total_done = 0
+    target = args_cli.eval_episodes
+
+    obs, _ = env.reset()
+
+    print(f"\n[Play] running {target} episodes  "
+          f"num_envs={E}  N={N}  n_min={args_cli.n_min}  curriculum={curriculum_on}",
+          flush=True)
+
+    with torch.no_grad():
+        while total_done < target:
+            x0 = torch.randn(E, N * 3, device=device)
+            actions, _ = actor.sample(x0=x0, condition=obs)
+            obs, _, term, trunc, _ = env.step(actions)
+
+            done_envs = (term | trunc).nonzero(as_tuple=True)[0]
+            for e in done_envs.tolist():
+                n_active = int(env_uw._active_n[e].item()) if curriculum_on else N
+                success  = bool(term[e].item())
+                ep_results.append((n_active, success))
+                total_done += 1
+                if total_done >= target:
+                    break
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    total_suc = sum(s for _, s in ep_results)
+    print(f"\n[Play] Results: {total_suc}/{total_done} = {total_suc/total_done:.1%} success")
+
+    if curriculum_on:
+        by_n: dict[int, list[bool]] = defaultdict(list)
+        for n_a, suc in ep_results:
+            by_n[n_a].append(suc)
+        print("[Play] Breakdown by active-drone count:")
+        for n_a in sorted(by_n):
+            suc_list = by_n[n_a]
+            print(f"  N_active={n_a:2d}: {sum(suc_list):3d}/{len(suc_list):3d} "
+                  f"= {sum(suc_list)/len(suc_list):.1%}")
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Resume helper                                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+def _load_resume(runner, path: str, device) -> tuple[int, bool]:
+    """Load a checkpoint, re-initialising the critic if obs_dim changed (N changed).
+
+    Actor weights (NeighborEncoder + FlowMlp) are N-independent and always loaded.
+    The critic's first layer is obs_dim-sized; when num_drones changes the shapes
+    won't match, so critic loading is silently skipped and the critic stays fresh.
+
+    Returns:
+        (iteration, critic_reinit) — iteration from the checkpoint; critic_reinit
+        is True when the critic was NOT loaded (shape mismatch detected).
+    """
+    import re
+
+    content = torch.load(path, map_location=device, weights_only=False)
+    critic_reinit = False
+
+    if "model_state_dicts" in content:
+        # ── Actor: N-independent parameters → always loadable ────────────
+        actor_sd = content["model_state_dicts"].get("actor")
+        if actor_sd is not None:
+            try:
+                runner._model_load_state_dict(runner._agent.model_dict["actor"], actor_sd)
+                print("[Resume] Actor weights loaded.", flush=True)
+            except RuntimeError as exc:
+                print(f"[Resume][WARN] Actor load failed: {exc}. Using fresh actor.", flush=True)
+
+        # ── Critic: obs_dim-dependent → skip on shape mismatch ───────────
+        critic_sd = content["model_state_dicts"].get("critic")
+        if critic_sd is not None:
+            try:
+                runner._model_load_state_dict(runner._agent.model_dict["critic"], critic_sd)
+                print("[Resume] Critic weights loaded.", flush=True)
+            except RuntimeError:
+                print(
+                    "[Resume] Critic shape mismatch (num_drones changed) — "
+                    "reinitialising critic. Actor will be frozen for warmup.",
+                    flush=True,
+                )
+                critic_reinit = True
+        # Optimizer is intentionally NOT restored so both actor and critic
+        # start with a fresh Adam state (correct when N changes).
+    else:
+        # Legacy checkpoint: fall back to standard load (may error if N changed).
+        runner.load(path)
+
+    iteration = content.get("iteration", 0)
+    if iteration == 0:
+        match = re.search(r"model_(\d+)\.pt", os.path.basename(path))
+        if match:
+            iteration = int(match.group(1))
+
+    print(f"[Resume] Checkpoint: iter={iteration}  critic_reinit={critic_reinit}", flush=True)
+    return iteration, critic_reinit
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Main                                                                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main() -> None:
@@ -502,6 +690,8 @@ def main() -> None:
     env_cfg = MultiDroneDmpcRLEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.num_drones     = args_cli.num_drones
+    if args_cli.n_min > 0:
+        env_cfg.n_curriculum_min = args_cli.n_min
     env_cfg.__post_init__()           # recompute action_space / observation_space
 
     env_raw = gym.make("Isaac-MultiDrone-DMPC-RL-Direct-v0", cfg=env_cfg)
@@ -514,21 +704,24 @@ def main() -> None:
     act_dim = gym.spaces.flatdim(env.unwrapped.single_action_space)
     assert act_dim == N * 3, f"Unexpected action dim {act_dim} for N={N}"
 
-    # Per-drone obs dim: own state + (N-1) neighbour features
-    per_drone_dim = PER_DRONE_OWN_DIM + PER_NEIGHBOUR_DIM * (N - 1)
+    # Per-drone obs dim: own state + SDF obstacle grid + (N-1) neighbour features
+    sdf_dim = PER_DRONE_SDF_DIM if env_cfg.enable_sdf_obs else 0
+    own_dim = PER_DRONE_OWN_DIM + sdf_dim
+    per_drone_dim = own_dim + PER_NEIGHBOUR_DIM * (N - 1)
     assert obs_dim == N * per_drone_dim, (
-        f"obs_dim {obs_dim} != N*per_drone_dim {N}*{per_drone_dim}"
+        f"obs_dim {obs_dim} != N*per_drone_dim {N}*{per_drone_dim} "
+        f"(own={own_dim}, sdf={sdf_dim}, neigh={PER_NEIGHBOUR_DIM}*(N-1))"
     )
 
     print(f"[Env] {args_cli.num_envs} envs × {N} drones  "
-          f"obs={obs_dim} (per_drone={per_drone_dim})  act={act_dim}", flush=True)
+          f"obs={obs_dim} (per_drone={per_drone_dim}, sdf={sdf_dim})  act={act_dim}", flush=True)
 
     # ── actor (per-agent shared policy) ──────────────────────────────────────
     emb_dim     = args_cli.emb_dim
     hidden_dims = args_cli.hidden_dims
 
     nn_condition = PerDroneConditionNet(
-        N=N, own_dim=PER_DRONE_OWN_DIM,
+        N=N, own_dim=own_dim,
         neigh_dim=PER_NEIGHBOUR_DIM,
         emb_dim=emb_dim, hidden_dims=hidden_dims,
     ).to(device)
@@ -603,8 +796,36 @@ def main() -> None:
     # ── checkpoint resume ─────────────────────────────────────────────────────
     start_iteration = 0
     if args_cli.resume:
-        start_iteration = runner.load(args_cli.resume)
-        print(f"[Resume] starting from iteration {start_iteration}", flush=True)
+        start_iteration, critic_reinit = _load_resume(runner, args_cli.resume, device)
+
+        # ── Play mode: eval only, no training ────────────────────────────────
+        if args_cli.play:
+            _run_play(env=env, actor=actor, N=N, args_cli=args_cli, device=device)
+            env.close()
+            simulation_app.close()
+            return
+
+        # When the critic was reinitialised (N changed), freeze the actor for
+        # `critic_warmup_iters` PPO updates so the new critic can converge
+        # against a stationary actor before joint training resumes.
+        warmup = args_cli.critic_warmup_iters if critic_reinit else 0
+        if warmup > 0:
+            print(
+                f"[Resume] Freezing actor for {warmup} PPO updates (critic warmup).",
+                flush=True,
+            )
+            for p in cnf.model.parameters():
+                p.requires_grad_(False)
+            runner.train(start_iteration=start_iteration, return_epochs=warmup)
+            for p in cnf.model.parameters():
+                p.requires_grad_(True)
+            start_iteration += warmup
+            print("[Resume] Actor unfrozen — starting full RL.", flush=True)
+    elif args_cli.play:
+        print("[Play] --play requires --resume <checkpoint>. Exiting.", flush=True)
+        env.close()
+        simulation_app.close()
+        return
 
     # ── Phase 1: BC warmup (skipped when --resume is set) ────────────────────
     if args_cli.bc_iters > 0 and not args_cli.resume:

@@ -76,16 +76,18 @@ Implementation choices mirror the paper / config.json:
 Public entry point::
 
     expert = DMPCExpert(num_drones=N, params=DMPCParams(), device=env.device)
-    ref_pos, ref_vel = expert.compute(pos_w, vel_w, goal_w, env_origins)
-    action = env.ref_to_action(ref_pos, ref_vel)
+    ref_pos, ref_vel, ref_acc = expert.compute(pos_w, vel_w, goal_w, env_origins)
+    action = env.ref_to_action(ref_pos, ref_vel, ref_acc)
     env.step(action)
 """
 
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from dataclasses import dataclass
 
 import numpy as np
@@ -93,6 +95,8 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import torch
 from scipy.special import comb, factorial
+
+from typing import Dict, List
 
 try:
     import osqp
@@ -142,14 +146,31 @@ class DMPCParams:
     spd_f: int = 3
     s_obs: float = 100.0
     spd_o: int = 1
-    acc_cost: float = 1.0 #10.0 #8e-3
-    lin_coll: float = -1.0e3
-    quad_coll: float = 1000.0
+    acc_cost: float = 1.0 #1.0 #10.0 #8e-3
+    lin_coll: float = -1.0e3 #-1.0e5
+    quad_coll: float = 1.0 #1.0
 
     # Collision parameters
     rmin: float = 0.5 #0.3
     height_scaling: float = 2.0
-    g_factor: float = 2.0
+    agent_g_factor: float = 2.0
+    obs_g_factor: float = 1.0 #1.2
+
+    enable_emergency: bool = True
+    emergency_repel_factor: float = 1.5
+    emergency_prediction_steps: int = 3
+    # height_scaling_obs: float = 4.0
+
+    # Optional priority metadata. Higher score means the agent has stronger
+    # right-of-way. It is gathered with neighbour predictions but is not yet
+    # consumed by the collision-constraint builder.
+    enable_priority: bool = True
+    priority_goal_enter_dist: float = 0.05
+    priority_goal_exit_dist: float = 0.10
+    priority_hold_score: float = 10.0
+    priority_goal_dist_weight: float = 1.0
+    priority_velocity_align_weight: float = 0.5
+    priority_velocity_eps: float = 1.0e-3
 
     # Event-triggered replanning
     f_min: float = -0.01
@@ -157,10 +178,31 @@ class DMPCParams:
     eps_velocity: float = 0.01
 
     # OSQP options
-    osqp_eps_abs: float = 1e-3
-    osqp_eps_rel: float = 1e-3
-    osqp_max_iter: int = 200 #200
+    osqp_eps_abs: float = 1e-2 # 1e-3
+    osqp_eps_rel: float = 1e-2 # 1e-3
+    osqp_max_iter: int = 400 #200
     osqp_polish: bool = False
+
+    # GPU ADMM parameters
+    max_envs: int = 10
+    rho: float = 1.5
+    admm_iters: int = 200
+    alpha: float = 1.6   # over-relaxation; 1.0 = plain ADMM, 1.6 = OSQP default (~40% faster)
+    reg: float = 1e-6
+    admm_eps_abs: float = 1e-2
+    admm_eps_rel: float = 1e-2
+    # Penalty-mode collision weight. In soft-slot mode, the slack cost uses
+    # admm_soft_quad_coll/admm_lin_coll below.
+    admm_quad_coll: float = 1.0
+    admm_lin_coll: float = -1.0e3
+    admm_collision_slots: int = 8 # 0 keeps penalty CA; >0 uses fixed-slot soft CA in GPU ADMM.
+    enable_admm_fallback: bool = False
+    # Penalty CA fallback: when soft-slot solve fails, re-solve with penalty CA (admm_collision_slots=0).
+    enable_penalty_fallback: bool = True
+    admm_penalty_iters: int = 50
+    # Penalty gradient weight for penalty-CA path. Matches the original quad_coll=1000
+    # used before soft-slot CA was introduced.
+    admm_penalty_quad_coll: float = 1000.0
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -298,153 +340,6 @@ def _build_state_propagator(A_d: np.ndarray, B_d: np.ndarray, K: int) -> tuple[n
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Batched GPU ADMM QP solver
-# ───────────────────────────────────────────────────────────────────────────
-
-class BatchedGPUDMPC:
-    """Batched ADMM solver for the constant-structure DMPC QP.
-
-    All (env, agent) pairs without active collision constraints share the same
-    constraint matrix  A_fixed = [A_cont ; M_deriv_0[0..d] ; M_pos_hor ; M_acc_hor]
-    and (in the free-cost mode) the same Hessian H.  The KKT factor L from
-    H + rho*A^T*A  is computed once at init; every GPU solve then needs only
-    two batched triangular solves plus element-wise clamp/axpy ops—all on GPU.
-
-    Warm-start tensors (z, y) are maintained per (env, agent) across replanning
-    windows, stored at flat index  e * N_agents + i  in pre-allocated buffers.
-
-    Agents with active collision constraints must be handled by the caller
-    (e.g., fall back to CPU OSQP).
-
-    ADMM iteration (OSQP formulation):
-        x-update:  (H + rho A^T A) x  =  -q + A^T (rho z - y)
-        z-update:  z  =  clip( A x + y/rho,  l,  u )
-        y-update:  y  =  y + rho (A x - z)
-
-    Equality constraints are handled as  l_i = u_i = b_eq_i  (box of width 0).
-    """
-
-    def __init__(
-        self,
-        n_bez: int,
-        H_bez: np.ndarray,
-        A_cont: np.ndarray,
-        M_deriv_0: list[np.ndarray],
-        M_pos_hor: np.ndarray,
-        M_acc_hor: np.ndarray,
-        pmin_vec: np.ndarray,
-        pmax_vec: np.ndarray,
-        amin_vec: np.ndarray,
-        amax_vec: np.ndarray,
-        max_B: int,
-        rho: float = 1.0,
-        admm_iters: int = 50,
-        alpha: float = 1.6,
-        device: str | torch.device = "cuda",
-        reg: float = 1e-6,
-    ) -> None:
-        self.device = torch.device(device)
-        self.n_bez = n_bez
-        self.rho = rho
-        self.admm_iters = admm_iters
-        self.alpha = alpha  # OSQP-style over-relaxation (1.6 is OSQP default)
-        self.max_B = max_B
-
-        # ── Partition constraint rows ─────────────────────────────────────
-        n_eq_cont = A_cont.shape[0]
-        A_init_np = [M.astype(np.float64) for M in M_deriv_0]
-        n_eq_init = sum(M.shape[0] for M in A_init_np)
-        self.n_eq_cont = n_eq_cont
-        self.n_eq_init = n_eq_init
-        self.n_eq = n_eq_cont + n_eq_init
-
-        A_ineq_np = np.vstack([M_pos_hor, M_acc_hor]).astype(np.float64)
-        self.n_ineq = A_ineq_np.shape[0]
-        self.m = self.n_eq + self.n_ineq
-
-        # ── Constant A_fixed (m, n_bez) ───────────────────────────────────
-        A_fixed_np = np.vstack(
-            [A_cont.astype(np.float64)] + A_init_np + [A_ineq_np]
-        )
-
-        # ── KKT = H + rho * A^T A, Cholesky-factored in float64 ──────────
-        KKT_np = H_bez.astype(np.float64) + rho * (A_fixed_np.T @ A_fixed_np)
-        KKT_np = 0.5 * (KKT_np + KKT_np.T) + reg * np.eye(n_bez)
-        KKT_t = torch.from_numpy(KKT_np).to(dtype=torch.float64, device=self.device)
-        self._L = torch.linalg.cholesky(KKT_t).float()  # (n, n), lower-triangular float32
-        self._L_T = self._L.T.contiguous()
-
-        self._A = torch.from_numpy(A_fixed_np).float().to(self.device)  # (m, n)
-
-        # ── Constant inequality bounds ────────────────────────────────────
-        l_ineq = np.concatenate([pmin_vec, amin_vec]).astype(np.float32)
-        u_ineq = np.concatenate([pmax_vec, amax_vec]).astype(np.float32)
-        self._l_ineq = torch.from_numpy(l_ineq).to(self.device)
-        self._u_ineq = torch.from_numpy(u_ineq).to(self.device)
-
-        # ── Warm-start buffers (max_B, m) ─────────────────────────────────
-        self._z = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
-        self._y = torch.zeros(max_B, self.m, dtype=torch.float32, device=self.device)
-
-    def reset_warm_start(self, flat_indices: torch.Tensor | None = None) -> None:
-        """Zero warm-start for the given flat indices (all if None)."""
-        if flat_indices is None:
-            self._z.zero_()
-            self._y.zero_()
-        else:
-            idx = flat_indices.to(self.device)
-            self._z[idx] = 0.0
-            self._y[idx] = 0.0
-
-    @torch.no_grad()
-    def solve(
-        self,
-        q_batch: torch.Tensor,       # (B, n_bez) float32 on device
-        b_eq_batch: torch.Tensor,    # (B, n_eq) float32 on device
-        flat_indices: torch.Tensor,  # (B,) int64
-    ) -> torch.Tensor:               # (B, n_bez) float32
-        """Warm-started batched ADMM solve.  Returns primal solutions (B, n_bez)."""
-        B = q_batch.shape[0]
-        rho = self.rho
-        A = self._A       # (m, n)
-        L = self._L       # (n, n) lower-triangular
-        L_T = self._L_T   # (n, n) upper-triangular
-
-        # Per-problem bounds (B, m): equality rows have l=u=b_eq
-        l = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
-        u = torch.empty(B, self.m, dtype=torch.float32, device=self.device)
-        l[:, : self.n_eq] = b_eq_batch
-        u[:, : self.n_eq] = b_eq_batch
-        l[:, self.n_eq :].copy_(self._l_ineq)
-        u[:, self.n_eq :].copy_(self._u_ineq)
-
-        z = self._z[flat_indices].clone()  # (B, m)
-        y = self._y[flat_indices].clone()
-        inv_rho = 1.0 / rho
-        alpha = self.alpha
-        one_minus_alpha = 1.0 - alpha
-
-        for _ in range(self.admm_iters):
-            # x-update: KKT x = -q + A^T(rho*z - y)  →  two triangular solves
-            rhs = (-q_batch + (rho * z - y) @ A).T.contiguous()  # (n, B)
-            fwd = torch.linalg.solve_triangular(L, rhs, upper=False)  # (n, B)
-            x = torch.linalg.solve_triangular(L_T, fwd, upper=True).T  # (B, n)
-
-            # Over-relaxed z-update (Boyd 2011, Eq 3.21-3.23 with unscaled dual y):
-            #   z_hat = alpha*Ax + (1-alpha)*z_prev   [over-relaxed proxy for Ax]
-            #   z_new = clip(z_hat + y/rho, l, u)
-            #   y    += rho * (z_hat - z_new)          [= standard ADMM when alpha=1]
-            Ax = x @ A.T                                       # (B, m)
-            z_hat = alpha * Ax + one_minus_alpha * z           # uses OLD z
-            z = torch.clamp(z_hat + y * inv_rho, l, u)        # NEW z
-            y = y + rho * (z_hat - z)
-
-        self._z[flat_indices] = z
-        self._y[flat_indices] = y
-        return x
-
-
-# ───────────────────────────────────────────────────────────────────────────
 # DMPC expert
 # ───────────────────────────────────────────────────────────────────────────
 class DMPCExpert:
@@ -452,11 +347,12 @@ class DMPCExpert:
     multiple agents, plus a method to evaluate the trajectory at the env
     control rate via :py:meth:`compute`."""
 
-    def __init__(self, num_drones: int, params: DMPCParams | None = None, device="cpu",
+    def __init__(self, num_drones: int, num_envs: int = 1, params: DMPCParams | None = None, device="cpu",
                  num_workers: int | None = None, verbose: bool = True):
         self.N = num_drones
-        self.p = params or DMPCParams()
+        self.E = num_envs
         self.verbose = verbose
+        self.p = params or DMPCParams()
         if self.p.t_segment is None:
             self.p.t_segment = (self.p.k_hor - 1) * self.p.h / self.p.num_segments
         self.device = torch.device(device)
@@ -538,9 +434,47 @@ class DMPCExpert:
         #                so the reference is C^{deg_poly}-continuous.
         #   "steps"      subsample counter modulo n_substeps
         self._state: dict[tuple[int, int], dict] = {}
+        # Hysteresis latch for priority: agents that have reached their goal
+        # keep right-of-way until they clearly leave the goal ball.
+        self._priority_hold: dict[tuple[int, int], bool] = {}
+        # Dense cache arrays for vectorized get_pos_ctrl_pts (GPU path).
+        # _st_U[e, i, :] mirrors _state[(e,i)]["U"]; _st_has[e, i] tracks validity.
+        self._st_U   = np.zeros((num_envs, self.N, self.n_bez), dtype=np.float32)
+        self._st_has = np.zeros((num_envs, self.N), dtype=bool)
 
-        # Batched GPU ADMM solver (None until enable_gpu_admm() is called).
-        self._gpu_solver: BatchedGPUDMPC | None = None
+        # Wall-time accounting for per-agent QP/replan calls. These values are
+        # updated from worker threads, so keep mutations behind a small lock.
+        self._timing_lock = Lock()
+        self._qp_wall_time_total = 0.0
+        self._qp_wall_time_count = 0
+        self._qp_wall_time_last = 0.0
+        self._qp_wall_time_max = 0.0
+
+    def reset_qp_timing_stats(self) -> None:
+        with self._timing_lock:
+            self._qp_wall_time_total = 0.0
+            self._qp_wall_time_count = 0
+            self._qp_wall_time_last = 0.0
+            self._qp_wall_time_max = 0.0
+
+    def get_qp_timing_stats(self) -> dict[str, float]:
+        with self._timing_lock:
+            count = self._qp_wall_time_count
+            total = self._qp_wall_time_total
+            return {
+                "count": float(count),
+                "total_s": float(total),
+                "avg_s": float(total / count) if count > 0 else 0.0,
+                "last_s": float(self._qp_wall_time_last),
+                "max_s": float(self._qp_wall_time_max),
+            }
+
+    def _record_qp_wall_time(self, elapsed_s: float) -> None:
+        with self._timing_lock:
+            self._qp_wall_time_total += float(elapsed_s)
+            self._qp_wall_time_count += 1
+            self._qp_wall_time_last = float(elapsed_s)
+            self._qp_wall_time_max = max(self._qp_wall_time_max, float(elapsed_s))
 
     # ───────────────────────────────────────────────────────────────────
     # Constant cost
@@ -571,6 +505,8 @@ class DMPCExpert:
 
         self._Q_diag_free, self._H_bez_free = _make_mode(self.p.s_free, self.p.spd_f)
         self._Q_diag_obs, self._H_bez_obs = _make_mode(self.p.s_obs, self.p.spd_o)
+        # self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.0, 0)
+        self._Q_diag_emergency, self._H_bez_emergency = _make_mode(0.001 * self.p.s_obs, self.p.spd_o)
 
     def _build_energy_quadratic(self) -> np.ndarray:
         """``H`` such that ``U^T H U = integral ||u''(t)||^2 dt``."""
@@ -590,6 +526,67 @@ class DMPCExpert:
             c = s * self.bezier.n_per_seg
             H[c : c + self.bezier.n_per_seg, c : c + self.bezier.n_per_seg] = seg_H
         return H
+    
+    def _precompute_static_obstacle_coeffs(self, obstacle_info: Dict | None):
+        # Precompute coefficients (e.g., covering ellipsoid) as obstacle support grows.
+        self._obstacle_info = obstacle_info
+        self._num_static_obstacles = 0
+        self._obstacle_pos_w = None
+        self._obstacle_pos_local = None
+
+        if obstacle_info is None:
+            return
+
+        obstacle_pos_w = obstacle_info.get("ellipsoid_pos_w", obstacle_info.get("pos_w"))
+        if obstacle_pos_w is None:
+            return
+
+        self._num_static_obstacles = int(obstacle_pos_w.shape[1])
+        self._obstacle_pos_w = obstacle_pos_w.detach().cpu().numpy()
+
+        params = obstacle_info.get("params", {})
+        ellipsoid_axes = params.get("ellipsoid_axes")
+        if ellipsoid_axes is not None:
+            ellipsoid_axes = np.asarray(ellipsoid_axes, dtype=np.float64)
+            if ellipsoid_axes.ndim == 1:
+                ellipsoid_axes = np.tile(ellipsoid_axes[None, :], (self._num_static_obstacles, 1))
+            if ellipsoid_axes.shape[0] != self._num_static_obstacles:
+                repeats = int(np.ceil(self._num_static_obstacles / max(ellipsoid_axes.shape[0], 1)))
+                ellipsoid_axes = np.tile(ellipsoid_axes, (repeats, 1))[: self._num_static_obstacles]
+            theta_inv = np.zeros((self.E, self._num_static_obstacles, 3, 3), dtype=np.float64)
+            for j in range(self._num_static_obstacles):
+                theta_inv[:, j, :, :] = np.diag(1.0 / np.maximum(ellipsoid_axes[j], 1e-6))
+            self._obs_theta_inv = theta_inv
+            self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
+            return
+
+        shape_name = obstacle_info.get("shape_name")
+        if shape_name == "SphereCfg":
+            # TODO: set heterogeneous obstacles & parse info.
+            self._obs_theta_inv = np.asarray(
+                [[np.eye(3) for _ in range(self._num_static_obstacles)] for _ in range(self.E)]
+            )
+            self._obs_rmin = np.asarray(
+                [[params.get("radius") + 0.25 for _ in range(self._num_static_obstacles)] for _ in range(self.E)]
+            )
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
+        elif shape_name == "CuboidCfg":
+            size = np.asarray(params.get("size"), dtype=np.float64)
+            # Fallback: cover each cuboid by one ellipsoid. Prefer the split
+            # ellipsoid set above for narrow passages.
+            margin = float(params.get("ellipsoid_margin", 0.25))
+            semi_axes = np.sqrt(3.0) * 0.5 * size + margin
+            theta_inv = np.diag(1.0 / np.maximum(semi_axes, 1e-6))
+            self._obs_theta_inv = np.tile(
+                theta_inv[None, None, :, :],
+                (self.E, self._num_static_obstacles, 1, 1),
+            )
+            self._obs_rmin = np.ones((self.E, self._num_static_obstacles), dtype=np.float64)
+            self._obs_g_thres = self.p.obs_g_factor * self._obs_rmin
+        else:
+            # TODO: support other shapes
+            raise NotImplementedError(f"Unsupported obstacle type: {shape_name}")
 
     # ───────────────────────────────────────────────────────────────────
     # Public API
@@ -602,7 +599,7 @@ class DMPCExpert:
         goal_w: torch.Tensor,
         env_origins: torch.Tensor | None = None,
         env_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Advance one control step.
 
         Internally replans the Bezier curve every ``h`` seconds and samples it
@@ -616,10 +613,10 @@ class DMPCExpert:
                 ``pmin/pmax`` is interpreted in env-local coordinates so all
                 envs share the same QP geometry.
             env_ids: optional 1-D tensor selecting a subset of envs to plan
-                for. For envs not in ``env_ids`` we output ``(pos_w, 0)``.
+                for. For envs not in ``env_ids`` we output ``(pos_w, 0, 0)``.
 
         Returns:
-            ``(ref_pos_w, ref_vel_w)`` each ``(E, N, 3)``.
+            ``(ref_pos_w, ref_vel_w, ref_acc_w)`` each ``(E, N, 3)``.
         """
         E = pos_w.shape[0]
         device = self.device
@@ -636,176 +633,110 @@ class DMPCExpert:
             origins_np = env_origins.detach().cpu().numpy().astype(np.float64)
             pos_np_local = pos_np - origins_np[:, None, :]
             goal_np_local = goal_np - origins_np[:, None, :]
+            if self._obstacle_pos_w is not None:
+                self._obstacle_pos_local = self._obstacle_pos_w - origins_np[:, None, :]
         else:
             origins_np = None
             pos_np_local = pos_np
             goal_np_local = goal_np
+            self._obstacle_pos_local = self._obstacle_pos_w
 
         ts = self.p.ts
         h_total = (self.p.k_hor - 1) * self.p.h
-        K = self.p.k_hor
         N = self.N
         env_list = list(env_iter)
-
-        import time as _time
-        _tc0 = _time.perf_counter()
+        _tc0 = time.perf_counter()
         E_n = len(env_list)
-        env_arr  = np.array(env_list, dtype=np.intp)           # (E_n,)
-        e_all    = np.repeat(env_arr, N)                        # (E_n*N,)
-        i_all    = np.tile(np.arange(N, dtype=np.intp), E_n)   # (E_n*N,)
 
         # sub-timers (set in GPU block, 0 for OSQP path)
         _t_flag = _t_nbr = _t_check = 0.0
 
-        if self._gpu_solver is not None:
-            # ── GPU path: fully vectorised, no per-agent Python loops ─────
-
-            # Phase 1a: reset flags — numpy batch, no Python loop
-            _ta = _time.perf_counter()
-            self._st_replanned[env_arr, :]  = False
-            self._st_reset_mode[env_arr, :] = False
-            self._st_fallback[env_arr, :]   = False
-            _t_flag = _time.perf_counter() - _ta
-
-            # Phase 1b: build nbr_preds_arr via numpy fancy indexing — no loop
-            # _st_u_pred[e,i] = (K,3) plan or zeros for uninitialised agents.
-            # For uninitialised agents: use stationary position tiled K times.
-            _tb = _time.perf_counter()
-            upred_all = self._st_u_pred[env_arr]         # (E_n, N, K, 3)
-            has_all   = self._st_has[env_arr]            # (E_n, N)
-            pos_tiled = np.repeat(
-                pos_np_local[env_arr, :, np.newaxis, :], K, axis=2
-            )  # (E_n, N, K, 3)
-            upred_safe = np.where(
-                has_all[:, :, np.newaxis, np.newaxis], upred_all, pos_tiled
-            )  # (E_n, N, K, 3)
-            # nbr_preds_arr[e_idx, i] = predictions of the N-1 neighbours of i
-            nbr_preds_arr = upred_safe[:, self._neighbor_idx]   # (E_n,N,N-1,K,3)
-            valid_nbr_arr = has_all[:, self._neighbor_idx]       # (E_n, N, N-1)
-            _t_nbr = _time.perf_counter() - _tb
-
-            # Phase 2: replan condition via numpy — no dict loop
-            _tc_chk = _time.perf_counter()
-            needs_replan = (
-                (~self._st_has[e_all, i_all]) |
-                (self._st_steps[e_all, i_all] % self.n_substeps == 0)
-            )  # (E_n*N,)
-            replan_e_arr = e_all[needs_replan]
-            replan_i_arr = i_all[needs_replan]
-            _t_check = _time.perf_counter() - _tc_chk
-
-            _tc1 = _time.perf_counter()
-
-            if replan_e_arr.size > 0:
-                self._plan_batched_gpu(
-                    replan_e_arr, replan_i_arr,
-                    nbr_preds_arr, valid_nbr_arr,
-                    pos_np_local, vel_np, goal_np_local,
+        # ── OSQP / CPU path: unchanged serial logic ───────────────────
+        priority_scores = self._compute_priority_scores(pos_np_local, vel_np, goal_np_local, env_list)
+        nbr_preds: dict[tuple[int, int], np.ndarray] = {}
+        nbr_priorities: dict[tuple[int, int], np.ndarray] = {}
+        nbr_ids: dict[tuple[int, int], list[int]] = {}
+        for e in env_list:
+            for i in range(N):
+                st = self._state.get((e, i))
+                if st is not None:
+                    st["last_replanned"] = False
+                    st["last_reset_mode"] = False
+                    st["last_fallback"] = False
+                    st["last_emergency_mode"] = False
+                nbr_preds[(e, i)], nbr_priorities[(e, i)], nbr_ids[(e, i)] = self._gather_neighbour_predictions(
+                    e, i, pos_np_local, priority_scores
                 )
 
-            _tc2 = _time.perf_counter()
+        _tc1 = time.perf_counter()
 
-            # Phase 3: sample references — no per-agent Python loop
-            _S_pos = getattr(self, "_S_pos_cache", None)
-            if _S_pos is None or len(_S_pos) != self.n_substeps:
-                self._S_pos_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=0
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
-                self._S_vel_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=1
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
-                self._S_acc_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=2
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
+        replan_tasks = [
+            (e, i) for e in env_list for i in range(N)
+            if (self._state.get((e, i)) is None
+                or self._state[(e, i)]["steps"] % self.n_substeps == 0)
+        ]
 
-            all_U   = self._st_U[e_all, i_all].astype(np.float32)    # (E_n*N, n_bez)
-            all_sub = (self._st_steps[e_all, i_all] % self.n_substeps).astype(np.int32)
-            self._st_steps[e_all, i_all] += 1                        # batch increment
-            if origins_np is not None:
-                all_ori = np.repeat(origins_np[env_arr], N, axis=0).astype(np.float32)
-            else:
-                all_ori = np.zeros((E_n * N, 3), dtype=np.float32)
-
-        else:
-            # ── OSQP / CPU path: unchanged serial logic ───────────────────
-            nbr_preds: dict[tuple[int, int], np.ndarray] = {}
-            for e in env_list:
-                for i in range(N):
-                    st = self._state.get((e, i))
-                    if st is not None:
-                        st["last_replanned"] = False
-                        st["last_reset_mode"] = False
-                        st["last_fallback"] = False
-                    nbr_preds[(e, i)] = self._gather_neighbour_predictions(e, i, pos_np_local)
-
-            _tc1 = _time.perf_counter()
-
-            replan_tasks = [
-                (e, i) for e in env_list for i in range(N)
-                if (self._state.get((e, i)) is None
-                    or self._state[(e, i)]["steps"] % self.n_substeps == 0)
-            ]
-
-            def _do_replan(ei: tuple[int, int]) -> None:
-                e, i = ei
+        def _do_replan(ei: tuple[int, int]) -> None:
+            e, i = ei
+            t_qp0 = time.perf_counter()
+            try:
                 self._replan_agent(
                     e, i,
+                    nbr_ids=nbr_ids[(e, i)],
                     pos_local=pos_np_local[e, i],
                     vel=vel_np[e, i],
                     goal_local=goal_np_local[e, i],
+                    own_priority_score=priority_scores[e][i],
                     nbr_pred=nbr_preds[(e, i)],
+                    nbr_priority_scores=nbr_priorities[(e, i)],
                 )
+            finally:
+                self._record_qp_wall_time(time.perf_counter() - t_qp0)
 
-            if self._pool is not None and len(replan_tasks) > 1:
-                list(self._pool.map(_do_replan, replan_tasks))
-            else:
-                for task in replan_tasks:
-                    _do_replan(task)
+        if self._pool is not None and len(replan_tasks) > 1:
+            list(self._pool.map(_do_replan, replan_tasks))
+        else:
+            for task in replan_tasks:
+                _do_replan(task)
 
-            _tc2 = _time.perf_counter()
+        _tc2 = time.perf_counter()
 
-            # Phase 3: serial U collection (OSQP path)
-            _S_pos = getattr(self, "_S_pos_cache", None)
-            if _S_pos is None or len(_S_pos) != self.n_substeps:
-                self._S_pos_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=0
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
-                self._S_vel_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=1
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
-                self._S_acc_cache = [
-                    self.bezier.sample_matrix(
-                        np.array([min((k + 1) * ts, h_total)]), deriv=2
-                    ).astype(np.float32) for k in range(self.n_substeps)
-                ]
+        # Phase 3: serial U collection (OSQP path)
+        _S_pos = getattr(self, "_S_pos_cache", None)
+        if _S_pos is None or len(_S_pos) != self.n_substeps:
+            self._S_pos_cache = [
+                self.bezier.sample_matrix(
+                    np.array([min((k + 1) * ts, h_total)]), deriv=0
+                ).astype(np.float32) for k in range(self.n_substeps)
+            ]
+            self._S_vel_cache = [
+                self.bezier.sample_matrix(
+                    np.array([min((k + 1) * ts, h_total)]), deriv=1
+                ).astype(np.float32) for k in range(self.n_substeps)
+            ]
+            self._S_acc_cache = [
+                self.bezier.sample_matrix(
+                    np.array([min((k + 1) * ts, h_total)]), deriv=2
+                ).astype(np.float32) for k in range(self.n_substeps)
+            ]
 
-            all_U   = np.empty((E_n * N, self.n_bez), dtype=np.float32)
-            all_sub = np.empty(E_n * N, dtype=np.int32)
-            all_ori = np.empty((E_n * N, 3), dtype=np.float32)
-            flat = 0
-            for e in env_list:
-                origin_e = (origins_np[e] if origins_np is not None
-                            else np.zeros(3, dtype=np.float64))
-                for i in range(N):
-                    st = self._state[(e, i)]
-                    all_U[flat]   = st["U"].astype(np.float32)
-                    all_sub[flat] = st["steps"] % self.n_substeps
-                    all_ori[flat] = origin_e
-                    st["steps"] += 1
-                    flat += 1
+        all_U   = np.empty((E_n * N, self.n_bez), dtype=np.float32)
+        all_sub = np.empty(E_n * N, dtype=np.int32)
+        all_ori = np.empty((E_n * N, 3), dtype=np.float32)
+        flat = 0
+        for e in env_list:
+            origin_e = (origins_np[e] if origins_np is not None
+                        else np.zeros(3, dtype=np.float64))
+            for i in range(N):
+                st = self._state[(e, i)]
+                all_U[flat]   = st["U"].astype(np.float32)
+                all_sub[flat] = st["steps"] % self.n_substeps
+                all_ori[flat] = origin_e
+                st["steps"] += 1
+                flat += 1
 
         # One batched matmul per unique substep index.
-        _tp3 = _time.perf_counter()
+        _tp3 = time.perf_counter()
         all_pos = np.empty((E_n * N, 3), dtype=np.float32)
         all_vel = np.empty((E_n * N, 3), dtype=np.float32)
         all_acc = np.zeros( (E_n * N, 3), dtype=np.float32)
@@ -813,13 +744,14 @@ class DMPCExpert:
             mask = all_sub == k
             if not mask.any():
                 continue
+            # S_pos/vel/acc: (1, n_bez) → squeeze for broadcast
             all_pos[mask] = (all_U[mask] @ self._S_pos_cache[k].T).reshape(-1, 3) + all_ori[mask]
             all_vel[mask] = (all_U[mask] @ self._S_vel_cache[k].T).reshape(-1, 3)
             all_acc[mask] = (all_U[mask] @ self._S_acc_cache[k].T).reshape(-1, 3)
-        _t_phase3 = _time.perf_counter() - _tp3
+        _t_phase3 = time.perf_counter() - _tp3
 
-        # Write results back to ref tensors — three bulk CUDA transfers.
-        _tw = _time.perf_counter()
+        # Write results back to ref tensors — two bulk CUDA transfers.
+        _tw = time.perf_counter()
         all_pos_t = torch.from_numpy(all_pos).to(device).reshape(E_n, N, 3)
         all_vel_t = torch.from_numpy(all_vel).to(device).reshape(E_n, N, 3)
         all_acc_t = torch.from_numpy(all_acc).to(device).reshape(E_n, N, 3)
@@ -832,13 +764,13 @@ class DMPCExpert:
             ref_pos[env_t] = all_pos_t
             ref_vel[env_t] = all_vel_t
             ref_acc[env_t] = all_acc_t
-        _t_write = _time.perf_counter() - _tw
+        _t_write = time.perf_counter() - _tw
 
-        _tc3 = _time.perf_counter()
+        _tc3 = time.perf_counter()
 
         # ── per-call timing log (every 10 calls) ──────────────────────────
         self._compute_calls = getattr(self, "_compute_calls", 0) + 1
-        if self.verbose and self._compute_calls % 10 == 1:
+        if self._compute_calls % 100 == 1:
             print(
                 f"[DMPC timing] call={self._compute_calls}"
                 f"  flag={_t_flag*1e3:.1f}ms"
@@ -858,339 +790,22 @@ class DMPCExpert:
         notation prefer "plan" -- semantically identical."""
         return self.compute(*args, **kwargs)
 
-    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+    def reset(self, env_ids: torch.Tensor | None = None, obstacle_info: Dict | None = None) -> None:
         """Drop per-agent cached state for the given envs (all by default)."""
+        self._precompute_static_obstacle_coeffs(obstacle_info)
         if env_ids is None:
             self._state.clear()
-            if self._gpu_solver is not None:
-                self._gpu_solver.reset_warm_start()
-                self._st_has[:]        = False
-                self._st_steps[:]      = 0
-                self._st_replanned[:]  = False
-                self._st_reset_mode[:] = False
-                self._st_fallback[:]   = False
-                self._st_coll_ts[:]    = -1
+            self._priority_hold.clear()
+            self._st_has[:] = False
             return
         ids_list = [int(i) for i in env_ids.detach().cpu().tolist()]
         ids = set(ids_list)
         self._state = {k: v for k, v in self._state.items() if k[0] not in ids}
-        if self._gpu_solver is not None:
-            ids_np = np.array(ids_list, dtype=np.intp)
-            self._st_has[ids_np]        = False
-            self._st_steps[ids_np]      = 0
-            self._st_replanned[ids_np]  = False
-            self._st_reset_mode[ids_np] = False
-            self._st_fallback[ids_np]   = False
-            self._st_coll_ts[ids_np]    = -1
-            flat = [e * self.N + i for e in ids for i in range(self.N)]
-            if flat:
-                self._gpu_solver.reset_warm_start(
-                    torch.tensor(flat, dtype=torch.long)
-                )
-
-    # ───────────────────────────────────────────────────────────────────
-    # GPU ADMM batch solver
-    # ───────────────────────────────────────────────────────────────────
-
-    def enable_gpu_admm(
-        self,
-        max_envs: int,
-        rho: float = 1.0,
-        admm_iters: int = 50,
-        alpha: float = 1.6,
-        device: str | torch.device | None = None,
-    ) -> None:
-        """Enable batched GPU ADMM solver.
-
-        Collision constraints are handled as a penalty term added to the linear
-        cost q (equivalent to eliminating the slack variable from the original
-        soft-constraint formulation).  All agents are solved on GPU — no CPU fallback.
-
-        Args:
-            max_envs:    Upper bound on the number of parallel environments.
-            rho:         ADMM penalty.  Default 1.0.
-            admm_iters:  ADMM iterations per window.  Default 50.
-            alpha:       Over-relaxation factor.  Range (1, 2).  Default 1.6.
-            device:      Target device.  Defaults to CUDA if available, else CPU.
-        """
-        if device is None:
-            device = (
-                self.device
-                if self.device.type == "cuda"
-                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            )
-        self._gpu_solver = BatchedGPUDMPC(
-            n_bez=self.n_bez,
-            H_bez=self._H_bez_free,
-            A_cont=self.A_continuity,
-            M_deriv_0=self._M_deriv_0,
-            M_pos_hor=self.M_pos_hor,
-            M_acc_hor=self.M_acc_hor,
-            pmin_vec=self._pmin,
-            pmax_vec=self._pmax,
-            amin_vec=self._amin,
-            amax_vec=self._amax,
-            max_B=max_envs * self.N,
-            rho=rho,
-            admm_iters=admm_iters,
-            alpha=alpha,
-            device=device,
-        )
-
-        # Numpy state arrays — GPU hot path reads/writes these instead of
-        # the Python dict, eliminating per-agent Python loop overhead.
-        K    = self.p.k_hor
-        deg1 = self.p.deg_poly + 1
-        N_   = self.N
-        self._st_has        = np.zeros((max_envs, N_), dtype=bool)
-        self._st_U          = np.zeros((max_envs, N_, self.n_bez), dtype=np.float64)
-        self._st_u_pred     = np.zeros((max_envs, N_, K, 3),       dtype=np.float64)
-        self._st_seeds      = np.zeros((max_envs, N_, deg1, 3),    dtype=np.float64)
-        self._st_steps      = np.zeros((max_envs, N_),             dtype=np.int32)
-        # Flag arrays for data logging — written per-replan, reset every compute() call
-        self._st_replanned  = np.zeros((max_envs, N_), dtype=bool)
-        self._st_reset_mode = np.zeros((max_envs, N_), dtype=bool)
-        self._st_fallback   = np.zeros((max_envs, N_), dtype=bool)
-        self._st_coll_ts    = np.full((max_envs, N_), -1, dtype=np.int32)
-
-        # Per-agent neighbor index table: row i = indices of all j ≠ i  (N, N-1)
-        self._neighbor_idx = np.array(
-            [[j for j in range(N_) if j != i] for i in range(N_)],
-            dtype=np.intp,
-        )
-
-        # Pre-cache float32 GPU tensors for Phase C — fixed matrices that never
-        # change between calls, uploaded once here to avoid repeated CPU→GPU transfers.
-        _dev = self._gpu_solver.device
-        self._t_Fx    = torch.from_numpy(self._Fx_pos_pred.astype(np.float32)).to(_dev)
-        self._t_Qd    = torch.from_numpy(self._Q_diag_free.astype(np.float32)).to(_dev)
-        self._t_Gp    = torch.from_numpy(self._G_pos_pred.astype(np.float32)).to(_dev)
-        self._t_Phi   = torch.from_numpy(
-            self.M_pos_hor.astype(np.float32).reshape(K, 3, self.n_bez)
-        ).to(_dev)  # (K, 3, n_bez)
-        self._t_thinv = torch.from_numpy(
-            np.diag(self._Theta_inv).astype(np.float32)
-        ).to(_dev)  # (3,)
-
-    def _plan_batched_gpu(
-        self,
-        e_arr: np.ndarray,              # (B,) env indices
-        i_arr: np.ndarray,              # (B,) agent indices
-        nbr_preds_arr: np.ndarray,      # (E, N, N-1, K, 3) — prebuilt by compute()
-        valid_nbr_arr: np.ndarray,      # (E, N, N-1) bool
-        pos_np_local: np.ndarray,
-        vel_np: np.ndarray,
-        goal_np_local: np.ndarray,
-    ) -> None:
-        """Solve a batch of replanning QPs on GPU.
-
-        All phases are fully vectorised — zero per-agent Python loops:
-        - state read     : numpy fancy indexing into _st_* arrays
-        - goal-tracking q: one batched matmul
-        - collision      : numpy broadcast over (B, K-1, N-1, 3)
-        - collision grad : einsum
-        - result write   : batch fancy-index assignment to _st_* arrays
-        """
-        import time as _time
-        _t0 = _time.perf_counter()
-
-        K      = self.p.k_hor
-        n_bez  = self.n_bez
-        N      = self.N
-        gs     = self._gpu_solver
-        n_eq   = gs.n_eq
-        n_eq_c = gs.n_eq_cont
-        rmin   = self.p.rmin
-        g_thr  = self.p.g_factor * rmin
-        qc     = self.p.quad_coll
-        B      = len(e_arr)
-        self._gpu_plan_calls = getattr(self, "_gpu_plan_calls", 0) + 1
-        _do_log = (self._gpu_plan_calls % 10 == 1)
-
-        # ── Phase A+B: zero-loop state read + vectorised init ─────────────
-        # All reads are numpy fancy indexing into _st_* arrays — no Python loop.
-        deg1   = self.p.deg_poly + 1
-        eps_v  = self.p.eps_velocity
-        amin_v = np.asarray(self.p.amin, dtype=np.float64)
-        amax_v = np.asarray(self.p.amax, dtype=np.float64)
-        h_dyn  = self.p.h
-
-        pos_b  = pos_np_local[e_arr, i_arr]    # (B, 3)
-        vel_b  = vel_np[e_arr, i_arr]          # (B, 3)
-        goal_b = goal_np_local[e_arr, i_arr]   # (B, 3)
-        x0_batch   = np.concatenate([pos_b, vel_b], axis=-1)  # (B, 6)
-        goal_batch = goal_b                                    # (B, 3)
-
-        has_prev       = self._st_has[e_arr, i_arr]            # (B,) bool
-        prev_seeds_all = self._st_seeds[e_arr, i_arr]          # (B, deg1, 3)
-        own_pred_batch = self._st_u_pred[e_arr, i_arr].copy()  # (B, K, 3)
-        U_prev_b       = self._st_U[e_arr, i_arr]              # (B, n_bez)
-
-        # nbr arrays from prebuilt (E, N, N-1, K, 3) — fancy index, no loop
-        nbr_batch = nbr_preds_arr[e_arr, i_arr]   # (B, N-1, K, 3)
-        valid_nbr = valid_nbr_arr[e_arr, i_arr]   # (B, N-1)
-        N_max     = N - 1
-
-        # PD rollout for new agents — vectorised over all new agents simultaneously
-        new_mask = ~has_prev
-        if new_mask.any():
-            p_new    = pos_b[new_mask].copy()         # (n_new, 3)
-            v_new    = np.zeros_like(p_new)           # (n_new, 3)
-            goal_new = goal_b[new_mask]               # (n_new, 3)
-            for k in range(K):
-                a = np.clip(2.0*(goal_new - p_new) - 1.5*v_new, amin_v, amax_v)
-                p_new = p_new + v_new*h_dyn + 0.5*a*(h_dyn*h_dyn)
-                v_new = v_new + a*h_dyn
-                own_pred_batch[new_mask, k] = p_new
-
-        # Vectorised event-triggered init (Eq. 15-17)
-        err   = pos_b - prev_seeds_all[:, 0]
-        denom = -(vel_b + np.sign(vel_b + 1e-12) * eps_v)
-        denom = np.where(np.abs(denom) < 1e-6,
-                         np.sign(denom) * 1e-6 + 1e-6, denom)
-        f_vec   = err**5 / denom
-        in_band = ((f_vec > self.p.f_min) & (f_vec < self.p.f_max)).all(-1)
-        do_reset = (~has_prev) | (~in_band)
-
-        seeds_batch = prev_seeds_all.copy()
-        seeds_batch[do_reset, 0]  = pos_b[do_reset]
-        seeds_batch[do_reset, 1:] = 0.0
-
-        n_seeds    = n_eq - n_eq_c
-        seeds_flat = seeds_batch.reshape(B, n_seeds).astype(np.float32)
-
-        _t_init = _time.perf_counter() - _t0
-
-        # ── Phase B: nbr arrays already built — no loop ────────────────────
-        _t1 = _time.perf_counter()
-        own_batch = own_pred_batch                  # (B, K, 3)
-        _t_assemble = _time.perf_counter() - _t1
-
-        # ── Phase C: q computation on GPU ─────────────────────────────────
-        _t2 = _time.perf_counter()
-        dev = gs.device
-
-        # Upload per-call inputs once
-        x0_t    = torch.from_numpy(x0_batch.astype(np.float32)).to(dev)     # (B, 6)
-        goal_t  = torch.from_numpy(goal_batch.astype(np.float32)).to(dev)   # (B, 3)
-        own_t   = torch.from_numpy(own_batch.astype(np.float32)).to(dev)    # (B, K, 3)
-        nbr_t   = torch.from_numpy(nbr_batch.astype(np.float32)).to(dev)    # (B, N-1, K, 3)
-        valid_t = torch.from_numpy(valid_nbr).to(dev)                        # (B, N-1)
-
-        # C1 — goal-tracking linear cost
-        residual = x0_t @ self._t_Fx.T - goal_t.repeat(1, K)   # (B, 3K)
-        q_t = 2.0 * (residual * self._t_Qd) @ self._t_Gp       # (B, n_bez)
-
-        # C2 — collision detection: own[k] vs nbr[k+1] for k in [0, K-1)
-        # own_t[:,:-1]: (B,K-1,3) → (B,K-1,1,3)
-        # nbr_t[:,:,1:].permute(0,2,1,3): (B,N-1,K-1,3) → (B,K-1,N-1,3)
-        diff  = (own_t[:, :-1, None, :]
-                 - nbr_t[:, :, 1:, :].permute(0, 2, 1, 3))    # (B,K-1,N-1,3)
-        d     = diff * self._t_thinv                            # Theta-scaled
-        norms = torch.sqrt((d * d).sum(-1))                     # (B,K-1,N-1)
-        norms = torch.where(valid_t[:, None, :], norms,
-                            torch.full_like(norms, float('inf')))
-
-        coll_any = (norms < rmin).any(-1)                       # (B, K-1)
-        has_coll = coll_any.any(-1)                             # (B,)
-        kc_arr   = torch.where(has_coll, coll_any.long().argmax(-1),
-                               has_coll.new_full((B,), -1))     # (B,) 0-indexed
-
-        # C3 — collision penalty gradient for agents that have a collision
-        if has_coll.any():
-            coll_idx = has_coll.nonzero(as_tuple=True)[0]      # (B_c,)
-            B_c  = coll_idx.shape[0]
-            kc_c = kc_arr[coll_idx] + 1                        # 1-indexed (B_c,)
-
-            d_kc = d[coll_idx, kc_c - 1, :, :]                # (B_c, N-1, 3)
-            n_kc = norms[coll_idx, kc_c - 1, :]               # (B_c, N-1)
-
-            ns   = torch.where(n_kc > 1e-6, n_kc, torch.ones_like(n_kc))
-            udir = d_kc / ns.unsqueeze(-1)                     # (B_c, N-1, 3)
-            ut   = udir * self._t_thinv                        # (B_c, N-1, 3)
-
-            Phi_kc = self._t_Phi[kc_c - 1]                    # (B_c, 3, n_bez)
-            dg_dU  = torch.einsum('bnk,bkm->bnm', ut, Phi_kc) # (B_c, N-1, n_bez)
-
-            # neighbour positions at timestep kc_c[b] for each j
-            jo     = torch.arange(N_max, device=dev).unsqueeze(0).expand(B_c, N_max)
-            nbr_kc = nbr_t[
-                coll_idx.unsqueeze(1).expand(B_c, N_max),
-                jo,
-                kc_c.unsqueeze(1).expand(B_c, N_max),
-                :
-            ]                                                   # (B_c, N-1, 3)
-
-            rhs    = (ut * nbr_kc).sum(-1) + rmin              # (B_c, N-1)
-            active = valid_t[coll_idx] & (n_kc < g_thr)        # (B_c, N-1)
-
-            U_prev_c = torch.from_numpy(
-                U_prev_b[coll_idx.cpu().numpy()].astype(np.float32)
-            ).to(dev)                                           # (B_c, n_bez)
-            pred  = torch.einsum('bnm,bm->bn', dg_dU, U_prev_c)  # (B_c, N-1)
-            viol  = torch.where(active,
-                                torch.clamp(rhs - pred, min=0.0),
-                                torch.zeros_like(pred))
-
-            pg = -2.0 * qc * torch.einsum('bn,bnm->bm', viol, dg_dU)  # (B_c, n_bez)
-            q_t[coll_idx] += pg
-
-        _t_q = _time.perf_counter() - _t2
-
-        # ── Phase D: GPU solve ────────────────────────────────────────────
-        _t3 = _time.perf_counter()
-        b_eq  = np.zeros((B, n_eq), dtype=np.float32)
-        b_eq[:, n_eq_c:] = seeds_flat
-        idx_np = (e_arr * N + i_arr).astype(np.int64)
-
-        # q_t already on GPU from Phase C
-        beq_t = torch.from_numpy(b_eq).to(dev)
-        idx_t = torch.from_numpy(idx_np).to(dev)
-        U_raw = gs.solve(q_t, beq_t, idx_t).cpu().numpy()  # (B, n_bez) float32
-        _t_gpu = _time.perf_counter() - _t3
-
-        # ── Phase E: result extraction (batched matmuls + batch numpy write)
-        _t4 = _time.perf_counter()
-        U_f64     = U_raw.astype(np.float64)                         # (B, n_bez)
-        u_pred_b  = (U_f64 @ self.M_pos_hor.T).reshape(B, K, 3)    # (B, K, 3)
-        deg1      = self.p.deg_poly + 1
-        seeds_new = np.stack(
-            [(U_f64 @ self._M_deriv_h[r].T).reshape(B, 3)
-             for r in range(deg1)], axis=1
-        )  # (B, deg1, 3)
-
-        # has_coll / kc_arr are torch tensors from Phase C — convert to numpy
-        has_coll_np = has_coll.cpu().numpy()
-        kc_arr_np   = kc_arr.cpu().numpy()
-        kc_meta = np.where(has_coll_np, kc_arr_np + 1, -1)   # 1-indexed coll ts
-
-        # Batch write all fields to numpy arrays — zero per-agent loop
-        self._st_U[e_arr, i_arr]          = U_f64
-        self._st_u_pred[e_arr, i_arr]     = u_pred_b
-        self._st_seeds[e_arr, i_arr]      = seeds_new
-        self._st_steps[e_arr, i_arr]      = 0
-        self._st_has[e_arr, i_arr]        = True
-        self._st_replanned[e_arr, i_arr]  = True
-        self._st_reset_mode[e_arr, i_arr] = do_reset
-        self._st_fallback[e_arr, i_arr]   = False
-        self._st_coll_ts[e_arr, i_arr]    = kc_meta
-        _t_extract = _time.perf_counter() - _t4
-
-        if _do_log and self.verbose:
-            n_coll = int(has_coll_np.sum())
-            total  = (_t_init + _t_assemble + _t_q + _t_gpu + _t_extract) * 1e3
-            print(
-                f"[DMPC gpu_admm] call={self._gpu_plan_calls}  B={B}  coll={n_coll}"
-                f"  init={_t_init*1e3:.1f}ms"
-                f"  assemble={_t_assemble*1e3:.1f}ms"
-                f"  q+coll={_t_q*1e3:.1f}ms"
-                f"  gpu={_t_gpu*1e3:.1f}ms"
-                f"  extract={_t_extract*1e3:.1f}ms"
-                f"  total={total:.1f}ms",
-                flush=True,
-            )
-
-
+        self._priority_hold = {k: v for k, v in self._priority_hold.items() if k[0] not in ids}
+        for e in ids_list:
+            if 0 <= e < self._st_has.shape[0]:
+                self._st_has[e, :] = False
+       
     def get_vref_ctrl_pts(
         self,
         env_list: "Iterable[int]",
@@ -1291,16 +906,13 @@ class DMPCExpert:
         Phi_pinv   = np.linalg.pinv(Phi_free)         # (K-2, n_fit)  — precomputed once
         S          = self.bezier.sample_matrix(t_abs, deriv=0).astype(np.float64)  # (n_fit*3, n_bez)
 
-        if self._gpu_solver is not None:
-            # ── GPU path: fully vectorised, no per-agent Python loop ─────────
-            env_arr = np.array(env_list, dtype=np.intp)
-            has_win = self._st_has[env_arr, :]          # (E_win, N)
-            e_loc, i_arr = np.where(has_win)            # local env index, agent index
-            e_arr = env_arr[e_loc]                      # global env index
-            B = len(e_arr)
-            if B == 0:
-                return torch.from_numpy(free_ctrl).to(self.device)
-
+        # ── GPU-vectorised path: batch all (env, agent) pairs with cached U ──
+        env_arr = np.array(env_list, dtype=np.intp)
+        has_win = self._st_has[env_arr, :]          # (E_win, N)
+        e_loc, i_arr = np.where(has_win)            # local env index, agent index
+        e_arr = env_arr[e_loc]                      # global env index
+        B = len(e_arr)
+        if B > 0:
             U_batch   = self._st_U[e_arr, i_arr].astype(np.float64)   # (B, n_bez)
             p_curr    = pos_np[e_arr, i_arr]                            # (B, 3)
             v_curr    = vel_np[e_arr, i_arr]
@@ -1334,45 +946,82 @@ class DMPCExpert:
             P_free_batch = np.einsum('kf,bfd->bkd', Phi_pinv, residuals)    # (B, K-2, 3)
             free_ctrl[e_arr, i_arr] = P_free_batch.astype(np.float32)
 
-        else:
-            # ── OSQP path: original per-agent loop ───────────────────────────
-            for e in env_list:
-                origin_e = orig_np[e]
-                for i in range(self.N):
-                    st = self._state.get((e, i))
-                    if st is None:
-                        continue
-                    U = st["U"]
-                    pos_dmpc = (S @ U).reshape(n_fit, 3) + origin_e
-                    p_curr   = pos_np[e, i]
-                    v_curr   = vel_np[e, i]
-                    delta    = goal_np[e, i] - p_curr
-                    horiz    = np.hypot(delta[0], delta[1])
-                    if horiz < 1e-3:
-                        R = np.eye(3, dtype=np.float64)
-                    else:
-                        cos_t = delta[0] / horiz;  sin_t = delta[1] / horiz
-                        R = np.array([[cos_t, sin_t, 0.], [-sin_t, cos_t, 0.], [0., 0., 1.]])
-                    P_1      = R @ v_curr * (h / (K - 1))
-                    delta_w  = pos_dmpc - p_curr
-                    p_goal   = (R @ delta_w.T).T
-                    residual = p_goal - np.outer(phi1_col, P_1)
-                    P_free   = (Phi_pinv @ residual).astype(np.float32)
-                    free_ctrl[e, i] = P_free
-
         return torch.from_numpy(free_ctrl).to(self.device)
 
     # ───────────────────────────────────────────────────────────────────
     # Neighbour broadcast retrieval
     # ───────────────────────────────────────────────────────────────────
+    def _compute_priority_scores(
+        self,
+        pos_local: np.ndarray,
+        vel: np.ndarray,
+        goal_local: np.ndarray,
+        env_list: list[int],
+    ) -> dict[int, np.ndarray]:
+        """Compute per-agent right-of-way scores for the selected envs.
+
+        Higher score means higher priority. Goal hysteresis prevents agents
+        already settled at the goal from repeatedly yielding near the success
+        threshold; in-transit scores combine goal urgency and velocity alignment.
+        """
+        scores_by_env: dict[int, np.ndarray] = {}
+        if not self.p.enable_priority:
+            for e in env_list:
+                scores_by_env[e] = np.zeros(self.N, dtype=np.float64)
+            return scores_by_env
+
+        eps = self.p.priority_velocity_eps
+        for e in env_list:
+            scores = np.zeros(self.N, dtype=np.float64)
+            for i in range(self.N):
+                key = (e, i)
+                to_goal = goal_local[e, i] - pos_local[e, i]
+                goal_dist = float(np.linalg.norm(to_goal))
+
+                hold = self._priority_hold.get(key, False)
+                if hold:
+                    hold = goal_dist <= self.p.priority_goal_exit_dist
+                else:
+                    hold = goal_dist <= self.p.priority_goal_enter_dist
+                self._priority_hold[key] = hold
+
+                if hold:
+                    scores[i] = self.p.priority_hold_score
+                    continue
+
+                vel_i = vel[e, i]
+                vel_norm = float(np.linalg.norm(vel_i))
+                if goal_dist > eps and vel_norm > eps:
+                    align = float(np.dot(vel_i, to_goal) / (vel_norm * goal_dist))
+                    align = float(np.clip(align, -1.0, 1.0))
+                else:
+                    align = 0.0
+
+                scores[i] = (
+                    self.p.priority_goal_dist_weight * goal_dist
+                    + self.p.priority_velocity_align_weight * align
+                )
+            scores_by_env[e] = scores
+        return scores_by_env
+
     def _gather_neighbour_predictions(
-        self, env_idx: int, agent_idx: int, pos_local: np.ndarray
-    ) -> np.ndarray:
-        """Return broadcast input predictions ``(N-1, K, 3)`` for the
-        neighbours of ``agent_idx`` in env ``env_idx``. Agents without a
-        cached plan yet are treated as stationary at their current position."""
+        self,
+        env_idx: int,
+        agent_idx: int,
+        pos_local: np.ndarray,
+        priority_scores: dict[int, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, list[int]]:
+        """Return neighbour predictions, priority scores, and agent IDs.
+
+        Predictions have shape ``(N-1, K, 3)``. Agents without a cached plan yet
+        are treated as stationary at their current position. Priority scores and
+        IDs are returned in the same neighbour order as the predictions.
+        """
         K = self.p.k_hor
         preds: list[np.ndarray] = []
+        scores: list[float] = []
+        ids: list[int] = []
+        env_scores = None if priority_scores is None else priority_scores.get(env_idx)
         for j in range(self.N):
             if j == agent_idx:
                 continue
@@ -1381,7 +1030,12 @@ class DMPCExpert:
                 preds.append(np.tile(pos_local[env_idx, j], (K, 1)))
             else:
                 preds.append(sj["u_pred"].copy())
-        return np.stack(preds, axis=0) if preds else np.zeros((0, K, 3))
+            scores.append(0.0 if env_scores is None else float(env_scores[j]))
+            ids.append(j)
+
+        if preds:
+            return np.stack(preds, axis=0), np.asarray(scores, dtype=np.float64), ids
+        return np.zeros((0, K, 3)), np.zeros(0, dtype=np.float64), ids
 
     # ───────────────────────────────────────────────────────────────────
     # Per-agent replanning: build + solve one QP.
@@ -1390,10 +1044,13 @@ class DMPCExpert:
         self,
         env_idx: int,
         agent_idx: int,
+        nbr_ids: List[int],
         pos_local: np.ndarray,
         vel: np.ndarray,
         goal_local: np.ndarray,
+        own_priority_score: float,
         nbr_pred: np.ndarray,
+        nbr_priority_scores: np.ndarray | None = None,
     ) -> None:
         K = self.p.k_hor
         n_bez = self.n_bez
@@ -1406,14 +1063,36 @@ class DMPCExpert:
 
         # ── Collision constraints first: their presence selects the cost mode.
         own_pred_seed = self._seed_input_prediction(prev, seeds[0], goal_local)
-        coll_A, coll_l, coll_u, collision_timestep, n_slack = self._build_collision_constraints(
+        emergency_points = np.vstack([
+            pos_local.reshape(1, 3),
+            own_pred_seed[: max(0, self.p.emergency_prediction_steps)],
+        ])
+        emergency_mode, violated_obs = self._is_inside_static_obstacle(env_idx, emergency_points)
+        coll_A, coll_l, coll_u, inter_agent_col_t, static_collision_timesteps, n_slack = self._build_collision_constraints(
+            env_idx=env_idx,
+            agent_idx=agent_idx,
             own_pred=own_pred_seed,
             nbr_pred=nbr_pred,
+            own_priority_score=own_priority_score,
+            nbr_priority_scores=nbr_priority_scores,
+            nbr_ids=nbr_ids,
+            violated_obs=violated_obs,
         )
+        collision_sample_indices = [max(int(inter_agent_col_t) - 1, 0)] if inter_agent_col_t >= 0 else []
+        for kc_o in static_collision_timesteps:
+            for kc in kc_o:
+                collision_sample_indices.append(max(int(kc) - 1, 0))
+        collision_sample_indices = sorted(set(collision_sample_indices))
         collision_mode = coll_A is not None
+        
 
-        # Pick free / obs cost mode (mirrors C++ generator.cpp::buildQP).
-        if collision_mode:
+        # Pick free / obs / emergency cost mode. Emergency mode is for testing
+        # recovery from actual static-obstacle penetration: keep regularization
+        # and collision constraints, but remove the goal-reaching objective.
+        if emergency_mode and self.p.enable_emergency:
+            H_bez_const = self._H_bez_emergency
+            Q_diag = self._Q_diag_emergency
+        elif collision_mode:
             H_bez_const = self._H_bez_obs
             Q_diag = self._Q_diag_obs
         else:
@@ -1428,7 +1107,7 @@ class DMPCExpert:
         H = np.zeros((n_total, n_total))
         H[:n_bez, :n_bez] = H_bez_const
         if n_slack > 0:
-            H[n_bez:, n_bez:] = 2.0 * self.p.quad_coll * np.eye(n_slack)
+            H[n_bez:, n_bez:] = 2.0 * self.p.admm_quad_coll * np.eye(n_slack)
 
         # Linear term on U_bez:  2 G^T Q (Fx x0 - pd_stack)
         x0 = np.concatenate([pos_local, vel])
@@ -1438,7 +1117,7 @@ class DMPCExpert:
         q = np.zeros(n_total)
         q[:n_bez] = q_lin_bez
         if n_slack > 0:
-            q[n_bez:] = self.p.lin_coll
+            q[n_bez:] = self.p.admm_lin_coll
 
         # ── Equality constraints
         A_eq_rows = []
@@ -1504,12 +1183,16 @@ class DMPCExpert:
                 polish=self.p.osqp_polish,
             )
         except ValueError:
-            self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
-            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
-            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
+            self._state[(env_idx, agent_idx)]["last_emergency_mode"] = bool(emergency_mode)
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
+            self._state[(env_idx, agent_idx)]["priority_scores"] = (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            )
             return
 
         if prev is not None and prev["U"].shape[0] == n_bez:
@@ -1517,13 +1200,17 @@ class DMPCExpert:
             solver.warm_start(warm)
         res = solver.solve()
         if res.info.status_val not in (1, 2):
-            # print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
-            self._fallback_state(env_idx, agent_idx, seeds[0], goal_local)
+            print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
-            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(collision_timestep)
-            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else []
+            self._state[(env_idx, agent_idx)]["last_emergency_mode"] = bool(emergency_mode)
+            self._state[(env_idx, agent_idx)]["collision_timestep"] = int(inter_agent_col_t)
+            self._state[(env_idx, agent_idx)]["collision_sample_indices"] = collision_sample_indices
+            self._state[(env_idx, agent_idx)]["priority_scores"] = (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            )
             return
 
         U_sol = res.x[:n_bez]
@@ -1531,7 +1218,7 @@ class DMPCExpert:
         new_seeds = np.stack(
             [(self._M_deriv_h[r] @ U_sol).reshape(3)
              for r in range(self.p.deg_poly + 1)]
-        )  # (deg1, 3) ndarray
+        )  # (deg1, 3) ndarray # sample refs shifted by one timestep
         self._state[(env_idx, agent_idx)] = {
             "U": U_sol,
             "u_pred": u_pred,
@@ -1540,9 +1227,15 @@ class DMPCExpert:
             "last_replanned": True,
             "last_reset_mode": bool(_reset_mode),
             "last_fallback": False,
-            "collision_timestep": int(collision_timestep),
-            "collision_sample_indices": [max(int(collision_timestep) - 1, 0)] if collision_timestep >= 0 else [],
+            "last_emergency_mode": bool(emergency_mode),
+            "collision_timestep": int(inter_agent_col_t),
+            "collision_sample_indices": collision_sample_indices,
+            "priority_scores": (
+                nbr_priority_scores.copy() if nbr_priority_scores is not None else np.zeros(n_nbr, dtype=np.float64)
+            ),
         }
+        self._st_U[env_idx, agent_idx] = U_sol.astype(np.float32)
+        self._st_has[env_idx, agent_idx] = True
 
     # ───────────────────────────────────────────────────────────────────
     # Event-triggered initial condition (Section IV)
@@ -1609,15 +1302,40 @@ class DMPCExpert:
             traj[k] = p
         return traj
 
+    def _is_inside_static_obstacle(self, env_idx: int, points_local: np.ndarray) -> tuple[bool, int]:
+        """Return True if any provided point is inside a static obstacle ellipsoid.
+
+        ``points_local`` may be one point ``(3,)`` or a short trajectory
+        ``(M, 3)``. The short trajectory is used to catch imminent penetration
+        when the actual state and replanning seed are slightly out of phase.
+        """
+        if self._num_static_obstacles <= 0 or self._obstacle_pos_local is None:
+            return False, -1
+
+        points = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+        for o in range(self._num_static_obstacles):
+            Theta_inv_o = self._obs_theta_inv[env_idx, o]
+            obstacle_pos = self._obstacle_pos_local[env_idx, o]
+            metric = np.linalg.norm((points - obstacle_pos) @ Theta_inv_o.T, axis=1)
+            if np.any(metric < self._obs_rmin[env_idx, o] * self.p.obs_g_factor):
+                return True, o
+        return False, -1
+
     # ───────────────────────────────────────────────────────────────────
     # On-demand input-space collision constraints (Section III.E)
     # ───────────────────────────────────────────────────────────────────
     def _build_collision_constraints(
         self,
+        env_idx: int,
+        agent_idx: int,
+        nbr_ids: list[int],
         own_pred: np.ndarray,
         nbr_pred: np.ndarray,
+        own_priority_score: float,
+        nbr_priority_scores: np.ndarray,
+        violated_obs: int,
         # n_slack: int,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | int]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | int | List[List[int]] | int]:
         """Construct collision-avoidance inequalities. For each neighbour ``j``
         find the first step ``k_c`` where the predicted (input-space) distance
         is below ``g(rmin)`` and add one linearised cut. The slack variable
@@ -1625,13 +1343,16 @@ class DMPCExpert:
         collision is predicted, no row is added and the slack stays at zero."""
         K = self.p.k_hor
         rmin = self.p.rmin
-        g_thresh = self.p.g_factor * rmin
-        Theta_inv = self._Theta_inv
+        g_thresh = self.p.agent_g_factor * rmin
+        Theta_inv = self._Theta_inv # for inter-agent CA
         n_nbr = nbr_pred.shape[0]
-        kc = -1
+        n_obs = self._num_static_obstacles
+
+        inter_agent_kc = -1
+        l_obs_kc = []
         n_slack = 0
-        if n_nbr == 0:
-            return None, None, None, kc, n_slack
+        if n_nbr + n_obs == 0:
+            return None, None, None, inter_agent_kc, l_obs_kc, n_slack
 
         rows = []
         lbs = []
@@ -1641,27 +1362,45 @@ class DMPCExpert:
         # Collision detection
         # 1. Determine k_c,i: the first timestep where there exists a neighbor j s.t. d < rmin
         # 2. Determine Omega_i: the set of neighbors j s.t. d < g_thresh at k_c,i
-        
+
         # 1. Determine k_c,i
-        for k in range(1, K):
+        for k in range(2, K): # exclude current timestep(already fixed) # range(1, K)
+            # Inter-agent
             for j in range(n_nbr):
                 d = Theta_inv @ (own_pred[k - 1] - nbr_pred[j, k])
                 if np.linalg.norm(d) < rmin:
-                    kc = k
+                    inter_agent_kc = k
                     break
-            if kc > 0:
+            if inter_agent_kc > 0:
                 break
         
+        # Static obstacle
+        for o in range(n_obs):
+            obs_kc_o = []
+            for k in range(1, K): 
+                Theta_inv_o = self._obs_theta_inv[env_idx, o]
+                d = Theta_inv_o @ (own_pred[k] - self._obstacle_pos_local[env_idx, o])
+                if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]: # more conservative collision checking for static obstacles #self._obs_rmin[env_idx, o]:
+                    obs_kc_o.append(k)
+            l_obs_kc.append(obs_kc_o)
+        
         # 2. Determine Omega_i and construct constraint
-        if kc >= 0:
+        # Inter-agent
+        if inter_agent_kc >= 0:
+            Phi_kc = self.M_pos_hor[3 * (inter_agent_kc - 1) : 3 * (inter_agent_kc - 1) + 3, :]
             for j in range(n_nbr):
-                d = Theta_inv @ (own_pred[kc - 1] - nbr_pred[j, kc])
-                if np.linalg.norm(d) < g_thresh:
+                d = Theta_inv @ (own_pred[inter_agent_kc - 1] - nbr_pred[j, inter_agent_kc])
+                prioritized = False
+                if self.p.enable_priority:
+                    nbr_agent_idx = nbr_ids[j]
+                    margin = min(1e-3, 0.01 * max(abs(own_priority_score), abs(nbr_priority_scores[j])))
+                    prioritized = (own_priority_score > nbr_priority_scores[j] + margin
+                                or (abs(own_priority_score - nbr_priority_scores[j]) < margin and agent_idx > nbr_agent_idx))
+                if np.linalg.norm(d) < g_thresh and not prioritized:
                     # construct collision constraint
-                    Phi_kc = self.M_pos_hor[3 * (kc - 1) : 3 * (kc - 1) + 3, :]
                     unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
                     dg_dU = unit_diff.transpose() @ Theta_inv @ Phi_kc
-                    rhs_lower = unit_diff.transpose() @ Theta_inv @ nbr_pred[j, kc] + rmin
+                    rhs_lower = unit_diff.transpose() @ Theta_inv @ nbr_pred[j, inter_agent_kc] + rmin
 
                     row = np.zeros(self.n_bez) # + n_slack)
                     row = dg_dU
@@ -1674,11 +1413,34 @@ class DMPCExpert:
 
                     n_slack += 1
 
-            A_col = np.hstack([np.vstack(rows), -np.eye(n_slack)])
-            return A_col, np.asarray(lbs), np.asarray(ubs), kc, n_slack
+        # static obstacle
+        for (o, obs_kc_o) in enumerate(l_obs_kc):
+            Theta_inv_o = self._obs_theta_inv[env_idx, o]
+            obstacle_pos = self._obstacle_pos_local[env_idx, o]
+            for kc_oi in obs_kc_o:
+                Phi_kc_oi = self.M_pos_hor[3 * kc_oi : 3 * kc_oi + 3, :]
+                d = Theta_inv_o @ (own_pred[kc_oi] - obstacle_pos)
+                if np.linalg.norm(d) < self._obs_g_thres[env_idx, o]:
+                    unit_diff = d / np.linalg.norm(d) if np.linalg.norm(d) > 1e-6 else np.array([1.0, 0.0, 0.0])
+                    dg_dU = unit_diff.transpose() @ Theta_inv_o @ Phi_kc_oi
+                    obs_rmin = self._obs_rmin[env_idx, o]
+                    if o == violated_obs:
+                        obs_rmin *= self.p.emergency_repel_factor
+                    rhs_lower = unit_diff.transpose() @ Theta_inv_o @ obstacle_pos + obs_rmin
 
+                    row = np.zeros(self.n_bez) # + n_slack)
+                    row = dg_dU
+
+                    rows.append(row)
+                    lbs.append(rhs_lower)
+                    ubs.append(np.inf)
+                    n_slack += 1 
+
+        if rows:
+            A_col = np.hstack([np.vstack(rows), -np.eye(n_slack)])
+            return A_col, np.asarray(lbs), np.asarray(ubs), inter_agent_kc, l_obs_kc, n_slack
         else:
-            return None, None, None, kc, n_slack
+            return None, None, None, inter_agent_kc, l_obs_kc, n_slack
     def _collision_check_batch(
         self,
         own_pred_list: list[np.ndarray],
@@ -1696,7 +1458,7 @@ class DMPCExpert:
         B = len(own_pred_list)
         K = self.p.k_hor
         rmin = self.p.rmin
-        g_thresh = self.p.g_factor * rmin
+        g_thresh = self.p.agent_g_factor * rmin
         theta_inv_diag = np.diag(self._Theta_inv)       # (3,)
 
         N_max = max((p.shape[0] for p in nbr_pred_list), default=0)
@@ -1770,36 +1532,69 @@ class DMPCExpert:
         self,
         env_idx: int,
         agent_idx: int,
+        prev: dict | None,
         pos_seed: np.ndarray,
-        goal: np.ndarray,
+        vel_seed: np.ndarray,
+        prefer_previous: bool = True,
     ) -> None:
-        """If the QP fails, freeze the agent's plan to a PD-toward-goal seed
-        fitted onto the Bezier basis so subsequent samples remain
-        well-defined."""
+        """If the QP fails, reuse a safe previous plan or brake to hover.
+
+        Preferred fallback is the standard MPC choice: shift the previous
+        feasible plan forward by one replanning period. If that plan is missing,
+        malformed, or immediately enters a static-obstacle guard, fall back to a
+        conservative brake-to-hover reference around ``pos_seed``.
+        """
         K = self.p.k_hor
         h = self.p.h
-        p = pos_seed.copy()
-        v = np.zeros(3)
-        u_pred = np.zeros((K, 3))
-        for k in range(K):
-            a = np.clip(2.0 * (goal - p) - 1.5 * v, np.asarray(self.p.amin), np.asarray(self.p.amax))
-            p = p + v * h + 0.5 * a * h ** 2
-            v = v + a * h
-            u_pred[k] = p
-        # Least-squares fit Bezier control points to the K samples.
-        try:
-            U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
-        except np.linalg.LinAlgError:
-            U = np.zeros(self.n_bez)
-        seeds = np.stack(
-            [(self._M_deriv_h[r] @ U).reshape(3)
-             for r in range(self.p.deg_poly + 1)]
-        )  # (deg1, 3) ndarray
+        U = None
+        u_pred = None
+        fallback_type = "brake_hover"
+
+        if prefer_previous and prev is not None:
+            U_prev = prev.get("U")
+            if U_prev is not None and U_prev.shape[0] == self.n_bez and np.isfinite(U_prev).all():
+                shifted_times = np.minimum(self._times_hor + h, self._times_hor[-1])
+                shifted_u_pred = (self.bezier.sample_matrix(shifted_times, deriv=0) @ U_prev).reshape(K, 3)
+                inside_static, _ = self._is_inside_static_obstacle(env_idx, shifted_u_pred[: max(1, self.p.emergency_prediction_steps)])
+                if np.isfinite(shifted_u_pred).all() and not inside_static:
+                    try:
+                        U = np.linalg.lstsq(self.M_pos_hor, shifted_u_pred.reshape(-1), rcond=None)[0]
+                        u_pred = shifted_u_pred
+                        fallback_type = "shift_previous"
+                    except np.linalg.LinAlgError:
+                        U = None
+                        u_pred = None
+
+        if U is None or u_pred is None:
+            p_hold = pos_seed.copy()
+            p = pos_seed.copy()
+            v = vel_seed.copy()
+            u_pred = np.zeros((K, 3))
+            for k in range(K):
+                a = np.clip(2.0 * (p_hold - p) - 2.0 * v, np.asarray(self.p.amin), np.asarray(self.p.amax))
+                p = p + v * h + 0.5 * a * h ** 2
+                v = v + a * h
+                u_pred[k] = p
+            try:
+                U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
+            except np.linalg.LinAlgError:
+                U = np.zeros(self.n_bez)
+
+        seeds = np.stack([
+            (self._M_deriv_h[r] @ U).reshape(3)
+            for r in range(self.p.deg_poly + 1)
+        ])
         self._state[(env_idx, agent_idx)] = {
             "U": U,
             "u_pred": u_pred,
             "seeds": seeds,
             "steps": 0,
+            "last_emergency_mode": False,
             "collision_timestep": -1,
             "collision_sample_indices": [],
+            "priority_scores": np.zeros(0, dtype=np.float64),
+            "fallback_type": fallback_type,
         }
+        self._st_U[env_idx, agent_idx] = U.astype(np.float32)
+        self._st_has[env_idx, agent_idx] = True
+        print(f"fallback_type: {fallback_type}")

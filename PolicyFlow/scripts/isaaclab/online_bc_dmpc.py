@@ -29,6 +29,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -50,7 +51,7 @@ parser = argparse.ArgumentParser(description="Online BC (flow-matching) with DMP
 parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument("--num_drones", type=int, default=4)
 parser.add_argument("--task", type=str, default="Isaac-MultiDrone-DMPC-Direct-v0")
-parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--seed", type=int, default=None) # Original default: 0
 
 parser.add_argument("--n_rounds", type=int, default=200,
                     help="Total outer iterations (0 = run forever).")
@@ -65,8 +66,18 @@ parser.add_argument("--min_buffer_transitions", type=int, default=4_000,
 
 parser.add_argument("--eval_every_rounds", type=int, default=2)
 parser.add_argument("--eval_steps", type=int, default=200)
+parser.add_argument("--expert_test_only", action="store_true", default=False,
+                    help="Run DMPC expert only, skip replay-buffer collection and BC training.")
+parser.add_argument("--expert_test_steps", type=int, default=None,
+                    help="Expert-only rollout length. Defaults to 3 full episodes per env.")
+parser.add_argument("--expert_test_progress_every", type=int, default=100,
+                    help="Print expert-test progress every N env steps (0 disables progress prints).")
+parser.add_argument("--rmin_check", type=float, default=0.1,
+                    help="Inter-agent collision judgement radius for test metrics (C++ simulator used 0.15).")
 parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds for debug rollouts.")
+parser.add_argument("--no_randomize_episode_start", action="store_true", default=False,
+                    help="Disable random initial episode progress offsets across envs.")
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False,
                     help="Disable z-bound termination for fixed-target debug rollouts.")
 parser.add_argument("--action_source", choices=["dmpc"], default="dmpc",
@@ -75,6 +86,9 @@ parser.add_argument("--dmpc_log_path", type=str, default=None,
                     help="Optional .npz path for first-env DMPC debug logging.")
 parser.add_argument("--dmpc_log_every", type=int, default=1,
                     help="Save one DMPC debug sample every N expert steps.")
+# GPU ADMM
+parser.add_argument("--gpu_admm", action="store_true", default=False,
+                    help="Use batched GPU ADMM instead of CPU OSQP threads.")
 
 parser.add_argument("--traj_save_dir", type=str, default=None,
                     help="Directory to save successful DMPC expert trajectories. "
@@ -148,6 +162,7 @@ from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     PER_NEIGHBOUR_DIM,
 )
 from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
+from quadcopter.dmpc_gpu_expert import GPUDMPCExpert
 
 # Full PolicyFlow flow-matching stack (same imports as online_bc_curobo.py).
 from policyflow_torch.modules import (  # noqa: E402
@@ -509,6 +524,31 @@ class PerEnvEpisodeBuffer:
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Expert wrapper: DMPC position/velocity/acceleration → env action        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+def expert_reference_acceleration(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    ref_pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """Recover the acceleration sample matching the latest DMPC reference.
+
+    ``DMPCExpert.compute`` currently returns position and velocity. It also
+    keeps each agent's Bezier control points, so we sample the second
+    derivative at the same substep used for the returned reference.
+    """
+    ref_acc_w = torch.zeros_like(ref_pos_w)
+    h_total = (expert.p.k_hor - 1) * expert.p.h
+    for e in range(env.num_envs):
+        for i in range(env.cfg.num_drones):
+            st = expert._state.get((e, i))
+            if st is None:
+                continue
+            steps_before_sample = max(int(st["steps"]) - 1, 0)
+            t_sub = ((steps_before_sample % expert.n_substeps) + 1) * expert.p.ts
+            t_sub = min(t_sub, h_total)
+            ref_acc = expert.bezier.sample_matrix(np.array([t_sub]), deriv=2) @ st["U"]
+            ref_acc_w[e, i] = torch.from_numpy(ref_acc.astype(np.float32)).to(env.device)
+    return ref_acc_w
+
 
 def hover_action(
     env: MultiDroneDmpcEnv,
@@ -782,7 +822,6 @@ class DmpcExpertLogger:
         for key in keys:
             payload[key] = np.stack([r[key] for r in self.records], axis=0)
         np.savez_compressed(self.path, **payload)
-
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Success trajectory recorder / replayer                                   ║
@@ -1156,20 +1195,255 @@ def replay_trajs_in_env(
     print(f"[traj_replay] replayed {replayed} trajectories", flush=True)
     return replayed
 
+def action_to_latent(action: torch.Tensor, clip: float) -> torch.Tensor:
+    """Map a tanh-squashed action in ``[-1, 1]^A`` to the unconstrained atanh
+    latent the flow regresses against. Clipping keeps the inverse finite when
+    the expert saturates the action box."""
+    return torch.atanh(action.clamp(-clip, clip))
 
+@torch.no_grad()
+def _static_obstacle_collision_mask(env: MultiDroneDmpcEnv, pos_w: torch.Tensor) -> torch.Tensor:
+    if not getattr(env.cfg, "enable_static_obstacles", False):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if not hasattr(env, "_static_obstacle_ellipsoid_centers_scales_w"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    centers, scales = env._static_obstacle_ellipsoid_centers_scales_w()
+    if centers.shape[1] == 0:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    metric_rel = (pos_w[:, :, None, :] - centers[:, None, :, :]) / scales.reshape(1, 1, -1, 3).clamp(min=1e-6)
+    metric_dist = torch.linalg.norm(metric_rel, dim=-1)
+    return (metric_dist < 1.0).any(dim=(1, 2))
+
+
+@torch.no_grad()
+def run_expert_test(
+    env: MultiDroneDmpcEnv,
+    expert: DMPCExpert,
+    n_steps: int,
+    debug_logger: DmpcExpertLogger | None = None,
+    log_every: int = 1,
+    progress_every: int = 100,
+    rmin_check: float = 0.15,
+) -> dict[str, float]:
+    """Run repeated DMPC-only episodes and aggregate env-level success metrics."""
+    device = env.device
+    env.reset(seed=args_cli.seed) if args_cli.seed is not None else env.reset()
+    expert.reset(obstacle_info=env.get_obstacle_info())
+    if hasattr(expert, "reset_qp_timing_stats"):
+        expert.reset_qp_timing_stats()
+    if hasattr(env, "_last_reset_env_ids"):
+        env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+    last_episode_length_buf = env.episode_length_buf.clone()
+
+    E = env.num_envs
+    N = env.cfg.num_drones
+    episode_returns = torch.zeros(E, device=device)
+    episode_success = torch.zeros(E, dtype=torch.bool, device=device)
+    episode_drone_collision = torch.zeros(E, dtype=torch.bool, device=device)
+    episode_obstacle_collision = torch.zeros(E, dtype=torch.bool, device=device)
+    episode_bounds_failure = torch.zeros(E, dtype=torch.bool, device=device)
+    episode_success_step = torch.full((E,), -1, dtype=torch.long, device=device)
+    episode_start_step = torch.zeros(E, dtype=torch.long, device=device)
+
+    total_episodes = 0
+    total_success = 0
+    total_clean_success = 0
+    total_drone_collision = 0
+    total_obstacle_collision = 0
+    total_bounds_failure = 0
+    total_terminated = 0
+    total_truncated = 0
+    completed_returns: list[float] = []
+    completed_success_times: list[float] = []
+
+    t0 = time.time()
+    for step in range(n_steps):
+        rewound = env.episode_length_buf < last_episode_length_buf
+        if rewound.any():
+            ids = rewound.nonzero(as_tuple=False).flatten()
+            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
+            episode_returns[ids] = 0.0
+            episode_success[ids] = False
+            episode_drone_collision[ids] = False
+            episode_obstacle_collision[ids] = False
+            episode_bounds_failure[ids] = False
+            episode_success_step[ids] = -1
+            episode_start_step[ids] = step
+
+        log_this_step = debug_logger is not None and log_every > 0 and step % log_every == 0
+        try:
+            action, _ = expert_action(
+                env, expert,
+                debug_logger=debug_logger if log_this_step else None,
+                debug_step=step,
+            )
+        except Exception:
+            print(f"[expert_test] expert_action failed before env.step at step={step}", flush=True)
+            traceback.print_exc()
+            raise
+        try:
+            _, reward, terminated, truncated, _ = env.step(action)
+        except Exception:
+            action_shape = tuple(action.shape) if isinstance(action, torch.Tensor) else None
+            print(
+                f"[expert_test] env.step failed at step={step} "
+                f"action_type={type(action).__name__} action_shape={action_shape}",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise
+        episode_returns += reward
+
+        st = env.get_world_states()
+        pos_w = st["pos_w"]
+        goal_dist = torch.linalg.norm(pos_w - st["goal_w"], dim=-1)
+        if N > 1:
+            pair_diff = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)
+            pair_dist = torch.linalg.norm(pair_diff, dim=-1)
+            eye = torch.eye(N, dtype=torch.bool, device=device)
+            pair_dist = pair_dist.masked_fill(eye, float("inf"))
+            episode_drone_collision |= pair_dist.amin(dim=(1, 2)) < rmin_check
+
+        episode_obstacle_collision |= _static_obstacle_collision_mask(env, pos_w)
+        z = pos_w[..., 2]
+        episode_bounds_failure |= ((z < env.cfg.z_min) | (z > env.cfg.z_max)).any(dim=-1)
+
+        success_done = getattr(env, "_just_succeeded", torch.zeros(E, dtype=torch.bool, device=device)).clone()
+        newly_succeeded = success_done & ~episode_success
+        episode_success_step[newly_succeeded] = step
+        episode_success |= newly_succeeded
+
+        natural_done = terminated | truncated
+        done = natural_done | success_done
+        if done.any():
+            done_ids = done.nonzero(as_tuple=False).flatten()
+            total_episodes += int(done_ids.numel())
+            failure_terminated = terminated & ~success_done
+            clean_success = episode_success & ~(episode_drone_collision | episode_obstacle_collision | episode_bounds_failure | failure_terminated)
+            total_success += int(episode_success[done_ids].sum().item())
+            total_clean_success += int(clean_success[done_ids].sum().item())
+            total_drone_collision += int(episode_drone_collision[done_ids].sum().item())
+            total_obstacle_collision += int(episode_obstacle_collision[done_ids].sum().item())
+            total_bounds_failure += int(episode_bounds_failure[done_ids].sum().item())
+            total_terminated += int(failure_terminated[done_ids].sum().item())
+            total_truncated += int(truncated[done_ids].sum().item())
+            completed_returns.extend(episode_returns[done_ids].detach().cpu().tolist())
+            success_done_ids = done_ids[episode_success[done_ids]]
+            success_ids = success_done_ids.detach().cpu().tolist()
+            done_ids_list = done_ids.detach().cpu().tolist()
+            print(
+                f"[expert_test] episode_end step={step} done_env_ids={done_ids_list} "
+                f"success_env_ids={success_ids}",
+                flush=True,
+            )
+            if success_done_ids.numel() > 0:
+                success_times = (episode_success_step[success_done_ids] - episode_start_step[success_done_ids]).float() * env.step_dt
+                completed_success_times.extend(success_times.detach().cpu().tolist())
+
+        reset_env_ids = getattr(env, "_last_reset_env_ids", None)
+        if reset_env_ids is not None and reset_env_ids.numel() > 0:
+            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=reset_env_ids)
+            env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
+            ids = reset_env_ids
+        elif natural_done.any():
+            ids = natural_done.nonzero(as_tuple=False).flatten()
+            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
+        else:
+            ids = None
+
+        if ids is not None and ids.numel() > 0:
+            episode_returns[ids] = 0.0
+            episode_success[ids] = False
+            episode_drone_collision[ids] = False
+            episode_obstacle_collision[ids] = False
+            episode_bounds_failure[ids] = False
+            episode_success_step[ids] = -1
+            episode_start_step[ids] = step + 1
+
+        if progress_every > 0 and ((step + 1) % progress_every == 0 or step == 0 or step + 1 == n_steps):
+            denom_now = max(total_episodes, 1)
+            active_incomplete = int((~episode_success & ~episode_drone_collision & ~episode_obstacle_collision & ~episode_bounds_failure).sum().item())
+            current_goal_max = goal_dist.max(dim=-1).values
+            elapsed = time.time() - t0
+            qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {"avg_s": 0.0, "max_s": 0.0, "count": 0.0}
+            print(
+                "[expert_test] progress "
+                f"step={step + 1}/{n_steps} "
+                f"sim_t={(step + 1) * env.step_dt:.2f}s "
+                f"episodes={total_episodes} "
+                f"success={total_success / denom_now:.3f} "
+                f"clean={total_clean_success / denom_now:.3f} "
+                f"drone_col={total_drone_collision / denom_now:.3f} "
+                f"obs_col={total_obstacle_collision / denom_now:.3f} "
+                f"active_incomplete={active_incomplete} "
+                f"goal_dist_mean={current_goal_max.mean().item():.3f} "
+                f"goal_dist_max={current_goal_max.max().item():.3f} "
+                f"qp_avg={qp_stats['avg_s'] * 1e3:.2f}ms "
+                f"qp_max={qp_stats['max_s'] * 1e3:.2f}ms "
+                f"qp_n={int(qp_stats['count'])} "
+                f"wall={elapsed:.1f}s",
+                flush=True,
+            )
+
+        last_episode_length_buf = env.episode_length_buf.clone()
+
+    active_incomplete = int((~episode_success & ~episode_drone_collision & ~episode_obstacle_collision & ~episode_bounds_failure).sum().item())
+    denom = max(total_episodes, 1)
+    qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {"avg_s": 0.0, "max_s": 0.0, "total_s": 0.0, "count": 0.0}
+    metrics = {
+        "expert_success_rate": total_success / denom,
+        "expert_clean_success_rate": total_clean_success / denom,
+        "expert_drone_collision_rate": total_drone_collision / denom,
+        "expert_obstacle_collision_rate": total_obstacle_collision / denom,
+        "expert_bounds_failure_rate": total_bounds_failure / denom,
+        "expert_terminated_rate": total_terminated / denom,
+        "expert_truncated_rate": total_truncated / denom,
+        "expert_incomplete_envs": float(active_incomplete),
+        "expert_completed_episodes": float(total_episodes),
+        "expert_mean_return": float(np.mean(completed_returns)) if completed_returns else float("nan"),
+        "expert_mean_time_to_success_s": float(np.mean(completed_success_times)) if completed_success_times else float("nan"),
+        "expert_runtime_s": time.time() - t0,
+        "expert_num_envs": float(E),
+        "expert_steps": float(n_steps),
+        "expert_qp_avg_ms": float(qp_stats["avg_s"] * 1e3),
+        "expert_qp_max_ms": float(qp_stats["max_s"] * 1e3),
+        "expert_qp_total_s": float(qp_stats["total_s"]),
+        "expert_qp_count": float(qp_stats["count"]),
+    }
+    print(
+        "[expert_test] "
+        f"episodes={total_episodes}  "
+        f"success={metrics['expert_success_rate']:.3f}  "
+        f"clean_success={metrics['expert_clean_success_rate']:.3f}  "
+        f"drone_col={metrics['expert_drone_collision_rate']:.3f}  "
+        f"obs_col={metrics['expert_obstacle_collision_rate']:.3f}  "
+        f"bounds={metrics['expert_bounds_failure_rate']:.3f}  "
+        f"incomplete_envs={active_incomplete}  "
+        f"mean_t_success={metrics['expert_mean_time_to_success_s']:.2f}s  "
+        f"qp_avg={metrics['expert_qp_avg_ms']:.2f}ms  "
+        f"qp_max={metrics['expert_qp_max_ms']:.2f}ms  "
+        f"qp_n={int(metrics['expert_qp_count'])}",
+        flush=True,
+    )
+    return metrics
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Main training loop                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main():
-    torch.manual_seed(args_cli.seed)
-    np.random.seed(args_cli.seed)
+    if args_cli.seed is not None:
+        torch.manual_seed(args_cli.seed)
+        np.random.seed(args_cli.seed)
 
     env_cfg = MultiDroneDmpcEnvCfg()
     env_cfg.num_drones = args_cli.num_drones
     env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.episode_length_s is not None:
         env_cfg.episode_length_s = args_cli.episode_length_s
+    elif args_cli.expert_test_only:
+        env_cfg.episode_length_s = 60.0
+    if args_cli.no_randomize_episode_start and hasattr(env_cfg, "randomize_episode_start"):
+        env_cfg.randomize_episode_start = False
     if args_cli.no_terminate_on_bounds and hasattr(env_cfg, "terminate_on_bounds"):
         env_cfg.terminate_on_bounds = False
     env_cfg.__post_init__()
@@ -1197,7 +1471,14 @@ def main():
             name_prefix="dmpc_collect",
         )
     env_raw = env.unwrapped  # type: MultiDroneDmpcEnv
+    
+    if args_cli.seed is not None:
+        env.reset(seed=args_cli.seed)
+    else:
+        env.reset()
+
     device = env_raw.device
+    E = env_raw.num_envs
     N = env_raw.cfg.num_drones
     P = per_drone_obs_dim(N)
     bezier_k = args_cli.bezier_k          # total K (default 6)
@@ -1236,16 +1517,31 @@ def main():
     # bind ``ts`` to the env step (sim.dt * decimation) so every env step the
     # planner emits one sample of the current Bezier, and leave ``h`` at its
     # paper default so a full QP solve only fires every ``h / ts`` env steps.
-    expert = DMPCExpert(
-        num_drones=N,
-        params=DMPCParams(
-            pmin=env_raw.cfg.pos_min,
-            pmax=env_raw.cfg.pos_max,
-            rmin=env_raw.cfg.rmin,
-            ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
-        ),
-        device=device,
-    )
+    if args_cli.gpu_admm:
+        expert = GPUDMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_raw.cfg.pos_min,
+                pmax=env_raw.cfg.pos_max,
+                rmin=env_raw.cfg.rmin,
+                ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
+                max_envs=E,
+            ),
+            device=device,
+        )
+    else:
+        expert = DMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=DMPCParams(
+                pmin=env_raw.cfg.pos_min,
+                pmax=env_raw.cfg.pos_max,
+                rmin=env_raw.cfg.rmin,
+                ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
+            ),
+            device=device,
+        )
 
     dmpc_logger = (
         DmpcExpertLogger(args_cli.dmpc_log_path, env_raw, expert)
@@ -1263,8 +1559,43 @@ def main():
             config=vars(args_cli),
         )
 
-    env.reset(seed=args_cli.seed)
-    expert.reset()
+
+    expert.reset(obstacle_info=env_raw.get_obstacle_info())
+    if args_cli.expert_test_only:
+        n_test_steps = args_cli.expert_test_steps if args_cli.expert_test_steps is not None else 3 * int(env_raw.max_episode_length)
+        try:
+            run_expert_test(
+                env=env_raw,
+                expert=expert,
+                n_steps=n_test_steps,
+                debug_logger=dmpc_logger,
+                log_every=args_cli.dmpc_log_every,
+                progress_every=args_cli.expert_test_progress_every,
+                rmin_check=args_cli.rmin_check,
+            )
+        finally:
+            if dmpc_logger is not None:
+                dmpc_logger.save()
+                print(f"[online_bc_dmpc] saved DMPC log to {args_cli.dmpc_log_path}", flush=True)
+            env.close()
+            simulation_app.close()
+        return
+
+    policy = SharedDronePolicy(
+        per_drone_obs_dim=P,
+        per_drone_action_dim=A_pol,
+        hidden_dims=args_cli.hidden_dims,
+        emb_dim=args_cli.emb_dim,
+        sample_steps=args_cli.sample_steps,
+        device=device,
+    ).to(device)
+    if args_cli.resume is not None and os.path.isfile(args_cli.resume):
+        policy.load_state_dict(torch.load(args_cli.resume, map_location=device))
+        print(f"[online_bc_dmpc] loaded checkpoint from {args_cli.resume}")
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args_cli.lr)
+
+    buffer = PerDroneBuffer(args_cli.buffer_capacity, P, A_pol, device)
+
     if hasattr(env_raw, "_last_reset_env_ids"):
         env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
     last_episode_length_buf = env_raw.episode_length_buf.clone()
@@ -1302,7 +1633,7 @@ def main():
         )
         # Re-sync env state after replay.
         env.reset()
-        expert.reset()
+        expert.reset(obstacle_info=env_raw.get_obstacle_info())
         if hasattr(env_raw, "_last_reset_env_ids"):
             env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
         last_episode_length_buf = env_raw.episode_length_buf.clone()
@@ -1338,7 +1669,7 @@ def main():
                         replay_pool.load_next(_rid, env_raw, n_substeps=n_substeps,
                                               h=h_window)
                         env_raw._reset_idx(torch.tensor([_rid], device=device))
-                        expert.reset(torch.tensor([_rid], device=device))
+                        expert.reset(env_ids=torch.tensor([_rid], device=device), obstacle_info=env_raw.get_obstacle_info())
                         ep_buf.clear(torch.tensor([_rid], device=device))
                         if traj_recorder is not None:
                             traj_recorder.clear(torch.tensor([_rid], device=device))
@@ -1356,7 +1687,8 @@ def main():
                     # Keep the DMPC expert in lockstep with IsaacLab resets.
                     rewound = env_raw.episode_length_buf < last_episode_length_buf
                     if rewound.any():
-                        expert.reset(rewound.nonzero(as_tuple=False).flatten())
+                        expert.reset(obstacle_info=env_raw.get_obstacle_info(),
+                                     env_ids=rewound.nonzero(as_tuple=False).flatten())
                     last_episode_length_buf = env_raw.episode_length_buf.clone()
 
                     log_this_step = (
@@ -1406,25 +1738,24 @@ def main():
                 episode_returns += reward
                 done = terminated | truncated
                 reset_env_ids = getattr(env_raw, "_last_reset_env_ids", None)
-                env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
                 if reset_env_ids is not None and reset_env_ids.numel() > 0:
-                    # Only process resets NOT already handled by the done branch below.
-                    # IsaacLab always includes done envs in _last_reset_env_ids, so we
-                    # must exclude them here or ep_buf/traj_recorder will be cleared
-                    # before flush/save_successes can run.
+                    expert.reset(obstacle_info=env_raw.get_obstacle_info(),
+                                 env_ids=reset_env_ids)
+                    env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
                     done_set = set(done.nonzero(as_tuple=False).flatten().tolist()) if done.any() else set()
                     unexpected = torch.tensor(
                         [e for e in reset_env_ids.tolist() if e not in done_set],
                         dtype=torch.long, device=device,
                     )
                     if unexpected.numel() > 0:
-                        expert.reset(unexpected)
+                        expert.reset(env_ids=unexpected)
                         ep_buf.clear(unexpected)
                         if traj_recorder is not None:
                             traj_recorder.clear(unexpected)
                 if done.any():
                     done_ids = done.nonzero(as_tuple=False).flatten()
-                    expert.reset(done_ids)
+                    expert.reset(obstacle_info=env_raw.get_obstacle_info(),
+                                 env_ids=done.nonzero(as_tuple=False).flatten())
                     # Per-drone flush: use individual drone success signal so that
                     # even partial successes (not all drones) contribute training data.
                     drone_succ = env_raw._drone_just_succeeded[done_ids]  # (M, N)
@@ -1450,7 +1781,7 @@ def main():
                             replay_pool.on_episode_done(
                                 _eid, env_raw, n_substeps=n_substeps, h=h_window,
                             )
-                            expert.reset(torch.tensor([_eid], device=device))
+                            expert.reset(env_ids=torch.tensor([_eid], device=device))
                             ep_buf.clear(torch.tensor([_eid], device=device))
                             if traj_recorder is not None:
                                 traj_recorder.clear(torch.tensor([_eid], device=device))
@@ -1522,7 +1853,7 @@ def main():
                     video_path=_eval_video_path,
                 )
                 env.reset()
-                expert.reset()
+                expert.reset(obstacle_info=env_raw.get_obstacle_info())
                 if hasattr(env_raw, "_last_reset_env_ids"):
                     env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
                 last_episode_length_buf = env_raw.episode_length_buf.clone()

@@ -62,6 +62,25 @@ parser.add_argument("--episode_length_s", type=float, default=None,
                     help="Override env episode length in seconds.")
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False)
 
+# Expert options.
+parser.add_argument("--gpu_admm", action="store_true", default=False,
+                    help="Use batched GPU ADMM solver (GPUDMPCExpert) instead of OSQP.")
+parser.add_argument("--static_obstacles", action="store_true", default=False,
+                    help="Enable static wall obstacles in the env.")
+parser.add_argument("--no_static_obstacles", action="store_true", default=False,
+                    help="Force-disable static obstacles even if env default is True.")
+parser.add_argument("--num_workers", type=int, default=None,
+                    help="Thread pool workers for DMPC (None = auto).")
+parser.add_argument("--rmin", type=float, default=None,
+                    help="Override inter-drone collision radius (m).")
+parser.add_argument("--rmin_collision_check", type=float, default=0.15,
+                    help="Distance threshold for reporting a collision event.")
+parser.add_argument("--qp_stats_every", type=int, default=0,
+                    help="Print DMPC QP timing every N steps (0 = disabled).")
+parser.add_argument("--task_spread_mode", type=str, default=None,
+                    choices=["symmetric", "free"],
+                    help="Override task spread mode (None = keep env default).")
+
 # Model architecture (must match checkpoint if loading student).
 parser.add_argument("--hidden_dims", type=int, nargs="*", default=[256, 256, 256])
 parser.add_argument("--emb_dim", type=int, default=64)
@@ -222,25 +241,12 @@ class SharedDronePolicy(nn.Module):
 def _expert_action(env: MultiDroneDmpcEnv, expert) -> torch.Tensor:
     """Run DMPC with proper pos/vel/acc references — identical to training."""
     states = env.get_world_states()
-    ref_pos_w, ref_vel_w = expert.plan(
+    ref_pos_w, ref_vel_w, ref_acc_w = expert.plan(
         pos_w=states["pos_w"],
         vel_w=states["lin_vel_w"],
         goal_w=states["goal_w"],
         env_origins=env._terrain.env_origins,
     )
-    # Compute acceleration from Bezier 2nd derivative (same as training).
-    ref_acc_w = torch.zeros_like(ref_pos_w)
-    h_total = (expert.p.k_hor - 1) * expert.p.h
-    for e in range(env.num_envs):
-        for i in range(env.cfg.num_drones):
-            st = expert._state.get((e, i))
-            if st is None:
-                continue
-            steps_before = max(int(st["steps"]) - 1, 0)
-            t_sub = ((steps_before % expert.n_substeps) + 1) * expert.p.ts
-            t_sub = min(t_sub, h_total)
-            acc = expert.bezier.sample_matrix(np.array([t_sub]), deriv=2) @ st["U"]
-            ref_acc_w[e, i] = torch.from_numpy(acc.astype(np.float32)).to(env.device)
     return env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
 
 
@@ -252,11 +258,24 @@ class EpisodeStats:
         self.returns: list[float] = []
         self.success: list[bool] = []       # True = success termination
         self.final_dist: list[float] = []   # mean distance of all drones to goal
+        self.collisions: list[int] = []     # inter-drone collision events per episode
+        self._ep_collisions: list[int] = [] # accumulator per env (indexed by env_id)
 
-    def add(self, ret: float, succeeded: bool, dist: float):
+    def init_envs(self, num_envs: int):
+        self._ep_collisions = [0] * num_envs
+
+    def record_collision(self, env_id: int):
+        if env_id < len(self._ep_collisions):
+            self._ep_collisions[env_id] += 1
+
+    def add(self, ret: float, succeeded: bool, dist: float, env_id: int = 0):
         self.returns.append(ret)
         self.success.append(succeeded)
         self.final_dist.append(dist)
+        col = self._ep_collisions[env_id] if env_id < len(self._ep_collisions) else 0
+        self.collisions.append(col)
+        if env_id < len(self._ep_collisions):
+            self._ep_collisions[env_id] = 0
 
     def n(self) -> int:
         return len(self.returns)
@@ -268,9 +287,12 @@ class EpisodeStats:
         sr = sum(self.success) / n
         mr = float(np.mean(self.returns))
         md = float(np.mean(self.final_dist))
+        mc = float(np.mean(self.collisions)) if self.collisions else 0.0
+        col_eps = sum(1 for c in self.collisions if c > 0)
         return (
             f"episodes={n}  success_rate={sr:.3f}  "
-            f"mean_return={mr:.2f}  mean_final_dist={md:.3f}m"
+            f"mean_return={mr:.2f}  mean_final_dist={md:.3f}m  "
+            f"collision_rate={col_eps/n:.3f}  mean_collisions_per_ep={mc:.2f}"
         )
 
 
@@ -396,6 +418,12 @@ def main():
         env_cfg.episode_length_s = args_cli.episode_length_s
     if args_cli.no_terminate_on_bounds:
         env_cfg.terminate_on_bounds = False
+    if args_cli.static_obstacles:
+        env_cfg.enable_static_obstacles = True
+    if args_cli.no_static_obstacles:
+        env_cfg.enable_static_obstacles = False
+    if args_cli.task_spread_mode is not None:
+        env_cfg.task_spread_mode = args_cli.task_spread_mode
     env_cfg.__post_init__()
     if getattr(args_cli, "device", None):
         env_cfg.sim.device = args_cli.device
@@ -428,12 +456,14 @@ def main():
     env_raw: MultiDroneDmpcEnv = env.unwrapped
     device = env_raw.device
     N = env_raw.cfg.num_drones
-    P = per_drone_obs_dim(N)
+    P = env_raw.per_drone_obs_dim   # includes SDF dim when enable_sdf_obs=True
+    own_dim = PER_DRONE_OWN_DIM + env_raw.per_drone_sdf_dim
     A = PER_DRONE_ACTION_DIM
 
     print(
         f"[test] mode={args_cli.mode}  num_envs={env_raw.num_envs}  num_drones={N}  "
-        f"per_drone_obs={P}  per_drone_action={A}"
+        f"per_drone_obs={P} (own={own_dim}, sdf={env_raw.per_drone_sdf_dim})  "
+        f"per_drone_action={A}"
     )
 
     # ── policy / expert setup ────────────────────────────────────────────────
@@ -448,6 +478,7 @@ def main():
             emb_dim=args_cli.emb_dim,
             sample_steps=args_cli.sample_steps,
             device=device,
+            own_dim=own_dim,
             action_clip=args_cli.action_clip,
         ).to(device)
         ckpt = torch.load(args_cli.checkpoint, map_location=device)
@@ -458,29 +489,49 @@ def main():
 
     else:  # expert
         from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
-        expert = DMPCExpert(
-            num_drones=N,
-            params=DMPCParams(
-                pmin=env_raw.cfg.pos_min,
-                pmax=env_raw.cfg.pos_max,
-                rmin=env_raw.cfg.rmin,
-                ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
-            ),
-            device=device,
+        _rmin = args_cli.rmin if args_cli.rmin is not None else env_raw.cfg.rmin
+        _dmpc_params = DMPCParams(
+            pmin=env_raw.cfg.pos_min,
+            pmax=env_raw.cfg.pos_max,
+            rmin=_rmin,
+            ts=env_raw.cfg.sim.dt * env_raw.cfg.decimation,
         )
-        print("[test] using DMPC expert baseline")
+        if args_cli.gpu_admm:
+            from quadcopter.dmpc_gpu_expert import GPUDMPCExpert  # noqa: E402
+            expert = GPUDMPCExpert(
+                num_drones=N,
+                num_envs=env_raw.num_envs,
+                params=_dmpc_params,
+                device=device,
+            )
+            print("[test] using GPU ADMM expert (GPUDMPCExpert)")
+        else:
+            expert = DMPCExpert(
+                num_drones=N,
+                num_envs=env_raw.num_envs,
+                params=_dmpc_params,
+                num_workers=args_cli.num_workers,
+                device=device,
+            )
+            print(f"[test] using DMPC OSQP expert  rmin={_rmin}m  "
+                  f"priority={'on' if _dmpc_params.enable_priority else 'off'}  "
+                  f"emergency={'on' if _dmpc_params.enable_emergency else 'off'}  "
+                  f"static_obs={env_raw.cfg.enable_static_obstacles}")
 
     # ── rollout ──────────────────────────────────────────────────────────────
     env.reset(seed=args_cli.seed)
     if expert is not None:
-        expert.reset()
+        obstacle_info = env_raw.get_obstacle_info() if hasattr(env_raw, "get_obstacle_info") else None
+        expert.reset(obstacle_info=obstacle_info)
     last_episode_length_buf = env_raw.episode_length_buf.clone()
 
     returns = torch.zeros(env_raw.num_envs, device=device)
     stats = EpisodeStats()
+    stats.init_envs(env_raw.num_envs)
     step = 0
     max_steps = args_cli.max_steps if args_cli.max_steps > 0 else int(1e9)
     _prev_goal_dist: torch.Tensor | None = None  # for Δdist tracking in alignment diag
+    _rmin_check = args_cli.rmin_collision_check
 
     print(f"[test] running until {args_cli.num_episodes} episodes complete …")
 
@@ -504,7 +555,9 @@ def main():
                 # Keep expert in sync with env resets.
                 rewound = env_raw.episode_length_buf < last_episode_length_buf
                 if rewound.any():
-                    expert.reset(rewound.nonzero(as_tuple=False).flatten())
+                    reset_ids = rewound.nonzero(as_tuple=False).flatten()
+                    _obs_info = env_raw.get_obstacle_info() if hasattr(env_raw, "get_obstacle_info") else None
+                    expert.reset(reset_ids, obstacle_info=_obs_info)
                 action_flat = _expert_action(env_raw, expert)
 
         last_episode_length_buf = env_raw.episode_length_buf.clone()
@@ -513,30 +566,43 @@ def main():
         returns += reward
         done = terminated | truncated
 
+        # ── Collision detection ───────────────────────────────────────────
+        if N > 1:
+            pos_w_now = torch.stack([r.data.root_pos_w for r in env_raw._robots], dim=1)  # (E, N, 3)
+            diff = pos_w_now.unsqueeze(2) - pos_w_now.unsqueeze(1)      # (E, N, N, 3)
+            pair_dist = torch.linalg.norm(diff, dim=-1)                  # (E, N, N)
+            eye_m = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+            pair_dist = pair_dist.masked_fill(eye_m, float("inf"))
+            collided_envs = (pair_dist.amin(dim=(1, 2)) < _rmin_check).nonzero(as_tuple=False).flatten()
+            for env_id in collided_envs:
+                stats.record_collision(int(env_id))
+
         # Expert: sync on explicit resets triggered inside env.step().
         if expert is not None:
+            _obs_info = env_raw.get_obstacle_info() if hasattr(env_raw, "get_obstacle_info") else None
             reset_env_ids = getattr(env_raw, "_last_reset_env_ids", None)
             if reset_env_ids is not None and reset_env_ids.numel() > 0:
-                expert.reset(reset_env_ids)
+                expert.reset(reset_env_ids, obstacle_info=_obs_info)
                 env_raw._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
             if done.any():
-                expert.reset(done.nonzero(as_tuple=False).flatten())
+                expert.reset(done.nonzero(as_tuple=False).flatten(), obstacle_info=_obs_info)
 
         if done.any():
             done_ids = done.nonzero(as_tuple=False).flatten()
-            pos_w = torch.stack([r.data.root_pos_w for r in env_raw._robots], dim=1)
+            pos_w_done = torch.stack([r.data.root_pos_w for r in env_raw._robots], dim=1)
             for env_id in done_ids:
                 dists = torch.linalg.norm(
-                    pos_w[env_id] - env_raw._goal_pos_w[env_id], dim=-1
+                    pos_w_done[env_id] - env_raw._goal_pos_w[env_id], dim=-1
                 )  # (N,)
                 mean_dist = dists.mean().item()
                 succeeded = bool(env_raw._just_succeeded[env_id].item())
                 ret = returns[env_id].item()
-                stats.add(ret, succeeded, mean_dist)
+                ep_col = stats._ep_collisions[int(env_id)] if int(env_id) < len(stats._ep_collisions) else 0
+                stats.add(ret, succeeded, mean_dist, env_id=int(env_id))
                 print(
                     f"  ep {stats.n():>4d}  env={int(env_id):>2d}  "
                     f"ret={ret:>8.2f}  success={succeeded}  "
-                    f"dist={mean_dist:.3f}m",
+                    f"dist={mean_dist:.3f}m  collisions={ep_col}",
                     flush=True,
                 )
             returns[done] = 0.0
@@ -545,6 +611,23 @@ def main():
             if args_cli.diag_alignment and (done[0] if done.numel() > 0 else False):
                 _prev_goal_dist = None
 
+        # ── QP timing stats (expert mode, periodic) ───────────────────────
+        if (
+            args_cli.mode == "expert"
+            and args_cli.qp_stats_every > 0
+            and step % args_cli.qp_stats_every == 0
+            and hasattr(expert, "get_qp_timing_stats")
+        ):
+            qp = expert.get_qp_timing_stats()
+            if qp["count"] > 0:
+                print(
+                    f"  [step {step:>5d}] QP timing — "
+                    f"count={int(qp['count'])}  avg={qp['avg_s']*1000:.2f}ms  "
+                    f"max={qp['max_s']*1000:.2f}ms  last={qp['last_s']*1000:.2f}ms",
+                    flush=True,
+                )
+                expert.reset_qp_timing_stats()
+
         step += 1
 
     # ── final summary ─────────────────────────────────────────────────────
@@ -552,6 +635,13 @@ def main():
     print("=" * 60)
     print(f"[test] RESULTS ({args_cli.mode})")
     print(stats.summary())
+    if args_cli.mode == "expert" and hasattr(expert, "get_qp_timing_stats"):
+        qp = expert.get_qp_timing_stats()
+        if qp["count"] > 0:
+            print(
+                f"QP timing (final) — count={int(qp['count'])}  "
+                f"avg={qp['avg_s']*1000:.2f}ms  max={qp['max_s']*1000:.2f}ms"
+            )
     if record_video:
         print(f"[test] videos saved to: {args_cli.video_out}/")
     print("=" * 60)

@@ -34,7 +34,7 @@ import gymnasium as gym
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.envs.ui import BaseEnvWindow
 from isaaclab.markers import VisualizationMarkers
@@ -54,14 +54,14 @@ from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
 # Per-drone observation layout sizes.
 HISTORY_STEPS = 5        # own position history length (steps)
 TIME_EMB_DIM = 4         # sinusoidal episode-progress embedding
-PER_DRONE_OWN_DIM = 40   # goal_rel_w(3) + lin_vel_w(3) + R_wb(9) + ang_vel_b(3)
+PER_DRONE_OWN_DIM = 37   # goal_rel_w(3) + lin_vel_w(3) + R_wb(9) + ang_vel_b(3)
                           # + past_rel_pos_w(HISTORY_STEPS*3) + time_emb(TIME_EMB_DIM)
-                          # + pos_local(3)  [env-relative position; needed for OOB awareness]
+PER_DRONE_SDF_DIM = 9    # SDF obstacle distances at 3×3 local XY grid (when enabled)
 PER_NEIGHBOUR_DIM = 9    # rel_pos_w(3) + rel_vel_w(3) + neigh_goal_dir_w(3)
 
 
-def per_drone_obs_dim(num_drones: int) -> int:
-    return PER_DRONE_OWN_DIM + PER_NEIGHBOUR_DIM * (num_drones - 1)
+def per_drone_obs_dim(num_drones: int, sdf_dim: int = 0) -> int:
+    return PER_DRONE_OWN_DIM + sdf_dim + PER_NEIGHBOUR_DIM * (num_drones - 1)
 
 
 class MultiDroneDmpcEnvWindow(BaseEnvWindow):
@@ -78,22 +78,53 @@ class MultiDroneDmpcEnvWindow(BaseEnvWindow):
 @configclass
 class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
-    num_drones: int = 4
-    episode_length_s: float = 10.0
+    num_drones: int = 4 # overwritten by cli args
+    episode_length_s: float = 20.0 #10.0
     decimation: int = 5
-    action_space: int = 3 * 4   # 3 (v_ref) per drone, overwritten in __post_init__
+    # action_type: str = "full_traj" # "full_traj", "velocity", "wrench"
+    action_space: int = None   # overwritten in __post_init__
     observation_space: int = 4 * 39  # overwritten in __post_init__
     state_space: int = 0
     debug_vis: bool = True
+    show_mpc_solution_vis: bool = False
     debug_short_horizon_steps: int = 3
     randomize_episode_start: bool = False
     terminate_on_bounds: bool = True
-    terminate_on_collision: bool = True
-    hard_collision_dist: float = 0.15  # metres centre-to-centre; ~1.5× propeller sweep radius
+    terminate_on_success: bool = True
     collision_free_two_drone_reset: bool = False # For DMPC debugging
+    task_spread_mode: str = "symmetric"  # "symmetric" for ring/opposite goals, "free" for spread sampling
+    reset_min_separation: float = 0.45
+    reset_min_start_goal_distance: float = 1.0
+    reset_sampling_attempts: int = 64
+    
+    # Static obstacles
+    enable_static_obstacles: bool = False
+    randomize_static_obstacles: bool = False
+    show_static_obstacle_ellipsoid_vis: bool = False
+    num_static_obstacles: int = 2
+    static_obstacle_radius: float = 0.15
+    static_obstacle_size: tuple[float, float, float] = (0.25, 1.225, 2.5)
+    static_obstacle_ellipsoid_margin: float = 0.10
+    static_obstacle_ellipsoid_mode: str = "outer_single"  # "outer_single" or "grid"
+    static_obstacle_outer_ellipsoid_axes: tuple[float, float, float] = (0.4, 1.35, 10.0)
+    static_obstacle_ellipsoid_grid: tuple[int, int, int] = (1, 4, 5)
+    static_obstacle_goal_ellipsoid_clearance: float = 0.25
+    fixed_static_obstacle_pos: tuple[tuple[float, float, float], ...] = (
+        (0.0, 0.9, 1.25),
+        (0.0, -0.9, 1.25),
+    )
+    static_obstacle_xy_min: tuple[float, float] = (-1.0, -1.0)
+    static_obstacle_xy_max: tuple[float, float] = (1.0, 1.0)
+    static_obstacle_z_range: tuple[float, float] = (0.6, 1.4)
     success_dist_threshold: float = 0.05   # metres; all drones must be within this
     success_hold_s: float = 1.0            # seconds all drones must hold the threshold
     goal_blend_radius: float = 0.5         # metres; blend ref_pos→goal within this radius
+
+    # SDF obstacle observations (paper 2309.13285v2 Section III-B)
+    enable_sdf_obs: bool = True           # append SDF grid obs to per-drone own features
+    sdf_grid_shape: tuple[int, int] = (3, 3)  # cells in local XY plane
+    sdf_resolution: float = 0.5          # metres between adjacent grid cells
+    sdf_max_dist: float = 2.0            # normalisation distance; values clipped to [0, 1]
 
     ui_window_class_type = MultiDroneDmpcEnvWindow
 
@@ -132,6 +163,19 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     robot_template: ArticulationCfg = CRAZYFLIE_CFG.replace(
         prim_path="/World/envs/env_.*/Drone_{idx}"
     )
+    static_obstacle_template: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/StaticObstacle_{idx}",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.25, 1.2, 2.5),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.12, 0.08)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 1.0)),
+    )
     thrust_to_weight: float = 1.9
     moment_scale: float = 0.01
 
@@ -161,8 +205,11 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     z_max: float = 2.5
 
     def __post_init__(self):
+        if self.enable_static_obstacles and not self.randomize_static_obstacles:
+            self.num_static_obstacles = len(self.fixed_static_obstacle_pos)
         self.action_space = 3 * self.num_drones
-        self.observation_space = self.num_drones * per_drone_obs_dim(self.num_drones)
+        sdf_dim = (self.sdf_grid_shape[0] * self.sdf_grid_shape[1]) if self.enable_sdf_obs else 0
+        self.observation_space = self.num_drones * per_drone_obs_dim(self.num_drones, sdf_dim=sdf_dim)
 
 
 class MultiDroneDmpcEnv(DirectRLEnv):
@@ -171,7 +218,10 @@ class MultiDroneDmpcEnv(DirectRLEnv):
     def __init__(self, cfg: MultiDroneDmpcEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         self.N = self.cfg.num_drones
-        self.per_drone_obs_dim = per_drone_obs_dim(self.N)
+        self.per_drone_sdf_dim = (
+            cfg.sdf_grid_shape[0] * cfg.sdf_grid_shape[1]
+        ) if cfg.enable_sdf_obs else 0
+        self.per_drone_obs_dim = per_drone_obs_dim(self.N, sdf_dim=self.per_drone_sdf_dim)
         device = self.device
 
         # Per-drone action buffer (v_ref 3D or wrench 4D depending on call site).
@@ -186,6 +236,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._last_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_vel_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         self._last_ref_acc_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        self._vel_action_ref_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        self._vel_action_ref_initialized = torch.zeros(self.num_envs, self.N, dtype=torch.bool, device=device)
         # Per-drone thrust / moment buffers ultimately applied to PhysX.
         self._thrust = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
         self._moment = torch.zeros(self.num_envs, self.N, 1, 3, device=device)
@@ -194,6 +246,11 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._goal_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
         # Initial positions saved at reset (handy for diagnostics).
         self._init_pos_w = torch.zeros(self.num_envs, self.N, 3, device=device)
+        # Static obstacle positions in world frame. These are only scene
+        # objects for now; DMPC/observations will consume them in a later pass.
+        self._static_obstacle_pos_w = torch.zeros(
+            self.num_envs, self.cfg.num_static_obstacles, 3, device=device
+        )
 
         # Per-drone collision radius used in the neighbour observation.
         # Defaults to cfg.rmin for all drones; set individual entries to model
@@ -256,6 +313,19 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self._robots.append(robot)
             self.scene.articulations[f"drone_{i}"] = robot
 
+        self._static_obstacles: list[RigidObject] = []
+        if self.cfg.enable_static_obstacles:
+            for i in range(self.cfg.num_static_obstacles):
+                obstacle_cfg = self.cfg.static_obstacle_template.replace(
+                    prim_path=self.cfg.static_obstacle_template.prim_path.format(idx=i),
+                    spawn=self.cfg.static_obstacle_template.spawn.replace(
+                        size=self.cfg.static_obstacle_size
+                    ),
+                )
+                obstacle = RigidObject(obstacle_cfg)
+                self._static_obstacles.append(obstacle)
+                self.scene.rigid_objects[f"static_obstacle_{i}"] = obstacle
+
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -264,7 +334,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-
+    
     # ── physics step ───────────────────────────────────────────────────────
     def _pre_physics_step(self, actions: torch.Tensor):
         """Dispatch to wrench-direct or v_ref→cascade path based on action size.
@@ -294,7 +364,6 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         if actions.shape[-1] == N * 9:
             # ── Full-reference mode: (ref_pos_w, ref_vel_w, ref_acc_w) ───
             # Absolute world-frame position, velocity, acceleration per drone.
-            # Passed directly to the cascade controller without normalization.
             w = actions.view(E, N, 9)
             ref_pos_w = w[:, :, 0:3]
             ref_vel_w = w[:, :, 3:6]
@@ -402,6 +471,54 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         deg = (horiz_dist < 1e-3).unsqueeze(-1).unsqueeze(-1)  # (E, N, 1, 1)
         return torch.where(deg, self._prev_R, R)
 
+    def _compute_obstacle_sdf_obs(self, pos_w: torch.Tensor) -> torch.Tensor:
+        """SDF distances to the nearest static obstacle at a local XY grid around each drone.
+
+        Samples ``sdf_grid_shape`` query points in the horizontal plane centred at
+        each drone, computes the exterior box-SDF to every static obstacle, takes
+        the minimum over obstacles, and normalises to ``[0, 1]`` by ``sdf_max_dist``.
+
+        Args:
+            pos_w: ``(E, N, 3)`` drone positions in world frame.
+
+        Returns:
+            ``(E, N, n_cells)`` normalised SDF values; 1.0 = no obstacle within ``sdf_max_dist``.
+        """
+        E, N = self.num_envs, self.N
+        gh, gw = self.cfg.sdf_grid_shape
+        res = self.cfg.sdf_resolution
+        max_dist = self.cfg.sdf_max_dist
+        n_cells = gh * gw
+
+        # Grid offsets in XY around the drone, Z=0 offset (query at drone altitude).
+        oi = (torch.arange(gh, device=self.device, dtype=torch.float32) - (gh - 1) * 0.5) * res
+        oj = (torch.arange(gw, device=self.device, dtype=torch.float32) - (gw - 1) * 0.5) * res
+        gi, gj = torch.meshgrid(oi, oj, indexing="ij")
+        offsets = torch.stack(
+            [gi.reshape(-1), gj.reshape(-1), torch.zeros(n_cells, device=self.device)], dim=-1
+        )  # (n_cells, 3)
+
+        # Query points: each drone position offset by each grid cell.
+        query_pts = pos_w.unsqueeze(2) + offsets  # (E, N, n_cells, 3)
+
+        if not self.cfg.enable_static_obstacles or self._static_obstacle_pos_w.shape[1] == 0:
+            return torch.ones(E, N, n_cells, device=self.device, dtype=pos_w.dtype)
+
+        obs_pos = self._static_obstacle_pos_w   # (E, M, 3)
+        half_size = (
+            torch.tensor(self.cfg.static_obstacle_size, device=self.device, dtype=pos_w.dtype) * 0.5
+        )  # (3,)
+
+        # Exterior box SDF: d = ||max(|q - c| - half_size, 0)||
+        # Broadcast: q (E, N, n_cells, 1, 3),  c (E, 1, 1, M, 3)
+        q = query_pts.unsqueeze(-2)             # (E, N, n_cells, 1, 3)
+        c = obs_pos[:, None, None, :, :]        # (E, 1, 1, M, 3)
+        diff = (q - c).abs() - half_size        # (E, N, n_cells, M, 3)
+        sdf = diff.clamp(min=0.0).norm(dim=-1)  # (E, N, n_cells, M)
+        sdf_min = sdf.min(dim=-1).values        # (E, N, n_cells)
+
+        return (sdf_min / max_dist).clamp(0.0, 1.0)
+
     def get_per_drone_obs(self) -> torch.Tensor:
         """Build the per-drone observation tensor in world frame.
 
@@ -414,7 +531,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             * **15-17** angular velocity, body frame
             * **18-32** past 5-step own positions relative to current, world frame
             * **33-36** sinusoidal episode-progress embedding (TIME_EMB_DIM=4)
-            * **37-39** drone position in env-local frame (needed for OOB penalty awareness)
+            * **37-45** *(if enable_sdf_obs)* normalised SDF distances at 3×3 local grid
             * For each neighbour ``j``:
               * relative position world frame (3)
               * relative velocity world frame (3)
@@ -430,9 +547,6 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         rot_wb    = matrix_from_quat(quat_w)          # (E, N, 3, 3)
         R_wb_flat = rot_wb.reshape(E, N, 9)           # (E, N, 9) row-major
 
-        # Env-local positions: subtract per-env origin so all envs share the same frame.
-        pos_local = pos_w - self._terrain.env_origins.unsqueeze(1)  # (E, N, 3)
-
         # Episode-progress sinusoidal embedding (E, TIME_EMB_DIM).
         t = (self.episode_length_buf.float() / self.max_episode_length).clamp(0.0, 1.0)
         t_emb = torch.stack([
@@ -444,13 +558,18 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
         out = torch.empty((E, N, self.per_drone_obs_dim), device=self.device, dtype=pos_w.dtype)
 
+        # SDF observations: computed once for all drones, then sliced per drone.
+        if self.per_drone_sdf_dim > 0:
+            sdf_obs = self._compute_obstacle_sdf_obs(pos_w)  # (E, N, sdf_dim)
+        else:
+            sdf_obs = None
+
         for i in range(N):
-            # Own features (all world frame except ang_vel_b and pos_local).
+            # Own features (all world frame except ang_vel_b).
             goal_rel_w  = self._goal_pos_w[:, i] - pos_w[:, i]  # (E, 3)
             lin_vel_w_i = lin_vel_w[:, i]                        # (E, 3)
             R_wb_flat_i = R_wb_flat[:, i]                        # (E, 9)
             ang_vel_b_i = ang_vel_b[:, i]                        # (E, 3)
-            pos_local_i = pos_local[:, i]                        # (E, 3)
 
             # Past HISTORY_STEPS positions relative to current, world frame.
             past_feats = []
@@ -459,13 +578,17 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             past_rel_w = torch.cat(past_feats, dim=-1)  # (E, HISTORY_STEPS*3)
 
             own = torch.cat(
-                [goal_rel_w, lin_vel_w_i, R_wb_flat_i, ang_vel_b_i, past_rel_w, t_emb, pos_local_i],
+                [goal_rel_w, lin_vel_w_i, R_wb_flat_i, ang_vel_b_i, past_rel_w, t_emb],
                 dim=-1,
-            )  # (E, 40)
+            )  # (E, PER_DRONE_OWN_DIM)
             out[:, i, :PER_DRONE_OWN_DIM] = own
 
+            # SDF obstacle features: appended directly after own features.
+            if sdf_obs is not None:
+                out[:, i, PER_DRONE_OWN_DIM : PER_DRONE_OWN_DIM + self.per_drone_sdf_dim] = sdf_obs[:, i]
+
             # Neighbour features (world frame).
-            offset = PER_DRONE_OWN_DIM
+            offset = PER_DRONE_OWN_DIM + self.per_drone_sdf_dim
             for j in range(N):
                 if j == i:
                     continue
@@ -534,14 +657,6 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         else:
             died = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        if self.cfg.terminate_on_collision and self.N > 1:
-            diff = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)          # (E, N, N, 3)
-            pair_dist = torch.linalg.norm(diff, dim=-1)              # (E, N, N)
-            eye_m = torch.eye(self.N, device=self.device, dtype=torch.bool).unsqueeze(0)
-            pair_dist = pair_dist.masked_fill(eye_m, float("inf"))
-            crashed = pair_dist.amin(dim=(1, 2)) < self.cfg.hard_collision_dist
-            died = died | crashed
-
         # Success termination: all drones within threshold for hold duration.
         dist = torch.linalg.norm(pos_w - self._goal_pos_w, dim=-1)  # (E, N)
         all_close = (dist < self.cfg.success_dist_threshold).all(dim=-1)  # (E,)
@@ -559,7 +674,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._drone_success_steps[~per_close] = 0
         self._drone_just_succeeded[:] = self._drone_success_steps >= hold_steps
 
-        return died | succeeded, time_out
+        success_done = succeeded if self.cfg.terminate_on_success else torch.zeros_like(succeeded)
+        return died | success_done, time_out
 
     # ── resets ─────────────────────────────────────────────────────────────
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -587,6 +703,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
         for robot in self._robots:
             robot.reset(env_ids)
+        for obstacle in self._static_obstacles:
+            obstacle.reset(env_ids)
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs and self.cfg.randomize_episode_start:
             self.episode_length_buf = torch.randint_like(
@@ -596,6 +714,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._last_ref_vel_w[env_ids] = 0.0
         self._last_ref_acc_w[env_ids] = 0.0
+        self._vel_action_ref_pos_w[env_ids] = 0.0
+        self._vel_action_ref_initialized[env_ids] = False
         self._success_steps[env_ids] = 0
         self._drone_success_steps[env_ids] = 0
         # _drone_just_succeeded is NOT cleared here — collection loop reads it
@@ -611,16 +731,30 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             goal_xy = torch.tensor([[1.0, -0.55], [1.0, 0.55]], device=device).unsqueeze(0).repeat(n, 1, 1)
             z0 = torch.ones(n, self.N, device=device)
             zg = torch.ones(n, self.N, device=device)
-        else:
+        elif self.cfg.task_spread_mode == "symmetric":
             radius = torch.empty(n, self.N, device=device).uniform_(0.8, 1.3)
             theta_base = torch.empty(n, 1, device=device).uniform_(0.0, 2.0 * torch.pi)
             theta_offsets = 2.0 * torch.pi * torch.arange(self.N, device=device).float().unsqueeze(0) / self.N
             theta0 = theta_base + theta_offsets
             z0 = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
-
             init_xy = torch.stack([radius * torch.cos(theta0), radius * torch.sin(theta0)], dim=-1)
             goal_xy = -init_xy
             zg = torch.empty(n, self.N, device=device).uniform_(0.6, 1.4)
+        elif self.cfg.task_spread_mode == "free":
+            init_pos_local = self._sample_spread_reset_points(n, self.N, device)
+            goal_pos_local = self._sample_spread_reset_points(
+                n,
+                self.N,
+                device,
+                avoid_points=init_pos_local,
+                min_avoid_dist=self.cfg.reset_min_start_goal_distance,
+            )
+            init_xy = init_pos_local[..., :2]
+            z0 = init_pos_local[..., 2]
+            goal_xy = goal_pos_local[..., :2]
+            zg = goal_pos_local[..., 2]
+        else:
+            raise ValueError(f"Unsupported task_spread_mode: {self.cfg.task_spread_mode!r}")
 
         origins = self._terrain.env_origins[env_ids]
         init_pos = torch.cat([init_xy, z0.unsqueeze(-1)], dim=-1)
@@ -642,6 +776,65 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         # Fill history with init_pos so first-step relative displacements start at zero.
         self._pos_history[env_ids] = init_pos.unsqueeze(2).expand(n, self.N, HISTORY_STEPS, 3)
 
+        if self.cfg.enable_static_obstacles and self.cfg.num_static_obstacles > 0:
+            if self.cfg.randomize_static_obstacles:
+                xy_min = torch.tensor(self.cfg.static_obstacle_xy_min, device=device)
+                xy_max = torch.tensor(self.cfg.static_obstacle_xy_max, device=device)
+                obs_xy = xy_min + (xy_max - xy_min) * torch.rand(
+                    n, self.cfg.num_static_obstacles, 2, device=device
+                )
+                z_low, z_high = self.cfg.static_obstacle_z_range
+                obs_z = torch.empty(n, self.cfg.num_static_obstacles, device=device).uniform_(z_low, z_high)
+                obs_pos_local = torch.cat([obs_xy, obs_z.unsqueeze(-1)], dim=-1)
+            else:
+                obs_pos_local = torch.tensor(
+                    self.cfg.fixed_static_obstacle_pos, device=device, dtype=init_pos.dtype
+                ).unsqueeze(0).repeat(n, 1, 1)
+            obs_pos = obs_pos_local + origins[:, None, :]
+            self._static_obstacle_pos_w[env_ids] = obs_pos
+            z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
+            z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
+
+            init_pos = self._push_points_out_of_static_obstacle_ellipsoids(init_pos, obs_pos, origins)
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, obs_pos, origins)
+            init_pos[..., 2] = init_pos[..., 2].clamp(z_low, z_high)
+            self._init_pos_w[env_ids] = init_pos
+
+            goal_pos = self._push_points_out_of_static_obstacle_ellipsoids(goal_pos, obs_pos, origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, obs_pos, origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_start_goal_distance, obs_pos, origins, avoid_points=init_pos)
+            goal_pos[..., 2] = goal_pos[..., 2].clamp(z_low, z_high)
+            self._goal_pos_w[env_ids] = goal_pos
+
+            zero_vel = torch.zeros(n, 6, device=device)
+            obstacle_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
+            for i, obstacle in enumerate(self._static_obstacles):
+                default_root = obstacle.data.default_root_state[env_ids].clone()
+                default_root[:, :3] = obs_pos[:, i]
+                default_root[:, 3:7] = obstacle_quat
+                obstacle.write_root_pose_to_sim(default_root[:, :7], env_ids)
+                obstacle.write_root_velocity_to_sim(zero_vel, env_ids)
+        elif self.cfg.num_static_obstacles > 0:
+            self._static_obstacle_pos_w[env_ids] = 0.0
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(
+                goal_pos, self.cfg.reset_min_start_goal_distance, env_origins_w=origins, avoid_points=init_pos
+            )
+            self._init_pos_w[env_ids] = init_pos
+            self._goal_pos_w[env_ids] = goal_pos
+        else:
+            init_pos = self._separate_reset_points(init_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(goal_pos, self.cfg.reset_min_separation, env_origins_w=origins)
+            goal_pos = self._separate_reset_points(
+                goal_pos, self.cfg.reset_min_start_goal_distance, env_origins_w=origins, avoid_points=init_pos
+            )
+            self._init_pos_w[env_ids] = init_pos
+            self._goal_pos_w[env_ids] = goal_pos
+
+        self._last_ref_pos_w[env_ids] = init_pos
+        self._pos_history[env_ids] = init_pos.unsqueeze(2).expand(n, self.N, HISTORY_STEPS, 3)
+
         for i, robot in enumerate(self._robots):
             default_root = robot.data.default_root_state[env_ids].clone()
             default_root[:, :3] = init_pos[:, i]
@@ -652,7 +845,180 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             robot.write_root_velocity_to_sim(default_root[:, 7:], env_ids)
             robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+    def _sample_spread_reset_points(
+        self,
+        num_resets: int,
+        num_points: int,
+        device: torch.device,
+        avoid_points: torch.Tensor | None = None,
+        min_avoid_dist: float | None = None,
+    ) -> torch.Tensor:
+        """Sample workspace points with simple 3D spread constraints."""
+        pmin = torch.tensor(self.cfg.pos_min, device=device, dtype=torch.float32)
+        pmax = torch.tensor(self.cfg.pos_max, device=device, dtype=torch.float32)
+        z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
+        z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
+        pmin = pmin.clone()
+        pmax = pmax.clone()
+        pmin[2] = z_low
+        pmax[2] = z_high
+
+        points = pmin + (pmax - pmin) * torch.rand(num_resets, num_points, 3, device=device)
+        min_pair = float(self.cfg.reset_min_separation)
+        if min_avoid_dist is None:
+            min_avoid_dist = min_pair
+
+        for _ in range(max(1, int(self.cfg.reset_sampling_attempts))):
+            invalid = torch.zeros(num_resets, num_points, dtype=torch.bool, device=device)
+            if num_points > 1 and min_pair > 0.0:
+                diff = points[:, :, None, :] - points[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1)
+                eye = torch.eye(num_points, device=device, dtype=torch.bool).unsqueeze(0)
+                too_close = (dist < min_pair) & ~eye
+                invalid |= too_close.any(dim=-1)
+            if avoid_points is not None and min_avoid_dist > 0.0:
+                avoid_diff = points[:, :, None, :] - avoid_points[:, None, :, :]
+                avoid_dist = torch.linalg.norm(avoid_diff, dim=-1)
+                invalid |= (avoid_dist < min_avoid_dist).any(dim=-1)
+            if not invalid.any():
+                break
+            resampled = pmin + (pmax - pmin) * torch.rand(num_resets, num_points, 3, device=device)
+            points = torch.where(invalid[..., None], resampled, points)
+        return points
+
+    def _separate_reset_points(
+        self,
+        points_w: torch.Tensor,
+        min_dist: float,
+        obstacle_pos_w: torch.Tensor | None = None,
+        env_origins_w: torch.Tensor | None = None,
+        avoid_points: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Push reset points apart after sampling/obstacle correction."""
+        if min_dist <= 0.0:
+            return points_w
+        separated = points_w.clone()
+        pmin = torch.tensor(self.cfg.pos_min, device=self.device, dtype=separated.dtype)
+        pmax = torch.tensor(self.cfg.pos_max, device=self.device, dtype=separated.dtype)
+        z_low = max(float(self.cfg.pos_min[2]), float(self.cfg.z_min) + 0.05)
+        z_high = min(float(self.cfg.pos_max[2]), float(self.cfg.z_max) - 0.05)
+        origins = env_origins_w[:, None, :] if env_origins_w is not None else torch.zeros_like(separated[:, :1, :])
+        low_w = origins + pmin
+        high_w = origins + pmax
+        low_w[..., 2] = z_low
+        high_w[..., 2] = z_high
+        eps = 1e-6
+
+        for _ in range(max(1, int(self.cfg.reset_sampling_attempts))):
+            moved = torch.zeros_like(separated)
+            if separated.shape[1] > 1:
+                diff = separated[:, :, None, :] - separated[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1).clamp(min=eps)
+                eye = torch.eye(separated.shape[1], device=self.device, dtype=torch.bool).unsqueeze(0)
+                too_close = (dist < min_dist) & ~eye
+                direction = diff / dist[..., None]
+                moved += (direction * (0.5 * (min_dist - dist).clamp(min=0.0))[..., None] * too_close[..., None]).sum(dim=2)
+            if avoid_points is not None:
+                diff = separated[:, :, None, :] - avoid_points[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1).clamp(min=eps)
+                too_close = dist < min_dist
+                direction = diff / dist[..., None]
+                moved += (direction * ((min_dist - dist).clamp(min=0.0))[..., None] * too_close[..., None]).sum(dim=2)
+            if torch.linalg.norm(moved, dim=-1).max() <= 1e-6:
+                break
+            separated = (separated + moved).clamp(min=low_w, max=high_w)
+            if obstacle_pos_w is not None and obstacle_pos_w.shape[1] > 0:
+                separated = self._push_points_out_of_static_obstacle_ellipsoids(separated, obstacle_pos_w, env_origins_w)
+                separated = separated.clamp(min=low_w, max=high_w)
+        return separated
+
+    def _push_points_out_of_static_obstacle_ellipsoids(
+        self,
+        points_w: torch.Tensor,
+        obstacle_pos_w: torch.Tensor,
+        env_origins_w: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Move generated points outside the static-obstacle ellipsoid guard.
+
+        ``points_w`` is ``(num_reset_envs, num_points, 3)`` and
+        ``obstacle_pos_w`` is ``(num_reset_envs, num_obstacles, 3)``.
+        The guard uses the same split covering ellipsoids exported to DMPC.
+        """
+        if obstacle_pos_w.shape[1] == 0:
+            return points_w
+        centers, scales = self._static_obstacle_ellipsoid_centers_scales_w(obstacle_pos_w, env_origins_w)
+        scales = scales.clamp(min=1e-6)
+        min_metric_dist = 1.0 + float(self.cfg.static_obstacle_goal_ellipsoid_clearance)
+
+        guarded = points_w.clone()
+        for _ in range(4):
+            rel = guarded[:, :, None, :] - centers[:, None, :, :]
+            metric_rel = rel / scales.reshape(1, 1, -1, 3)
+            metric_dist = torch.linalg.norm(metric_rel, dim=-1).clamp(min=1e-6)
+            nearest_dist, nearest_idx = metric_dist.min(dim=-1)
+            too_close = nearest_dist < min_metric_dist
+            if not bool(too_close.any()):
+                break
+
+            gather_idx = nearest_idx[..., None].expand(-1, -1, 3)
+            nearest_center = torch.gather(centers, 1, gather_idx)
+            nearest_scale = scales[nearest_idx]
+            rel_nearest = guarded - nearest_center
+            metric_rel_nearest = rel_nearest / nearest_scale
+            metric_norm = torch.linalg.norm(metric_rel_nearest, dim=-1, keepdim=True)
+            fallback_dir = torch.zeros_like(metric_rel_nearest)
+            fallback_dir[..., 0] = 1.0
+            direction = torch.where(
+                metric_norm > 1e-6,
+                metric_rel_nearest / metric_norm.clamp(min=1e-6),
+                fallback_dir,
+            )
+            corrected = nearest_center + direction * min_metric_dist * nearest_scale
+            guarded = torch.where(too_close[..., None], corrected, guarded)
+        return guarded
+
     # ── helpers exposed for the DMPC expert ────────────────────────────────
+    def get_obstacle_info(self) -> dict:
+        """Return static obstacle geometry for planner-side collision handling.
+
+        Positions are in world frame with shape ``(num_envs, num_obstacles, 3)``.
+        The return payload also carries the IsaacLab spawn config class and a
+        small parameter dictionary so the DMPC side does not have to inspect
+        scene assets directly.
+        """
+        enabled = self.cfg.enable_static_obstacles and len(self._static_obstacles) > 0
+        if not enabled:
+            return None
+        spawn_cfg = self.cfg.static_obstacle_template.spawn
+        shape_class = type(spawn_cfg)
+        shape_name = shape_class.__name__
+        params = {}
+
+        if hasattr(spawn_cfg, "radius"):
+            params["radius"] = float(self.cfg.static_obstacle_radius)
+        if hasattr(spawn_cfg, "size"):
+            params["size"] = tuple(float(v) for v in self.cfg.static_obstacle_size)
+        if hasattr(spawn_cfg, "height"):
+            params["height"] = float(spawn_cfg.height)
+        if hasattr(spawn_cfg, "axis"):
+            params["axis"] = spawn_cfg.axis
+        params["ellipsoid_margin"] = float(self.cfg.static_obstacle_ellipsoid_margin)
+        params["ellipsoid_mode"] = self.cfg.static_obstacle_ellipsoid_mode
+        params["ellipsoid_grid"] = tuple(int(v) for v in self.cfg.static_obstacle_ellipsoid_grid)
+        params["outer_ellipsoid_axes"] = tuple(float(v) for v in self.cfg.static_obstacle_outer_ellipsoid_axes)
+
+        ellipsoid_pos_w, ellipsoid_axes = self._static_obstacle_ellipsoid_centers_scales_w()
+        params["ellipsoid_axes"] = ellipsoid_axes.detach().cpu().numpy()
+        pos_w = self._static_obstacle_pos_w
+        return {
+            "pos_w": pos_w,
+            "ellipsoid_pos_w": ellipsoid_pos_w,
+            "shape_class": shape_class,
+            "shape_name": shape_name,
+            "params": params,
+        }
+
+
     def get_world_states(self) -> dict[str, torch.Tensor]:
         """World-frame states + goals used by :class:`DMPCExpert`."""
         st = self._stack_drone_state()
@@ -693,9 +1059,21 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         return vel_norm.reshape(E, N * 3)
 
     def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper: pack velocity-only commands with zero acceleration."""
+        """Compatibility helper: integrate velocity-only commands with zero acceleration."""
         st = self._stack_drone_state()
-        ref_pos_w = st["pos_w"] + v_cmd_w * self.step_dt
+        pos_w = st["pos_w"]
+
+        # init_mask = ~self._vel_action_ref_initialized
+        # if init_mask.any():
+        #     self._vel_action_ref_pos_w[init_mask] = pos_w[init_mask]
+        #     self._vel_action_ref_initialized[init_mask] = True
+
+        # self._vel_action_ref_pos_w = self._vel_action_ref_pos_w + v_cmd_w * self.step_dt
+        # ref_pos_w = self._vel_action_ref_pos_w
+
+        # Previous reconstruction used the current state every step, which makes
+        # the reference position discontinuous when tracking error exists:
+        ref_pos_w = pos_w + v_cmd_w * self.step_dt
         return self.reference_to_action(ref_pos_w, v_cmd_w, torch.zeros_like(v_cmd_w))
 
     def ref_to_action(
@@ -859,6 +1237,77 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             self._debug_collision_pos_w = collision_pos_w.detach().to(self.device).clone()
 
     # ── debug viz ──────────────────────────────────────────────────────────
+    def _set_mpc_solution_visualizers_visible(self, visible: bool):
+        if hasattr(self, "mpc_plan_visualizer"):
+            self.mpc_plan_visualizer.set_visibility(visible)
+        if hasattr(self, "mpc_pred_visualizer"):
+            self.mpc_pred_visualizer.set_visibility(visible)
+        if hasattr(self, "mpc_plan_segment_visualizers"):
+            for visualizer in self.mpc_plan_segment_visualizers:
+                visualizer.set_visibility(visible)
+        if hasattr(self, "mpc_pred_segment_visualizers"):
+            for visualizer in self.mpc_pred_segment_visualizers:
+                visualizer.set_visibility(visible)
+        if hasattr(self, "mpc_collision_visualizer"):
+            self.mpc_collision_visualizer.set_visibility(visible)
+
+    def _set_static_obstacle_ellipsoid_visualizer_visible(self, visible: bool):
+        if hasattr(self, "static_obstacle_ellipsoid_visualizer"):
+            self.static_obstacle_ellipsoid_visualizer.set_visibility(visible)
+
+    def _static_obstacle_grid_ellipsoid_offsets_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        size = torch.tensor(self.cfg.static_obstacle_size, device=self.device, dtype=torch.float32)
+        grid = torch.tensor(self.cfg.static_obstacle_ellipsoid_grid, device=self.device, dtype=torch.long).clamp(min=1)
+        cell = size / grid.to(dtype=torch.float32)
+        axes = torch.sqrt(torch.tensor(3.0, device=self.device)) * 0.5 * cell + self.cfg.static_obstacle_ellipsoid_margin
+        coords = []
+        for dim in range(3):
+            count = int(grid[dim].item())
+            start = -0.5 * size[dim] + 0.5 * cell[dim]
+            end = 0.5 * size[dim] - 0.5 * cell[dim]
+            coords.append(torch.linspace(start, end, count, device=self.device, dtype=torch.float32))
+        xx, yy, zz = torch.meshgrid(coords[0], coords[1], coords[2], indexing="ij")
+        offsets = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+        scales = axes.reshape(1, 3).repeat(offsets.shape[0], 1)
+        return offsets, scales
+
+    def _static_obstacle_ellipsoid_centers_scales_w(
+        self,
+        obstacle_pos_w: torch.Tensor | None = None,
+        env_origins_w: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        obstacle_pos_w = self._static_obstacle_pos_w if obstacle_pos_w is None else obstacle_pos_w
+        if obstacle_pos_w.shape[1] == 0:
+            return torch.empty(obstacle_pos_w.shape[0], 0, 3, device=self.device), torch.empty(0, 3, device=self.device)
+
+        spawn_cfg = self.cfg.static_obstacle_template.spawn
+        if hasattr(spawn_cfg, "size") and self.cfg.static_obstacle_ellipsoid_mode == "outer_single":
+            size = torch.tensor(self.cfg.static_obstacle_size, device=self.device, dtype=torch.float32)
+            axes = torch.tensor(self.cfg.static_obstacle_outer_ellipsoid_axes, device=self.device, dtype=torch.float32)
+            axes = axes + self.cfg.static_obstacle_ellipsoid_margin
+            if env_origins_w is None:
+                env_origins_w = self._terrain.env_origins[: obstacle_pos_w.shape[0]]
+            env_origins_w = env_origins_w.to(device=self.device)
+            local_y = obstacle_pos_w[..., 1] - env_origins_w[:, None, 1]
+            outward_sign = torch.where(local_y >= 0.0, 1.0, -1.0)
+            centers = obstacle_pos_w.clone()
+            centers[..., 1] = centers[..., 1] + outward_sign * 0.5 * size[1]
+            scales = axes.reshape(1, 3).repeat(obstacle_pos_w.shape[1], 1)
+            return centers, scales
+
+        if hasattr(spawn_cfg, "size"):
+            offsets, scales_per_obstacle = self._static_obstacle_grid_ellipsoid_offsets_scales()
+            centers = obstacle_pos_w[:, :, None, :] + offsets.reshape(1, 1, -1, 3)
+            centers = centers.reshape(obstacle_pos_w.shape[0], -1, 3)
+            scales = scales_per_obstacle.repeat(obstacle_pos_w.shape[1], 1)
+            return centers, scales
+
+        if hasattr(spawn_cfg, "radius"):
+            radius = float(self.cfg.static_obstacle_radius) + float(self.cfg.static_obstacle_ellipsoid_margin)
+            scales = torch.full((obstacle_pos_w.shape[1], 3), radius, device=self.device, dtype=torch.float32)
+            return obstacle_pos_w, scales
+        return obstacle_pos_w, torch.ones(obstacle_pos_w.shape[1], 3, device=self.device)
+
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
             if not hasattr(self, "goal_pos_visualizer"):
@@ -867,19 +1316,28 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                 marker_cfg.prim_path = "/Visuals/Command/multi_drone_goal"
                 self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
             self.goal_pos_visualizer.set_visibility(True)
-            if not hasattr(self, "mpc_plan_visualizer"):
+            if self.cfg.show_static_obstacle_ellipsoid_vis and not hasattr(self, "static_obstacle_ellipsoid_visualizer"):
+                ellipsoid_cfg = SPHERE_MARKER_CFG.copy()
+                ellipsoid_cfg.markers["sphere"].radius = 1.0
+                ellipsoid_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 0.95, 0.95)
+                ellipsoid_cfg.prim_path = "/Visuals/Command/static_obstacle_covering_ellipsoid"
+                self.static_obstacle_ellipsoid_visualizer = VisualizationMarkers(ellipsoid_cfg)
+            self._set_static_obstacle_ellipsoid_visualizer_visible(
+                self.cfg.show_static_obstacle_ellipsoid_vis and self.cfg.enable_static_obstacles
+            )
+            if self.cfg.show_mpc_solution_vis and not hasattr(self, "mpc_plan_visualizer"):
                 plan_cfg = SPHERE_MARKER_CFG.copy()
                 plan_cfg.markers["sphere"].radius = 0.01
                 plan_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.55, 0.0)
                 plan_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_plan"
                 self.mpc_plan_visualizer = VisualizationMarkers(plan_cfg)
-            if not hasattr(self, "mpc_pred_visualizer"):
+            if self.cfg.show_mpc_solution_vis and not hasattr(self, "mpc_pred_visualizer"):
                 pred_cfg = SPHERE_MARKER_CFG.copy()
                 pred_cfg.markers["sphere"].radius = 0.008
                 pred_cfg.markers["sphere"].visual_material.diffuse_color = (0.55, 0.25, 1.0)
                 pred_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_prediction"
                 self.mpc_pred_visualizer = VisualizationMarkers(pred_cfg)
-            if not hasattr(self, "mpc_plan_segment_visualizers"):
+            if self.cfg.show_mpc_solution_vis and not hasattr(self, "mpc_plan_segment_visualizers"):
                 plan_colors = [(0.0, 0.9, 1.0), (1.0, 0.85, 0.0), (1.0, 0.2, 0.75)]
                 pred_colors = [(0.1, 1.0, 0.25), (0.35, 0.65, 1.0), (0.85, 0.45, 1.0)]
                 self.mpc_plan_segment_visualizers = []
@@ -896,19 +1354,26 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                     seg_cfg.markers["sphere"].visual_material.diffuse_color = color
                     seg_cfg.prim_path = f"/Visuals/Command/multi_drone_mpc_prediction_segment_{seg_idx}"
                     self.mpc_pred_segment_visualizers.append(VisualizationMarkers(seg_cfg))
-            self.mpc_plan_visualizer.set_visibility(True)
-            self.mpc_pred_visualizer.set_visibility(True)
-            for visualizer in self.mpc_plan_segment_visualizers:
-                visualizer.set_visibility(True)
-            for visualizer in self.mpc_pred_segment_visualizers:
-                visualizer.set_visibility(True)
-            if not hasattr(self, "mpc_collision_visualizer"):
+            if self.cfg.show_mpc_solution_vis and hasattr(self, "mpc_plan_visualizer"):
+                self.mpc_plan_visualizer.set_visibility(True)
+            if self.cfg.show_mpc_solution_vis and hasattr(self, "mpc_pred_visualizer"):
+                self.mpc_pred_visualizer.set_visibility(True)
+            if self.cfg.show_mpc_solution_vis and hasattr(self, "mpc_plan_segment_visualizers"):
+                for visualizer in self.mpc_plan_segment_visualizers:
+                    visualizer.set_visibility(True)
+            if self.cfg.show_mpc_solution_vis and hasattr(self, "mpc_pred_segment_visualizers"):
+                for visualizer in self.mpc_pred_segment_visualizers:
+                    visualizer.set_visibility(True)
+            if self.cfg.show_mpc_solution_vis and not hasattr(self, "mpc_collision_visualizer"):
                 coll_cfg = SPHERE_MARKER_CFG.copy()
                 coll_cfg.markers["sphere"].radius = 0.012
                 coll_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)
                 coll_cfg.prim_path = "/Visuals/Command/multi_drone_mpc_collision"
                 self.mpc_collision_visualizer = VisualizationMarkers(coll_cfg)
-            self.mpc_collision_visualizer.set_visibility(True)
+            if self.cfg.show_mpc_solution_vis and hasattr(self, "mpc_collision_visualizer"):
+                self.mpc_collision_visualizer.set_visibility(True)
+            if not self.cfg.show_mpc_solution_vis:
+                self._set_mpc_solution_visualizers_visible(False)
         else:
             if hasattr(self, "goal_pos_visualizer"):
                 self.goal_pos_visualizer.set_visibility(False)
@@ -924,9 +1389,22 @@ class MultiDroneDmpcEnv(DirectRLEnv):
                     visualizer.set_visibility(False)
             if hasattr(self, "mpc_collision_visualizer"):
                 self.mpc_collision_visualizer.set_visibility(False)
+            self._set_static_obstacle_ellipsoid_visualizer_visible(False)
 
     def _debug_vis_callback(self, event):
         self.goal_pos_visualizer.visualize(self._goal_pos_w.reshape(-1, 3))
+        if (
+            self.cfg.show_static_obstacle_ellipsoid_vis
+            and hasattr(self, "static_obstacle_ellipsoid_visualizer")
+            and self.cfg.enable_static_obstacles
+            and self._static_obstacle_pos_w.shape[1] > 0
+        ):
+            ellipsoid_centers_w, ellipsoid_scales = self._static_obstacle_ellipsoid_centers_scales_w()
+            centers = ellipsoid_centers_w[0].reshape(-1, 3)
+            quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).reshape(1, 4).repeat(centers.shape[0], 1)
+            self.static_obstacle_ellipsoid_visualizer.visualize(centers, quat, ellipsoid_scales)
+        if not self.cfg.show_mpc_solution_vis:
+            return
         if hasattr(self, "mpc_plan_visualizer") and self._debug_planned_pos_w.numel() > 0:
             self.mpc_plan_visualizer.visualize(self._debug_planned_pos_w.reshape(-1, 3))
         if hasattr(self, "mpc_pred_visualizer") and self._debug_predicted_pos_w.numel() > 0:

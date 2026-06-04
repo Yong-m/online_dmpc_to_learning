@@ -82,10 +82,12 @@ parser.add_argument("--num_drones", type=int, default=10)
 parser.add_argument("--task", type=str, default="Isaac-MultiDrone-DMPC-Direct-v0")
 parser.add_argument("--seed", type=int, default=0)
 
-parser.add_argument("--save_dir", type=str, required=True,
-                    help="Directory to write per-episode .npz files.")
+parser.add_argument("--save_dir", type=str, default=None,
+                    help="Directory to write per-episode .npz files. "
+                         "Optional when --test_only is set.")
 parser.add_argument("--target_episodes", type=int, default=500000,
-                    help="Stop after this many episodes have been saved.")
+                    help="Stop after this many episodes saved (normal mode) "
+                         "or completed (--test_only mode).")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Hard env-step cap (0 = use --target_episodes only).")
 parser.add_argument("--save_all", action="store_true", default=False,
@@ -97,11 +99,22 @@ parser.add_argument("--min_safe_dist", type=float, default=0.08,
 parser.add_argument("--episode_length_s", type=float, default=None)
 parser.add_argument("--no_terminate_on_bounds", action="store_true", default=False)
 
+# N curriculum (inactive drones)
+parser.add_argument("--n_min", type=int, default=0,
+                    help="Enable N-curriculum: env e uses (e %% N)+1 active drones. "
+                         "Uses MultiDroneDmpcRLEnv so inactive drones are parked. "
+                         "0 = disabled (all envs use --num_drones).")
+parser.add_argument("--test_only", action="store_true", default=False,
+                    help="Run expert and print success stats without saving .npz files. "
+                         "Stops after --target_episodes total completed episodes.")
+
 # GPU ADMM
 parser.add_argument("--gpu_admm", action="store_true", default=False,
                     help="Use batched GPU ADMM instead of CPU OSQP threads.")
 parser.add_argument("--admm_iters", type=int, default=50,
                     help="ADMM iterations per window (default 50).")
+parser.add_argument("--gpu_expert", action="store_true", default=False,
+                    help="Use GPUDMPCExpert (colleague's solver) instead of DMPCExpert+GPU-ADMM.")
 
 # Video recording
 parser.add_argument("--video", action="store_true", default=False,
@@ -131,7 +144,12 @@ from quadcopter.multi_drone_dmpc_env import (  # noqa: E402
     MultiDroneDmpcEnvCfg,
     per_drone_obs_dim,
 )
+from quadcopter.multi_drone_dmpc_rl_env import (  # noqa: E402
+    MultiDroneDmpcRLEnv,
+    MultiDroneDmpcRLEnvCfg,
+)
 from quadcopter.dmpc_expert import DMPCExpert, DMPCParams  # noqa: E402
+from quadcopter.dmpc_gpu_expert import GPUDMPCExpert       # noqa: E402
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -366,10 +384,10 @@ class EpisodeCollector:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _read_expert_state(
-    expert: DMPCExpert, E: int, N: int,
+    expert: DMPCExpert | GPUDMPCExpert, E: int, N: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read DMPC expert state for all (e, i) pairs after a plan() call."""
-    if expert._gpu_solver is not None:
+    if isinstance(expert, GPUDMPCExpert) or expert._gpu_solver is not None:
         # GPU path: direct numpy array slice — no Python loop
         return (
             expert._st_U[:E, :N].astype(np.float32),
@@ -404,8 +422,20 @@ def main() -> None:
     torch.manual_seed(args_cli.seed)
     np.random.seed(args_cli.seed)
 
+    # ── validate args ────────────────────────────────────────────────────────
+    if not args_cli.test_only and args_cli.save_dir is None:
+        raise ValueError("--save_dir is required unless --test_only is set.")
+
     # ── env setup ────────────────────────────────────────────────────────────
-    env_cfg = MultiDroneDmpcEnvCfg()
+    curriculum_on = args_cli.n_min > 0
+    if curriculum_on:
+        env_cfg = MultiDroneDmpcRLEnvCfg()
+        env_cfg.n_curriculum_min = args_cli.n_min
+        task_id = "Isaac-MultiDrone-DMPC-RL-Direct-v0"
+    else:
+        env_cfg = MultiDroneDmpcEnvCfg()
+        task_id = args_cli.task
+
     env_cfg.num_drones = args_cli.num_drones
     env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.episode_length_s is not None:
@@ -420,7 +450,7 @@ def main() -> None:
         env_cfg.sim.device = args_cli.device
 
     env_gym = gym.make(
-        args_cli.task,
+        task_id,
         cfg=env_cfg,
         render_mode="rgb_array" if args_cli.video else None,
     )
@@ -457,29 +487,46 @@ def main() -> None:
     )
 
     # ── DMPC expert ───────────────────────────────────────────────────────────
-    expert = DMPCExpert(
-        num_drones=N,
-        params=DMPCParams(
-            pmin=env_cfg.pos_min,
-            pmax=env_cfg.pos_max,
-            rmin=env_cfg.rmin,
-            ts=env_cfg.sim.dt * env_cfg.decimation,
-        ),
-        device=device,
+    _params = DMPCParams(
+        pmin=env_cfg.pos_min,
+        pmax=env_cfg.pos_max,
+        rmin=env_cfg.rmin,
+        ts=env_cfg.sim.dt * env_cfg.decimation,
     )
-    if args_cli.gpu_admm:
-        expert.enable_gpu_admm(max_envs=E, admm_iters=args_cli.admm_iters)
-        print(f"[collect_dmpc_data] GPU ADMM enabled  "
-              f"(max_B={E*N}  iters={args_cli.admm_iters}  alpha=1.6  coll=penalty)")
+    if args_cli.gpu_expert:
+        expert = GPUDMPCExpert(
+            num_drones=N,
+            num_envs=E,
+            params=_params,
+            device=device,
+        )
+        print(f"[collect_dmpc_data] GPUDMPCExpert enabled  "
+              f"(N={N}  E={E}  ts={_params.ts:.3f}s  rmin={_params.rmin}m)")
+    else:
+        expert = DMPCExpert(num_drones=N, params=_params, device=device)
+        if args_cli.gpu_admm:
+            expert.enable_gpu_admm(max_envs=E, admm_iters=args_cli.admm_iters)
+            print(f"[collect_dmpc_data] GPU ADMM enabled  "
+                  f"(max_B={E*N}  iters={args_cli.admm_iters}  alpha=1.6  coll=penalty)")
 
     # ── output dir ───────────────────────────────────────────────────────────
-    save_dir = Path(args_cli.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    # Resume from existing file count.
-    existing = sorted(save_dir.glob("ep_*.npz"))
-    ep_count = int(existing[-1].stem.split("_")[1]) + 1 if existing else 0
-    print(f"[collect_dmpc_data] save_dir={save_dir}  "
-          f"target={args_cli.target_episodes}  starting from ep {ep_count}")
+    if args_cli.test_only:
+        save_dir = None
+        ep_count = 0
+        print(f"[collect_dmpc_data] test_only mode  target={args_cli.target_episodes} episodes"
+              + (f"  n_min={args_cli.n_min}" if curriculum_on else ""))
+    else:
+        save_dir = Path(args_cli.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(save_dir.glob("ep_*.npz"))
+        ep_count = int(existing[-1].stem.split("_")[1]) + 1 if existing else 0
+        print(f"[collect_dmpc_data] save_dir={save_dir}  "
+              f"target={args_cli.target_episodes}  starting from ep {ep_count}"
+              + (f"  n_min={args_cli.n_min}" if curriculum_on else ""))
+
+    # Per-N success tracking (active when curriculum_on or always for breakdown).
+    from collections import defaultdict
+    suc_by_n: dict[int, list[bool]] = defaultdict(list)
 
     # ── per-env collectors + step trackers ───────────────────────────────────
     collectors = [
@@ -515,11 +562,13 @@ def main() -> None:
     # ── collection loop ───────────────────────────────────────────────────────
     total_steps   = 0
     saved_count   = ep_count
+    # test_only: stop by total episodes done; normal: stop by saved count.
     target        = ep_count + args_cli.target_episodes
     t0            = time.time()
 
     # Success rate tracking
-    total_done    = 0
+    total_done    = 0   # per-drone episodes counted
+    total_ep_done = 0   # whole env-episodes completed (for test_only stopping)
     total_success = 0
     recent_outcomes: deque[int] = deque(maxlen=100)  # rolling 100-ep window
 
@@ -532,7 +581,8 @@ def main() -> None:
     )
 
     try:
-        while saved_count < target:
+        while (total_ep_done < args_cli.target_episodes if args_cli.test_only
+               else saved_count < target):
             if args_cli.max_steps > 0 and total_steps >= args_cli.max_steps:
                 print(f"[collect_dmpc_data] max_steps={args_cli.max_steps} reached.")
                 break
@@ -671,26 +721,33 @@ def main() -> None:
                 done_ids = done.nonzero(as_tuple=False).flatten()
                 expert.reset(done_ids)
                 for e in done_ids.tolist():
+                    total_ep_done += 1
                     origin = env._terrain.env_origins[e].cpu()
                     ip = ep_init_pos[e].cpu().numpy().astype(np.float32).copy()
                     gp = ep_goal[e].cpu().numpy().astype(np.float32).copy()
                     ip[:, :2] -= origin[:2].numpy()
                     gp[:, :2] -= origin[:2].numpy()
                     ep_had_collision = bool(had_collision[e].item())
+                    # active drone count for this env (1..N when curriculum, N otherwise)
+                    n_active = int(env._active_n[e].item()) if curriculum_on else N
                     for i in range(N):
+                        if i >= n_active:
+                            break  # skip parked inactive drones
                         success_i = bool(env._drone_just_succeeded[e, i].item())
                         total_done    += 1
                         total_success += int(success_i)
                         recent_outcomes.append(int(success_i))
-                        should_save = (args_cli.save_all or success_i) and not ep_had_collision
-                        if should_save:
-                            ep_path = str(save_dir / f"ep_{saved_count:07d}.npz")
-                            saved = collectors[e].save_agent(
-                                ep_path, i, ip[i], gp[i], success_i, h_window
-                            )
-                            if saved:
-                                saved_count += 1
-                                pbar.update(1)
+                        suc_by_n[n_active].append(success_i)
+                        if not args_cli.test_only:
+                            should_save = (args_cli.save_all or success_i) and not ep_had_collision
+                            if should_save:
+                                ep_path = str(save_dir / f"ep_{saved_count:07d}.npz")
+                                saved = collectors[e].save_agent(
+                                    ep_path, i, ip[i], gp[i], success_i, h_window
+                                )
+                                if saved:
+                                    saved_count += 1
+                                    pbar.update(1)
                     collectors[e].reset()
                     had_collision[e] = False
                     env_step_cnt[e] = 0
@@ -701,31 +758,54 @@ def main() -> None:
 
             # ── tqdm postfix (every step, lightweight) ────────────────────────
             elapsed   = time.time() - t0
-            ep_rate   = (saved_count - ep_count) / max(elapsed, 1e-3)
             sps       = total_steps / max(elapsed, 1e-3)
             roll_n    = len(recent_outcomes)
             roll_pct  = sum(recent_outcomes) / roll_n * 100 if roll_n else 0.0
             total_pct = total_success / max(total_done, 1) * 100
-            pbar.set_postfix(
-                sps=f"{sps:.0f}",
-                ep_s=f"{ep_rate:.2f}",
-                succ=f"{total_pct:.1f}%",
-                roll=f"{roll_pct:.1f}%",
-                done=total_done,
-                refresh=False,
-            )
+            if args_cli.test_only:
+                pbar.n = total_ep_done
+                pbar.set_postfix(
+                    sps=f"{sps:.0f}",
+                    succ=f"{total_pct:.1f}%",
+                    roll=f"{roll_pct:.1f}%",
+                    ep=total_ep_done,
+                    refresh=False,
+                )
+            else:
+                ep_rate = (saved_count - ep_count) / max(elapsed, 1e-3)
+                pbar.set_postfix(
+                    sps=f"{sps:.0f}",
+                    ep_s=f"{ep_rate:.2f}",
+                    succ=f"{total_pct:.1f}%",
+                    roll=f"{roll_pct:.1f}%",
+                    done=total_done,
+                    refresh=False,
+                )
 
     except KeyboardInterrupt:
         print("\n[collect_dmpc_data] interrupted by user.")
     finally:
         pbar.close()
         total_pct = total_success / max(total_done, 1) * 100
-        print(
-            f"\n[collect_dmpc_data] done.  "
-            f"saved={saved_count - ep_count}  "
-            f"success={total_success}/{total_done} ({total_pct:.1f}%)  "
-            f"steps={total_steps}  elapsed={time.time()-t0:.1f}s"
-        )
+        if args_cli.test_only:
+            print(
+                f"\n[collect_dmpc_data] test done.  "
+                f"episodes={total_ep_done}  "
+                f"success={total_success}/{total_done} ({total_pct:.1f}%)  "
+                f"steps={total_steps}  elapsed={time.time()-t0:.1f}s"
+            )
+        else:
+            print(
+                f"\n[collect_dmpc_data] done.  "
+                f"saved={saved_count - ep_count}  "
+                f"success={total_success}/{total_done} ({total_pct:.1f}%)  "
+                f"steps={total_steps}  elapsed={time.time()-t0:.1f}s"
+            )
+        if curriculum_on and suc_by_n:
+            print("[collect_dmpc_data] Breakdown by active-drone count:")
+            for n_a in sorted(suc_by_n):
+                sl = suc_by_n[n_a]
+                print(f"  N_active={n_a:2d}: {sum(sl):4d}/{len(sl):4d} = {sum(sl)/len(sl):.1%}")
         simulation_app.close()
 
 
