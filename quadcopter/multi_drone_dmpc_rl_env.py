@@ -60,7 +60,10 @@ class MultiDroneDmpcRLEnvCfg(MultiDroneDmpcEnvCfg):
     # ── Dense rewards ───────────────────────────────────────────────────
     dmpc_guide_scale: float = 20.0        # DMPC velocity-alignment reward (per drone, *step_dt)
     dmpc_guide_sigma_v: float = 1.0      # velocity bandwidth [m/s]
-    dist_to_goal_scale: float = 50.0     # tanh distance shaping (per drone, *step_dt)
+    dist_to_goal_far_scale: float = 30.0     # broad goal-attraction shaping (per drone, *step_dt)
+    dist_to_goal_far_tanh_scale: float = 1.2 # larger denominator keeps gradient farther from goal
+    dist_to_goal_near_scale: float = 20.0    # near-goal precision shaping (per drone, *step_dt)
+    dist_to_goal_near_tanh_scale: float = 0.8 # smaller denominator sharpens near-goal gradient
 
     # ang_vel_reward_scale is inherited from parent (-0.01); kept as-is.
 
@@ -82,6 +85,18 @@ class MultiDroneDmpcRLEnvCfg(MultiDroneDmpcEnvCfg):
 
     # ── DMPC guide ───────────────────────────────────────────────────────
     dmpc_guide_enabled: bool = True
+
+    # ── Phase-2 curriculum terminations ──────────────────────────────────
+    # When enabled, collisions and OOB are treated as terminated (V=0) rather
+    # than soft penalties.  Enable when resuming from a converged phase-1 run.
+    terminate_on_collision_rl: bool = False  # terminate when any active pair dist < collision_terminate_dist
+    collision_terminate_dist: float = 0.12    # hard terminate distance [m], separate from DMPC rmin
+    terminate_on_oob_rl: bool = False        # terminate when any active drone leaves workspace
+
+    # ── Hover incentive near goal ─────────────────────────────────────────
+    # Penalises linear velocity scaled by proximity to goal.  Off by default.
+    hover_vel_scale: float = 0.0        # penalty weight (per drone, *step_dt)
+    hover_proximity_dist: float = 0.4   # tanh half-width [m] for proximity gate
 
     # ── N curriculum ─────────────────────────────────────────────────────
     # Static per-env drone count: env e uses (e % num_drones) + 1 active drones.
@@ -141,6 +156,7 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         self._episode_sums["goal_all"]        = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums["ang_vel_rl"]      = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums["tilt_rl"]         = torch.zeros(self.num_envs, device=self.device)
+        self._episode_sums["hover_rl"]        = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums["total_rl"]        = torch.zeros(self.num_envs, device=self.device)
 
     # ── Curriculum helpers ────────────────────────────────────────────────────
@@ -180,7 +196,10 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         per_drone = self.get_per_drone_obs()  # (E, N, per_drone_obs_dim)
         if self._curriculum_enabled:
             per_drone = self._mask_curriculum_obs(per_drone)
-        return {"policy": per_drone.reshape(self.num_envs, -1)}
+        policy = per_drone.reshape(self.num_envs, -1)
+        active_n = self._active_n.to(dtype=policy.dtype).unsqueeze(-1)
+        critic = torch.cat([policy, active_n], dim=-1)
+        return {"policy": policy, "critic": critic}
 
     # ── Action override ───────────────────────────────────────────────────────
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -264,10 +283,21 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
             r_guide = torch.zeros(self.num_envs, device=self.device)
 
         # ── Dense: distance-to-goal shaping ─────────────────────────────
+        # Split into broad far-field attraction and sharper near-goal precision.
         dist_to_goal = (self._goal_pos_w - pos_w).norm(dim=-1)          # (E, N)
+        r_dist_far_per = 1.0 - torch.tanh(
+            dist_to_goal / self.cfg.dist_to_goal_far_tanh_scale
+        )
+        r_dist_near_per = 1.0 - torch.tanh(
+            dist_to_goal / self.cfg.dist_to_goal_near_tanh_scale
+        )
+        r_dist_per = (
+            self.cfg.dist_to_goal_far_scale * r_dist_far_per
+            + self.cfg.dist_to_goal_near_scale * r_dist_near_per
+        )
         r_dist = (
-            ((1.0 - torch.tanh(dist_to_goal / 0.8)) * amask).sum(dim=-1) * inv_n
-            * self.cfg.dist_to_goal_scale
+            (r_dist_per * amask).sum(dim=-1)
+            * inv_n
             * self.step_dt
         )
 
@@ -321,7 +351,17 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         tilt_pen = ((1.0 - cos_tilt) * amask).sum(dim=-1) * inv_n         # (E,)
         r_tilt   = tilt_pen * self.cfg.tilt_reward_scale * self.step_dt
 
-        total_unscaled = r_guide + r_dist + r_coll + r_oob + r_per_drone + r_goal_all + r_ang + r_tilt
+        # ── Dense: hover incentive (linear velocity near goal) ───────────
+        # Penalises velocity weighted by closeness to goal so the policy learns
+        # to decelerate and hold position once it arrives.
+        if self.cfg.hover_vel_scale != 0.0:
+            proximity = 1.0 - torch.tanh(dist_to_goal / self.cfg.hover_proximity_dist)  # (E, N)
+            vel_mag   = lin_vel_w.norm(dim=-1)                                            # (E, N)
+            r_hover   = -(vel_mag * proximity * amask).sum(dim=-1) * inv_n * self.cfg.hover_vel_scale * self.step_dt
+        else:
+            r_hover = torch.zeros(self.num_envs, device=self.device)
+
+        total_unscaled = r_guide + r_dist + r_coll + r_oob + r_per_drone + r_goal_all + r_ang + r_tilt + r_hover
         total = total_unscaled * 0.1
 
         self._episode_sums["guide"]           += r_guide
@@ -332,6 +372,7 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         self._episode_sums["goal_all"]        += r_goal_all
         self._episode_sums["ang_vel_rl"]      += r_ang
         self._episode_sums["tilt_rl"]         += r_tilt
+        self._episode_sums["hover_rl"]        += r_hover
         self._episode_sums["total_rl"]        += total
 
         return total
@@ -382,7 +423,36 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         # Hard floor: physically unrecoverable, truncate with bootstrap.
         on_ground = (pos_w[..., 2] < self.cfg.z_min).any(dim=-1)
 
-        return terminated, time_out | on_ground
+        # ── Phase-2 curriculum: hard terminations (off by default) ───────
+        # Collision termination: any active drone pair closer than the physical
+        # hard-stop threshold.  This is intentionally separate from cfg.rmin,
+        # which remains the DMPC/safety-margin and penalty radius.
+        if self.cfg.terminate_on_collision_rl and self.N > 1:
+            diff      = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)           # (E, N, N, 3)
+            pair_dist = diff.norm(dim=-1)                                   # (E, N, N)
+            eye_m     = torch.eye(self.N, device=self.device, dtype=torch.bool).unsqueeze(0)
+            pair_dist = pair_dist.masked_fill(eye_m, float("inf"))
+            if self._curriculum_enabled:
+                both_active = self._active_mask.unsqueeze(2) * self._active_mask.unsqueeze(1)
+                pair_dist   = pair_dist.masked_fill(both_active < 0.5, float("inf"))
+            collision_term = (pair_dist < self.cfg.collision_terminate_dist).any(dim=(1, 2))
+        else:
+            collision_term = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # OOB termination: any active drone outside workspace bounds.
+        if self.cfg.terminate_on_oob_rl:
+            pos_local = pos_w - self._terrain.env_origins.unsqueeze(1)    # (E, N, 3)
+            oob_per   = (
+                (pos_local < torch.tensor(self.cfg.pos_min, device=self.device)) |
+                (pos_local > torch.tensor(self.cfg.pos_max, device=self.device))
+            ).any(dim=-1)                                                   # (E, N)
+            if self._curriculum_enabled:
+                oob_per = oob_per & self._active_mask
+            oob_term = oob_per.any(dim=-1)                                 # (E,)
+        else:
+            oob_term = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        return terminated | collision_term | oob_term, time_out | on_ground
 
     # ── Reset ─────────────────────────────────────────────────────────────────
     def _reset_idx(self, env_ids: torch.Tensor | None):

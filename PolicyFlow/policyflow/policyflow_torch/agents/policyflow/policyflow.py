@@ -594,13 +594,31 @@ class PolicyFlow(PolicyFlowBase):
                 # π_ref is evaluated with no_grad since its parameters are frozen.
                 bc_ref_kl_loss = 0
                 if self._bc_ref_model is not None and _bc_ref_coef > 0:
-                    with torch.no_grad():
-                        ref_cond = self._bc_ref_model.model["condition"](
-                            sampled_actor_observations
-                        )
-                        # Use the same (xt, t) that compute_flow_variation already used
-                        # — we re-derive them here from sampled_flow_x0 and sampled_actions_prior.
-                        # Draw a fresh random t for the reference query (same distribution).
+                    # Use the same (xt, t) for current and reference.  Per-agent
+                    # wrappers expose _split_obs/N and use x_dim=3 internally.
+                    _is_per_agent = hasattr(actor, "_split_obs") and hasattr(actor, "N")
+                    if _is_per_agent:
+                        _B = sampled_actions_prior.shape[0]
+                        _N = int(actor.N)
+                        _ref_t_env = torch.rand(_B, device=self.device)
+                        _ref_t = _ref_t_env.repeat_interleave(_N)
+                        _ref_alpha = _ref_t_env.unsqueeze(-1)
+                        _ref_xt = (
+                            (1.0 - _ref_alpha) * sampled_flow_x0
+                            + _ref_alpha * sampled_actions_prior
+                        ).reshape(_B * _N, 3)
+                        _cur_obs = actor._split_obs(sampled_actor_observations)
+                        if hasattr(self._bc_ref_model, "_split_obs"):
+                            _ref_obs = self._bc_ref_model._split_obs(sampled_actor_observations)
+                        else:
+                            _ref_obs = _cur_obs
+                        _active = _cur_obs.norm(dim=-1) > 1e-6
+                        if not bool(_active.all()):
+                            _ref_xt = _ref_xt[_active]
+                            _ref_t = _ref_t[_active]
+                            _cur_obs = _cur_obs[_active]
+                            _ref_obs = _ref_obs[_active]
+                    else:
                         _ref_t = torch.rand(
                             sampled_actions_prior.shape[0], device=self.device
                         )
@@ -609,13 +627,18 @@ class PolicyFlow(PolicyFlowBase):
                             (1.0 - _ref_alpha) * sampled_flow_x0
                             + _ref_alpha * sampled_actions_prior
                         )
+                        _cur_obs = sampled_actor_observations
+                        _ref_obs = sampled_actor_observations
+
+                    with torch.no_grad():
+                        ref_cond = self._bc_ref_model.model["condition"](_ref_obs)
                         ref_vel = self._bc_ref_model.model["flow"](
                             _ref_xt, _ref_t, ref_cond
                         )
                         ref_std = torch.ones_like(ref_vel) * self._bc_ref_model.model["variance"].std
 
                     # Re-query current model at the same (xt, t) for a fair comparison.
-                    cur_cond = actor.model["condition"](sampled_actor_observations)
+                    cur_cond = actor.model["condition"](_cur_obs)
                     cur_vel  = actor.model["flow"](_ref_xt, _ref_t, cur_cond)
                     cur_std  = torch.ones_like(cur_vel) * actor.model["variance"].std
 

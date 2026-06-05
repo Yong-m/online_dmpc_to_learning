@@ -52,6 +52,31 @@ class IsaaclabRunner:
         self._experiment_dir: str = None
         self._learn_cb: list = None
 
+    def _update_model_normalizers(self, obs_dict: dict) -> None:
+        """Update optional actor/critic observation normalizers from rollout obs."""
+        if self._cfg is not None and not self._cfg.get("update_model_normalizers", True):
+            return
+        try:
+            models = self._agent.model_dict
+        except AttributeError:
+            return
+        if not isinstance(models, dict):
+            return
+
+        actor = models.get("actor")
+        critic = models.get("critic")
+        actor_obs = obs_dict.get("actor_observations")
+        critic_obs = obs_dict.get("critic_observations")
+
+        if actor is not None and actor_obs is not None:
+            model = getattr(actor, "model", None)
+            cond = model.get("condition") if isinstance(model, dict) else None
+            if cond is not None and hasattr(cond, "update_norm"):
+                cond.update_norm(actor_obs)
+
+        if critic is not None and critic_obs is not None and hasattr(critic, "update_norm"):
+            critic.update_norm(critic_obs)
+
     def evaluate(self, steps: int, return_epochs: int = 100, log=False) -> float:
         """Evaluates the agent for a number of steps.
 
@@ -209,6 +234,7 @@ class IsaaclabRunner:
                 desc="step",
                 leave=False,
             ):
+                self._update_model_normalizers(obs_dict)
                 with torch.inference_mode():
                     # compute actions
                     actions, actions_info = self._agent.draw_actions(obs_dict, env_info)

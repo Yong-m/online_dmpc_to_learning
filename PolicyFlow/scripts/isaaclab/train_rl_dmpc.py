@@ -58,13 +58,44 @@ parser.add_argument("--bc_epochs_per_round", type=int,   default=10,
                     help="Gradient steps per rollout round during BC.")
 parser.add_argument("--bc_batch_size",       type=int,   default=2048)
 parser.add_argument("--bc_lr",              type=float, default=3e-4)
+parser.add_argument("--bc_critic_value_loss_scale", type=float, default=1e-4)
+parser.add_argument("--bc_awr_temperature", type=float, default=2.0)
+parser.add_argument("--bc_awr_max_weight", type=float, default=20.0)
 parser.add_argument("--bc_ref_kl_coef0",    type=float, default=1.0,
                     help="Initial KL coef toward frozen BC policy in RL phase.")
 parser.add_argument("--bc_ref_kl_decay_steps", type=float, default=500.0,
                     help="PPO updates to decay KL coef to ~1/100 of initial.")
+parser.add_argument("--bc_ref_kl_min", type=float, default=0.0,
+                    help="Floor value for BC reference KL coefficient.")
+parser.add_argument("--bc_critic_warmup_iters", type=int, default=10,
+                    help="After BC warmup, freeze actor for this many PPO updates "
+                         "so the critic learns before actor updates resume.")
 # N curriculum
-parser.add_argument("--n_min", type=int, default=0, 
+parser.add_argument("--n_min", type=int, default=0,
                     help="Min active drones for N curriculum (0 = disabled, use --num_drones throughout).") #1
+# Phase-2 resume curriculum (critic reset and actor freeze only).  The harder
+# env settings below are now enabled from phase 1 as well.
+parser.add_argument("--curriculum", action="store_true", default=False,
+                    help="On resume: reset critic and freeze actor for "
+                         "--actor_freeze_iters PPO updates.")
+parser.add_argument("--hover_vel_scale", type=float, default=5.0,
+                    help="Hover velocity penalty scale used with --curriculum (per drone, *step_dt).")
+parser.add_argument("--hover_proximity_dist", type=float, default=0.4,
+                    help="Tanh half-width [m] for hover velocity penalty gate (with --curriculum).")
+parser.add_argument("--dist_far_scale", type=float, default=45.0,
+                    help="Far-field distance-to-goal reward scale.")
+parser.add_argument("--dist_far_tanh_scale", type=float, default=1.2,
+                    help="Far-field tanh denominator [m] for distance-to-goal reward.")
+parser.add_argument("--dist_near_scale", type=float, default=30.0,
+                    help="Near-goal distance-to-goal reward scale.")
+parser.add_argument("--dist_tanh_scale", type=float, default=0.3,
+                    help="Near-goal tanh denominator [m] for distance-to-goal reward. "
+                         "Smaller = sharper gradient near goal.")
+parser.add_argument("--actor_freeze_iters", type=int, default=10,
+                    help="PPO updates to freeze the actor after critic reset (--curriculum). Default 10.")
+parser.add_argument("--collision_terminate_dist", type=float, default=0.12,
+                    help="Hard collision termination distance [m]. Separate from cfg.rmin, "
+                         "which remains the DMPC/safety-margin penalty radius.")
 # Resume with N change
 parser.add_argument("--critic_warmup_iters", type=int, default=10,
                     help="When resuming with a different num_drones, freeze the actor for this many "
@@ -361,13 +392,29 @@ class DroneCriticNet(nn.Module):
         self.obs_norm.update(obs.detach())
 
 
+def _extract_actor_obs(obs) -> torch.Tensor:
+    if isinstance(obs, dict):
+        return obs["actor_observations"] if "actor_observations" in obs else obs["policy"]
+    return obs
+
+
+def _extract_critic_obs(obs) -> torch.Tensor:
+    if isinstance(obs, dict):
+        if "critic_observations" in obs:
+            return obs["critic_observations"]
+        if "critic" in obs:
+            return obs["critic"]
+        return obs["policy"]
+    return obs
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ PPO agent config (plain dict — avoids @configclass MISSING inheritance)  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 AGENT_CFG: dict = {
     "desired_kl":                  0.01,
     "use_kl_lr_schedule":          False,
-    "use_kl_lr_schedule_critic_only": True,
+    "use_kl_lr_schedule_critic_only": False,
     "discount_factor":             0.995,
     "lam":                         0.95,
     "time_limit_bootstrap":        True,
@@ -404,7 +451,8 @@ def run_bc_phase(
     critic,         # DroneCriticNet
     N: int,
     per_drone_dim: int,
-    obs_dim: int,
+    actor_obs_dim: int,
+    critic_obs_dim: int,
     device: torch.device,
     run_name: str,
 ) -> None:
@@ -412,7 +460,8 @@ def run_bc_phase(
 
     Saves a runner-compatible checkpoint at log_dir/run_name/bc_checkpoint.pt.
     """
-    from quadcopter.dmpc_expert import DMPCExpert, DMPCParams
+    from quadcopter.dmpc_gpu_expert import GPUDMPCExpert
+    from quadcopter.dmpc_expert import DMPCParams
 
     env_uw   = env.unwrapped
     num_envs = env.num_envs
@@ -420,20 +469,25 @@ def run_bc_phase(
 
     env_cfg_uw = env_uw.cfg
     ts_bc = env_cfg_uw.sim.dt * env_cfg_uw.decimation
-    bc_expert = DMPCExpert(
-        num_drones=N, num_envs=num_envs, device=device, verbose=False,
+    bc_expert = GPUDMPCExpert(
+        num_drones=N, num_envs=num_envs, device=device,
         params=DMPCParams(
             pmin=env_cfg_uw.pos_min,
             pmax=env_cfg_uw.pos_max,
             rmin=env_cfg_uw.rmin,
             ts=ts_bc,
+            max_envs=num_envs,
         ),
     )
+    obstacle_info = env_uw.get_obstacle_info() if hasattr(env_uw, "get_obstacle_info") else None
+    bc_expert.reset(obstacle_info=obstacle_info)
 
     # Ring buffer (per-drone)
     BUF = 200_000
     buf_obs  = torch.zeros(BUF, per_drone_dim, device=device)
     buf_act  = torch.zeros(BUF, 3, device=device)
+    buf_critic_obs = torch.zeros(BUF, critic_obs_dim, device=device)
+    buf_ret  = torch.zeros(BUF, device=device)
     buf_ptr, buf_full = 0, False
 
     actor_opt  = torch.optim.Adam(list(cnf.model.parameters()), lr=args_cli.bc_lr)
@@ -443,7 +497,7 @@ def run_bc_phase(
 
     for it in range(args_cli.bc_iters):
         # ── Collect rollout with DMPC ────────────────────────────────────────
-        obs_list, act_list, rew_list, done_list = [], [], [], []
+        actor_obs_list, critic_obs_list, act_list, rew_list, done_list = [], [], [], [], []
 
         for _ in range(args_cli.rollouts):
             st      = env_uw._stack_drone_state()
@@ -454,36 +508,43 @@ def run_bc_phase(
             )
             env_act = env_uw.reference_to_action(ref_pos, ref_vel, ref_acc)  # (E, N*3)
 
-            obs_list.append(obs.clone())
+            actor_obs_list.append(_extract_actor_obs(obs).clone())
+            critic_obs_list.append(_extract_critic_obs(obs).clone())
             act_list.append(env_act.clone())
 
-            obs, rew, term, trunc, _ = env.step(env_act)
-            done_list.append((term | trunc).clone())
+            obs, rew, done, _ = env.step(env_act)
+            done_list.append(done.bool().clone())
             rew_list.append(rew.clone())
 
         # ── Compute discounted returns ───────────────────────────────────────
         with torch.no_grad():
-            R = critic(obs)  # bootstrap last state
+            R = critic(_extract_critic_obs(obs))  # bootstrap last state
         returns = []
         for rew, done in zip(reversed(rew_list), reversed(done_list)):
             R = rew + gamma * R * (~done).float()
             returns.insert(0, R.clone())
 
         # ── Update obs normalisers ───────────────────────────────────────────
-        all_obs = torch.stack(obs_list)              # (T, E, obs_dim)
-        flat_for_norm = all_obs.reshape(-1, obs_dim)
-        cnf.model["condition"].update_norm(flat_for_norm)
-        critic.update_norm(flat_for_norm)
+        all_actor_obs = torch.stack(actor_obs_list)    # (T, E, actor_obs_dim)
+        all_critic_obs = torch.stack(critic_obs_list)  # (T, E, critic_obs_dim)
+        flat_actor_for_norm = all_actor_obs.reshape(-1, actor_obs_dim)
+        flat_critic_for_norm = all_critic_obs.reshape(-1, critic_obs_dim)
+        cnf.model["condition"].update_norm(flat_actor_for_norm)
+        critic.update_norm(flat_critic_for_norm)
 
         # ── Add to BC buffer ─────────────────────────────────────────────────
-        for obs_s, act_s in zip(obs_list, act_list):
+        for obs_s, critic_s, act_s, ret_s in zip(actor_obs_list, critic_obs_list, act_list, returns):
             obs_per = obs_s.reshape(-1, per_drone_dim)   # (E*N, per_dim)
             act_per = act_s.reshape(-1, 3)               # (E*N, 3)
+            critic_per = critic_s.repeat_interleave(N, dim=0)
+            ret_per = ret_s.repeat_interleave(N)
             n = obs_per.shape[0]
             end = buf_ptr + n
             if end <= BUF:
                 buf_obs[buf_ptr:end] = obs_per
                 buf_act[buf_ptr:end] = act_per
+                buf_critic_obs[buf_ptr:end] = critic_per
+                buf_ret[buf_ptr:end] = ret_per
                 buf_ptr = end % BUF
                 if buf_ptr == 0:
                     buf_full = True
@@ -491,37 +552,59 @@ def run_bc_phase(
                 first = BUF - buf_ptr
                 buf_obs[buf_ptr:]   = obs_per[:first]
                 buf_act[buf_ptr:]   = act_per[:first]
+                buf_critic_obs[buf_ptr:] = critic_per[:first]
+                buf_ret[buf_ptr:] = ret_per[:first]
                 buf_obs[:n - first] = obs_per[first:]
                 buf_act[:n - first] = act_per[first:]
+                buf_critic_obs[:n - first] = critic_per[first:]
+                buf_ret[:n - first] = ret_per[first:]
                 buf_ptr  = n - first
                 buf_full = True
 
         buf_valid = BUF if buf_full else buf_ptr
 
-        # ── BC actor update (rectified-flow matching) ────────────────────────
+        # ── AWR-BC actor update (rectified-flow matching) ────────────────────
         bc_loss_val = float("nan")
+        bc_weight_val = float("nan")
+        bc_adv_val = float("nan")
         if buf_valid >= args_cli.bc_batch_size:
             cnf.model["condition"].train()
             cnf.model["flow"].train()
+            weight_sum = 0.0
+            adv_sum = 0.0
+            bc_batches = 0
             for _ in range(args_cli.bc_epochs_per_round):
                 idx  = torch.randperm(buf_valid, device=device)[:args_cli.bc_batch_size]
                 obs_b = buf_obs[idx]   # (B, per_dim)
                 x1    = buf_act[idx]   # (B, 3)
+                critic_b = buf_critic_obs[idx]
+                ret_b = buf_ret[idx]
                 x0    = torch.randn_like(x1)
                 t     = torch.rand(x1.shape[0], device=device)
                 xt    = (1 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
                 cond  = cnf.model["condition"](obs_b)
                 v_pred = cnf.model["flow"](xt, t, cond)
-                bc_loss = (v_pred - (x1 - x0)).pow(2).mean()
+                with torch.no_grad():
+                    value_b = critic(critic_b)
+                    adv_b = ret_b - value_b
+                    weights = torch.exp(adv_b / max(args_cli.bc_awr_temperature, 1e-6))
+                    weights = weights.clamp(max=args_cli.bc_awr_max_weight)
+                    weight_sum += float(weights.mean().item())
+                    adv_sum += float(adv_b.mean().item())
+                    bc_batches += 1
+                vel_mse = (v_pred - (x1 - x0)).pow(2).mean(dim=-1)
+                bc_loss = (weights * vel_mse).mean()
                 actor_opt.zero_grad()
                 bc_loss.backward()
                 torch.nn.utils.clip_grad_norm_(cnf.model.parameters(), 1.0)
                 actor_opt.step()
                 cnf.update_proximal()   # keep EWMA proximal in sync
             bc_loss_val = bc_loss.item()
+            bc_weight_val = weight_sum / max(bc_batches, 1)
+            bc_adv_val = adv_sum / max(bc_batches, 1)
 
         # ── Critic value regression ──────────────────────────────────────────
-        flat_obs = all_obs.reshape(-1, obs_dim)
+        flat_obs = all_critic_obs.reshape(-1, critic_obs_dim)
         flat_ret = torch.stack(returns).reshape(-1)
         perm = torch.randperm(flat_obs.shape[0], device=device)
         critic_loss_val = float("nan")
@@ -530,7 +613,10 @@ def run_bc_phase(
                 idx = perm[start : start + args_cli.bc_batch_size]
                 if len(idx) == 0:
                     break
-                critic_loss = F.mse_loss(critic(flat_obs[idx]), flat_ret[idx].detach())
+                critic_loss = (
+                    args_cli.bc_critic_value_loss_scale
+                    * F.mse_loss(critic(flat_obs[idx]), flat_ret[idx].detach())
+                )
                 critic_opt.zero_grad()
                 critic_loss.backward()
                 critic_opt.step()
@@ -539,9 +625,28 @@ def run_bc_phase(
         print(
             f"[BC {it+1:4d}/{args_cli.bc_iters}] "
             f"bc={bc_loss_val:.4f}  critic={critic_loss_val:.4f}  "
-            f"buf={buf_valid}",
+            f"w={bc_weight_val:.3f}  adv={bc_adv_val:.3f}  buf={buf_valid}",
             flush=True,
         )
+        if args_cli.wandb and _WANDB_AVAILABLE and _wandb.run is not None:
+            _wandb.log(
+                {
+                    "BC/iteration": it + 1,
+                    "BC/actor_loss": bc_loss_val,
+                    "BC/critic_loss": critic_loss_val,
+                    "BC/awr_weight": bc_weight_val,
+                    "BC/advantage": bc_adv_val,
+                    "BC/buffer_size": buf_valid,
+                    "BC/rollout_steps": args_cli.rollouts,
+                    "BC/epochs_per_round": args_cli.bc_epochs_per_round,
+                },
+                step=it + 1,
+            )
+
+    # PPO starts from the post-BC policy.  Keep behavior/proximal snapshots in
+    # sync so the first RL update is not measured against the random init actor.
+    cnf.update()
+    cnf.reset_proximal()
 
     # ── Save BC checkpoint (runner-compatible format) ────────────────────────
     ckpt_dir  = Path(args_cli.log_dir) / run_name
@@ -549,7 +654,22 @@ def run_bc_phase(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_state_dicts": {"actor": cnf.state_dict(), "critic": critic.state_dict()},
+            "model_state_dicts": {
+                "actor": {
+                    "_type": "flow",
+                    "state": {
+                        "model": cnf.model.state_dict(),
+                        "model_ema": cnf.model_ema.state_dict(),
+                        "model_last": cnf.model_last.state_dict(),
+                        **(
+                            {"model_proximal": cnf.model_proximal.state_dict()}
+                            if cnf.model_proximal is not None
+                            else {}
+                        ),
+                    },
+                },
+                "critic": {"_type": "nn_module", "state": critic.state_dict()},
+            },
             "iteration": 0,
         },
         ckpt_path,
@@ -593,13 +713,13 @@ def _run_play(
     with torch.no_grad():
         while total_done < target:
             x0 = torch.randn(E, N * 3, device=device)
-            actions, _ = actor.sample(x0=x0, condition=obs)
-            obs, _, term, trunc, _ = env.step(actions)
+            actions, _ = actor.sample(x0=x0, condition=_extract_actor_obs(obs))
+            obs, _, done, env_info = env.step(actions)
 
-            done_envs = (term | trunc).nonzero(as_tuple=True)[0]
+            done_envs = done.nonzero(as_tuple=True)[0]
             for e in done_envs.tolist():
                 n_active = int(env_uw._active_n[e].item()) if curriculum_on else N
-                success  = bool(term[e].item())
+                success  = bool(env_uw._just_succeeded[e].item())
                 ep_results.append((n_active, success))
                 total_done += 1
                 if total_done >= target:
@@ -623,6 +743,26 @@ def _run_play(
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Resume helper                                                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+def _reset_critic_weights(critic: "DroneCriticNet") -> None:
+    """Re-initialise critic MLP weights and clear observation normalisation stats.
+
+    Called when entering a new curriculum phase so the critic can re-learn the
+    value function under the updated reward/termination structure while the actor
+    (frozen for actor_freeze_iters updates) stays behaviorally stable.
+    """
+    for m in critic.mlp.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.constant_(m.bias, 0.0)
+    # Reset running statistics so old phase-1 normalisation doesn't pollute phase-2.
+    norm = critic.obs_norm
+    norm._mean.zero_()
+    norm._var.fill_(1.0)
+    norm._std.fill_(1.0)
+    norm.count.zero_()
+    print("[Phase-2] Critic weights and obs-norm stats reset.", flush=True)
+
+
 def _load_resume(runner, path: str, device) -> tuple[int, bool]:
     """Load a checkpoint, re-initialising the critic if obs_dim changed (N changed).
 
@@ -692,6 +832,21 @@ def main() -> None:
     env_cfg.num_drones     = args_cli.num_drones
     if args_cli.n_min > 0:
         env_cfg.n_curriculum_min = args_cli.n_min
+    # Harder env settings are enabled from phase 1 so the policy learns the
+    # final termination/reward semantics immediately.
+    env_cfg.terminate_on_collision_rl   = True
+    env_cfg.collision_terminate_dist    = args_cli.collision_terminate_dist
+    env_cfg.terminate_on_oob_rl         = True
+    env_cfg.hover_vel_scale             = args_cli.hover_vel_scale
+    env_cfg.hover_proximity_dist        = args_cli.hover_proximity_dist
+    env_cfg.dmpc_guide_scale            = env_cfg.dmpc_guide_scale * 0.5
+    env_cfg.dist_to_goal_far_scale      = args_cli.dist_far_scale
+    env_cfg.dist_to_goal_far_tanh_scale = args_cli.dist_far_tanh_scale
+    env_cfg.dist_to_goal_near_scale     = args_cli.dist_near_scale
+    env_cfg.dist_to_goal_near_tanh_scale = args_cli.dist_tanh_scale
+    # --curriculum now only controls resume-time critic reset / actor freeze.
+    if args_cli.curriculum:
+        pass
     env_cfg.__post_init__()           # recompute action_space / observation_space
 
     env_raw = gym.make("Isaac-MultiDrone-DMPC-RL-Direct-v0", cfg=env_cfg)
@@ -700,7 +855,11 @@ def main() -> None:
     device  = env.device
 
     N       = env_cfg.num_drones
-    obs_dim = gym.spaces.flatdim(env.unwrapped.single_observation_space["policy"])
+    actor_obs_dim = gym.spaces.flatdim(env.unwrapped.single_observation_space["policy"])
+    # The env returns a runtime "critic" observation with active_n appended, but
+    # IsaacLab's static single_observation_space is built from cfg and only
+    # declares "policy".  Keep the critic size explicit here.
+    critic_obs_dim = actor_obs_dim + 1
     act_dim = gym.spaces.flatdim(env.unwrapped.single_action_space)
     assert act_dim == N * 3, f"Unexpected action dim {act_dim} for N={N}"
 
@@ -708,13 +867,17 @@ def main() -> None:
     sdf_dim = PER_DRONE_SDF_DIM if env_cfg.enable_sdf_obs else 0
     own_dim = PER_DRONE_OWN_DIM + sdf_dim
     per_drone_dim = own_dim + PER_NEIGHBOUR_DIM * (N - 1)
-    assert obs_dim == N * per_drone_dim, (
-        f"obs_dim {obs_dim} != N*per_drone_dim {N}*{per_drone_dim} "
+    assert actor_obs_dim == N * per_drone_dim, (
+        f"actor_obs_dim {actor_obs_dim} != N*per_drone_dim {N}*{per_drone_dim} "
         f"(own={own_dim}, sdf={sdf_dim}, neigh={PER_NEIGHBOUR_DIM}*(N-1))"
+    )
+    assert critic_obs_dim == actor_obs_dim + 1, (
+        f"critic_obs_dim {critic_obs_dim} != actor_obs_dim+1 {actor_obs_dim + 1}"
     )
 
     print(f"[Env] {args_cli.num_envs} envs × {N} drones  "
-          f"obs={obs_dim} (per_drone={per_drone_dim}, sdf={sdf_dim})  act={act_dim}", flush=True)
+          f"actor_obs={actor_obs_dim} critic_obs={critic_obs_dim} "
+          f"(per_drone={per_drone_dim}, sdf={sdf_dim})  act={act_dim}", flush=True)
 
     # ── actor (per-agent shared policy) ──────────────────────────────────────
     emb_dim     = args_cli.emb_dim
@@ -746,7 +909,7 @@ def main() -> None:
     actor = PerAgentActorWrapper(cnf, N=N, per_drone_obs_dim=per_drone_dim)
 
     # ── critic ────────────────────────────────────────────────────────────────
-    critic = DroneCriticNet(obs_dim=obs_dim, hidden_dims=hidden_dims).to(device)
+    critic = DroneCriticNet(obs_dim=critic_obs_dim, hidden_dims=hidden_dims).to(device)
 
     # ── agent ─────────────────────────────────────────────────────────────────
     if AGENT_CFG["use_ewma"]:
@@ -758,29 +921,44 @@ def main() -> None:
         device=device,
     )
 
+    agent_cfg = {
+        **AGENT_CFG,
+        "bc_ref_kl_coef0": args_cli.bc_ref_kl_coef0,
+        "bc_ref_kl_decay_steps": args_cli.bc_ref_kl_decay_steps,
+        "bc_ref_kl_min": args_cli.bc_ref_kl_min,
+    }
+
     models = {"critic": critic, "actor": actor}
     agent  = PolicyFlow(
         models=models,
         replay_buffer=replay_buffer,
         device=device,
-        cfg=AGENT_CFG,
+        cfg=agent_cfg,
     )
     agent.init_replay_buffer(
-        critic_observation_size=obs_dim,
-        actor_observation_size=obs_dim,
+        critic_observation_size=critic_obs_dim,
+        actor_observation_size=actor_obs_dim,
         action_size=act_dim,            # N*3 — env action space
     )
 
     # ── runner cfg ────────────────────────────────────────────────────────────
     run_name = args_cli.experiment_name or datetime.datetime.now().strftime("%y-%m-%d_%H-%M-%S")
+    bc_step_offset = args_cli.bc_iters if args_cli.bc_iters > 0 and not args_cli.resume else 0
+    bc_critic_step_offset = (
+        args_cli.bc_critic_warmup_iters if bc_step_offset > 0 else 0
+    )
     runner_cfg = {
-        "max_iterations": args_cli.max_iterations,
+        "max_iterations": args_cli.max_iterations + bc_step_offset + bc_critic_step_offset,
         "rollouts":       args_cli.rollouts,
         "save_interval":  args_cli.save_interval,
         "log_dir":        args_cli.log_dir,
         "experiment_name": run_name,
         "run_name":        run_name,
         "wandb_project":   args_cli.wandb_project if args_cli.wandb else "",
+        # If BC warmup is used, BC collection/training matures the actor and
+        # critic normalizers.  Keep them fixed during subsequent RL to preserve
+        # the post-BC policy/anchor semantics.  Without BC, update online in RL.
+        "update_model_normalizers": args_cli.bc_iters <= 0,
     }
 
     if args_cli.wandb and _WANDB_AVAILABLE:
@@ -805,10 +983,23 @@ def main() -> None:
             simulation_app.close()
             return
 
-        # When the critic was reinitialised (N changed), freeze the actor for
-        # `critic_warmup_iters` PPO updates so the new critic can converge
-        # against a stationary actor before joint training resumes.
-        warmup = args_cli.critic_warmup_iters if critic_reinit else 0
+        # ── Phase-2: curriculum flag resets critic and freezes actor ─────
+        # Takes precedence over the automatic N-change reinit path below.
+        if args_cli.curriculum:
+            _reset_critic_weights(critic)
+            critic_reinit = True  # triggers actor freeze logic below
+            freeze_iters  = args_cli.actor_freeze_iters
+            print(
+                f"[Phase-2] Critic reset. Freezing actor for {freeze_iters} PPO updates.",
+                flush=True,
+            )
+        else:
+            freeze_iters = args_cli.critic_warmup_iters if critic_reinit else 0
+
+        # When the critic was reinitialised (N changed or --reset_critic),
+        # freeze the actor so the new critic can converge against a stationary
+        # actor before joint training resumes.
+        warmup = freeze_iters if critic_reinit else 0
         if warmup > 0:
             print(
                 f"[Resume] Freezing actor for {warmup} PPO updates (critic warmup).",
@@ -831,43 +1022,36 @@ def main() -> None:
     if args_cli.bc_iters > 0 and not args_cli.resume:
         run_bc_phase(
             env=env, cnf=cnf, critic=critic,
-            N=N, per_drone_dim=per_drone_dim, obs_dim=obs_dim,
+            N=N, per_drone_dim=per_drone_dim,
+            actor_obs_dim=actor_obs_dim, critic_obs_dim=critic_obs_dim,
             device=device, run_name=run_name,
         )
+        start_iteration = args_cli.bc_iters
 
-        # Freeze BC actor as reference; attach KL loss to RL agent.
-        frozen_cnf = copy.deepcopy(cnf)
-        for p in frozen_cnf.model.parameters():
-            p.requires_grad_(False)
-        frozen_cnf.model.eval()
-
-        kl_step = [0]
-
-        def _bc_kl_loss(obs, delta_actions, *_):
-            coef0 = args_cli.bc_ref_kl_coef0
-            decay = args_cli.bc_ref_kl_decay_steps
-            coef  = coef0 * (0.01 ** min(kl_step[0] / max(decay, 1.0), 1.0))
-            kl_step[0] += 1
-            if coef < 1e-5:
-                return 0
-            B = obs.shape[0]
-            obs_per = obs.reshape(B * N, per_drone_dim)
-            x1 = delta_actions.reshape(B * N, 3)
-            x0 = torch.randn_like(x1)
-            t  = torch.rand(x1.shape[0], device=device)
-            xt = (1 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * x1
-            cur_cond = cnf.model["condition"](obs_per)
-            vel_cur  = cnf.model["flow"](xt, t, cur_cond)
-            with torch.no_grad():
-                vel_ref = frozen_cnf.model["flow"](xt, t, frozen_cnf.model["condition"](obs_per))
-            return coef * (vel_cur - vel_ref).pow(2).mean()
-
-        agent._bc_loss_fn = _bc_kl_loss
+        # Attach the post-BC actor as a frozen KL reference for PPO.  PolicyFlow's
+        # BC-ref KL path is wrapper-aware for this per-drone actor.
+        agent.set_bc_ref_model(actor)
         print(
-            f"[BC→RL] KL ref attached  "
-            f"(coef0={args_cli.bc_ref_kl_coef0}, decay={args_cli.bc_ref_kl_decay_steps} iters)",
+            f"[BC→RL] KL anchor attached "
+            f"(coef0={args_cli.bc_ref_kl_coef0}, decay={args_cli.bc_ref_kl_decay_steps}, "
+            f"min={args_cli.bc_ref_kl_min})",
             flush=True,
         )
+
+        # Critic warmup against a fixed actor before joint PPO updates.
+        if args_cli.bc_critic_warmup_iters > 0:
+            print(
+                f"[BC→RL] Freezing actor for {args_cli.bc_critic_warmup_iters} "
+                "PPO updates for critic warmup.",
+                flush=True,
+            )
+            for p in cnf.model.parameters():
+                p.requires_grad_(False)
+            runner.train(start_iteration=start_iteration, return_epochs=args_cli.bc_critic_warmup_iters)
+            for p in cnf.model.parameters():
+                p.requires_grad_(True)
+            start_iteration += args_cli.bc_critic_warmup_iters
+            print("[BC→RL] Actor unfrozen — starting joint PPO with KL anchor.", flush=True)
 
     # ── Phase 2: RL ───────────────────────────────────────────────────────────
     runner.train(start_iteration=start_iteration, return_epochs=args_cli.max_iterations)

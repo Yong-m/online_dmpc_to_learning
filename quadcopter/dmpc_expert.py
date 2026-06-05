@@ -442,6 +442,13 @@ class DMPCExpert:
         self._st_U   = np.zeros((num_envs, self.N, self.n_bez), dtype=np.float32)
         self._st_has = np.zeros((num_envs, self.N), dtype=bool)
 
+        # Static-obstacle cache.  reset(obstacle_info=...) refreshes these, but
+        # compute() must also be valid before the first reset call.
+        self._obstacle_info = None
+        self._num_static_obstacles = 0
+        self._obstacle_pos_w = None
+        self._obstacle_pos_local = None
+
         # Wall-time accounting for per-agent QP/replan calls. These values are
         # updated from worker threads, so keep mutations behind a small lock.
         self._timing_lock = Lock()
