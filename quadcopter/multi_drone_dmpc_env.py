@@ -10,8 +10,9 @@ env, goal-reaching) but instantiates *N* Crazyflies and aligns the action /
 observation interface with the multi-robot motion-planning setting of the
 ``online_dmpc`` paper. Design choices:
 
-* **Action = 3-D world-frame velocity reference per drone**: normalised
-  ``v_ref_w`` in ``[-1, 1]^3``.  The env integrates one step ahead to produce the position
+* **Action = 3-D goal-aligned velocity reference per drone**: normalised
+  ``v_ref`` in ``[-1, 1]^3``.  The env rotates it into world frame, integrates one
+  step ahead to produce the position
   reference ``ref_pos_w = pos_w + v_ref_w * v_max * dt`` and drives the
   cascade controller with ``(ref_pos, ref_vel, ref_acc=0)``.  Total env
   action dimension is ``3 * num_drones``.
@@ -79,7 +80,7 @@ class MultiDroneDmpcEnvWindow(BaseEnvWindow):
 class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     # ── env ──
     num_drones: int = 4 # overwritten by cli args
-    episode_length_s: float = 10.0
+    episode_length_s: float = 20.0
     decimation: int = 5
     # action_type: str = "full_traj" # "full_traj", "velocity", "wrench"
     action_space: int = None   # overwritten in __post_init__
@@ -341,8 +342,8 @@ class MultiDroneDmpcEnv(DirectRLEnv):
 
         * ``actions.shape[-1] == N * 4``: wrench mode — ``[f_z, τ_x, τ_y, τ_z]``
           per drone (body frame) applied directly, bypassing the cascade.
-        * ``actions.shape[-1] == N * 3``: v_ref mode — normalised world-frame
-          velocity reference, converted via the cascade controller.
+        * ``actions.shape[-1] == N * 3``: v_ref mode — normalised velocity
+          reference in goal-aligned frame, converted via the cascade controller.
         """
         E, N = self.num_envs, self.N
 
@@ -383,9 +384,15 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         st = self._stack_drone_state()
         pos_w = st["pos_w"]
 
-        # v_ref is expressed directly in world frame.  This keeps action
-        # semantics aligned with the world-frame observation and DMPC ref_vel.
-        ref_vel_w = a * self.cfg.v_max
+        # v_ref is expressed in each drone's goal-aligned frame, then rotated
+        # into world frame for the cascade controller.
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)   # (E, N, 3, 3)
+        self._prev_R = R.detach()
+        v_ref_goal = a * self.cfg.v_max                             # (E, N, 3)
+        ref_vel_w = torch.bmm(
+            R.transpose(-1, -2).reshape(E * N, 3, 3),
+            v_ref_goal.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
 
         # Integrate v_ref: advance reference from last reference position.
         ref_pos_w = self._last_ref_pos_w + ref_vel_w * self.step_dt
@@ -1029,7 +1036,7 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         ref_vel_w: torch.Tensor | None = None,
         _ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pack world-frame velocity reference into normalised 3-D action.
+        """Convert a world-frame velocity reference into goal-aligned action.
 
         Args:
             ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions (unused,
@@ -1038,12 +1045,19 @@ class MultiDroneDmpcEnv(DirectRLEnv):
             _ref_acc_w: ignored (kept for API compatibility).
 
         Returns:
-            ``(num_envs, num_drones * 3)`` normalised v_ref in ``[-1, 1]``.
+            ``(num_envs, num_drones * 3)`` normalised goal-frame v_ref in ``[-1, 1]``.
         """
         if ref_vel_w is None:
             ref_vel_w = torch.zeros_like(ref_pos_w)
         E, N = ref_pos_w.shape[0], ref_pos_w.shape[1]
-        vel_norm = (ref_vel_w / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
+        pos_w = self._stack_drone_state()["pos_w"]
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)  # (E, N, 3, 3)
+        # Rotate world-frame v_ref into each drone's goal-aligned action frame.
+        v_ref_goal = torch.bmm(
+            R.reshape(E * N, 3, 3),
+            ref_vel_w.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
+        vel_norm = (v_ref_goal / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
         return vel_norm.reshape(E, N * 3)
 
     def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
@@ -1074,13 +1088,21 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         return self.reference_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
 
     def vref_to_action(self, ref_vel_w: torch.Tensor) -> torch.Tensor:
-        """Normalise a world-frame velocity reference.
+        """Rotate world-frame velocity reference into goal-aligned frame and normalise.
 
         Returns ``(num_envs, num_drones * 3)`` in ``[-1, 1]`` — the 3-D action
         consumed by the v_ref cascade path in :meth:`_pre_physics_step`.
         """
-        E, N = ref_vel_w.shape[0], ref_vel_w.shape[1]
-        vel_norm = (ref_vel_w / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
+        st = self._stack_drone_state()
+        pos_w = st["pos_w"]
+        E, N = pos_w.shape[0], pos_w.shape[1]
+        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)   # (E, N, 3, 3)
+        # world -> goal frame: v_goal = R @ ref_vel_w
+        v_goal = torch.bmm(
+            R.reshape(E * N, 3, 3),
+            ref_vel_w.reshape(E * N, 3, 1),
+        ).reshape(E, N, 3)
+        vel_norm = (v_goal / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
         return vel_norm.reshape(E, N * 3)
 
     # ── internal: cascaded position controller -> thrust/moment ────────────

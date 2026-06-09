@@ -68,37 +68,42 @@ parser.add_argument("--bc_ref_kl_decay_steps", type=float, default=500.0,
 parser.add_argument("--bc_ref_kl_min", type=float, default=0.0,
                     help="Floor value for BC reference KL coefficient.")
 parser.add_argument("--bc_critic_warmup_iters", type=int, default=10,
-                    help="After BC warmup, freeze actor for this many PPO updates "
-                         "so the critic learns before actor updates resume.")
+                    help="After BC warmup, ramp actor LR for this many PPO updates "
+                         "so the critic learns while the actor moves slowly.")
 # N curriculum
 parser.add_argument("--n_min", type=int, default=0,
                     help="Min active drones for N curriculum (0 = disabled, use --num_drones throughout).") #1
-# Phase-2 resume curriculum (critic reset and actor freeze only).  The harder
+# Phase-2 resume curriculum (critic reset and actor LR warmup only).  The harder
 # env settings below are now enabled from phase 1 as well.
 parser.add_argument("--curriculum", action="store_true", default=False,
-                    help="On resume: reset critic and freeze actor for "
-                         "--actor_freeze_iters PPO updates.")
+                    help="On resume: reset critic and ramp actor LR for "
+                         "--actor_lr_warmup_iters PPO updates.")
+parser.add_argument("--curriculum2", action="store_true", default=False,
+                    help="Enable curriculum-2 reward settings: min/max per-drone reward "
+                         "aggregation and time-proportional early-completion bonus at goal_all. "
+                         "Can be combined with --curriculum for critic reset.")
+parser.add_argument("--time_bonus_scale", type=float, default=1500.0,
+                    help="Early-completion bonus scale for --curriculum2 (unscaled, default 1500).")
 parser.add_argument("--hover_vel_scale", type=float, default=5.0,
                     help="Hover velocity penalty scale used with --curriculum (per drone, *step_dt).")
 parser.add_argument("--hover_proximity_dist", type=float, default=0.4,
                     help="Tanh half-width [m] for hover velocity penalty gate (with --curriculum).")
-parser.add_argument("--dist_far_scale", type=float, default=45.0,
-                    help="Far-field distance-to-goal reward scale.")
-parser.add_argument("--dist_far_tanh_scale", type=float, default=1.2,
-                    help="Far-field tanh denominator [m] for distance-to-goal reward.")
-parser.add_argument("--dist_near_scale", type=float, default=30.0,
-                    help="Near-goal distance-to-goal reward scale.")
-parser.add_argument("--dist_tanh_scale", type=float, default=0.3,
-                    help="Near-goal tanh denominator [m] for distance-to-goal reward. "
-                         "Smaller = sharper gradient near goal.")
-parser.add_argument("--actor_freeze_iters", type=int, default=10,
-                    help="PPO updates to freeze the actor after critic reset (--curriculum). Default 10.")
+parser.add_argument("--dist_far_scale", type=float, default=50.0,
+                    help="Distance-to-goal reward scale.")
+parser.add_argument("--dist_far_tanh_scale", type=float, default=0.8,
+                    help="Tanh denominator [m] for distance-to-goal reward.")
+parser.add_argument("--actor_lr_warmup_iters", type=int, default=30,
+                    help="PPO updates to ramp actor LR after critic reset (--curriculum). Default 30.")
+parser.add_argument("--actor_freeze_iters", type=int, default=None,
+                    help=argparse.SUPPRESS)
+parser.add_argument("--actor_lr_warmup_start_scale", type=float, default=0.01,
+                    help="Initial actor LR as a fraction of base actor LR during critic warmup.")
 parser.add_argument("--collision_terminate_dist", type=float, default=0.12,
                     help="Hard collision termination distance [m]. Separate from cfg.rmin, "
                          "which remains the DMPC/safety-margin penalty radius.")
 # Resume with N change
-parser.add_argument("--critic_warmup_iters", type=int, default=10,
-                    help="When resuming with a different num_drones, freeze the actor for this many "
+parser.add_argument("--critic_warmup_iters", type=int, default=30,
+                    help="When resuming with a different num_drones, ramp actor LR for this many "
                          "PPO updates so the new critic can warm up before joint training.")
 # Play / eval mode
 parser.add_argument("--play", action="store_true", default=False,
@@ -113,6 +118,8 @@ parser.add_argument("--wandb_project",   type=str,   default="dmpc_rl")
 from isaaclab.app import AppLauncher  # noqa: E402
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.actor_freeze_iters is not None:
+    args_cli.actor_lr_warmup_iters = args_cli.actor_freeze_iters
 args_cli.headless = getattr(args_cli, "headless", True)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -364,6 +371,78 @@ class PerAgentActorWrapper:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Per-drone env wrapper (IPPO: E×N → E*N virtual envs)                     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+class PerDroneEnvWrapper:
+    """Flattens an E×N multi-drone env into E*N single-drone virtual envs for IPPO.
+
+    obs  (E, N*P) → (E*N, P)  — each drone gets its own per-drone slice.
+    act  (E*N, 3) → (E, N*3)  — stacked back before calling the real env.
+    rew  reads ``env.unwrapped._per_drone_rewards_last`` (E, N) → (E*N,).
+    done env-level (E,) broadcast to all N drones in each env → (E*N,).
+    """
+
+    def __init__(self, env: "IsaacLabEnvWrapper", N: int, per_drone_dim: int):
+        self._env           = env
+        self._N             = N
+        self._per_drone_dim = per_drone_dim
+        self.num_envs       = env.num_envs * N
+        self.device         = env.device
+
+    @property
+    def unwrapped(self):
+        return self._env.unwrapped
+
+    # Forward episode-length attributes so the runner can stagger resets.
+    @property
+    def episode_length_buf(self):
+        return self.unwrapped.episode_length_buf
+
+    @episode_length_buf.setter
+    def episode_length_buf(self, value):
+        self.unwrapped.episode_length_buf = value
+
+    @property
+    def max_episode_length(self):
+        return self.unwrapped.max_episode_length
+
+    def reset(self):
+        obs, info = self._env.reset()
+        return self._split_obs(obs), info
+
+    def step(self, actions: torch.Tensor):
+        E = self._env.num_envs
+        N = self._N
+        act_env = actions.reshape(E, N * 3)
+        obs, _, done, info = self._env.step(act_env)
+
+        rewards  = self._env.unwrapped._per_drone_rewards_last.reshape(E * N)
+        done_per = done.unsqueeze(-1).expand(E, N).reshape(E * N)
+
+        if isinstance(info, dict) and "time_outs" in info:
+            info = dict(info)
+            info["time_outs"] = (
+                info["time_outs"].unsqueeze(-1).expand(E, N).reshape(E * N)
+            )
+
+        return self._split_obs(obs), rewards, done_per, info
+
+    def _split_obs(self, obs):
+        E = self._env.num_envs
+        N = self._N
+        P = self._per_drone_dim
+        # IsaacLabEnvWrapper renames keys to actor_observations / critic_observations.
+        if isinstance(obs, dict):
+            key = "actor_observations" if "actor_observations" in obs else "policy"
+            per_drone = obs[key].reshape(E * N, P)
+            return {"actor_observations": per_drone, "critic_observations": per_drone}
+        return obs.reshape(E * N, P)
+
+    def close(self):
+        self._env.close()
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Critic network                                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 class DroneCriticNet(nn.Module):
@@ -390,6 +469,36 @@ class DroneCriticNet(nn.Module):
 
     def update_norm(self, obs: torch.Tensor) -> None:
         self.obs_norm.update(obs.detach())
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Per-drone critic (IPPO) — same encoder as actor condition net             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+class PerDroneCriticNet(nn.Module):
+    """Per-drone critic for IPPO: same architecture as PerDroneConditionNet + value head.
+
+    Input:  ``(B, per_drone_dim)`` — single-drone observation slice.
+    Output: ``(B,)``               — scalar value estimate.
+    """
+
+    def __init__(self, N: int, own_dim: int, neigh_dim: int, emb_dim: int, hidden_dims: list[int]):
+        super().__init__()
+        self._encoder = PerDroneConditionNet(
+            N=N, own_dim=own_dim, neigh_dim=neigh_dim,
+            emb_dim=emb_dim, hidden_dims=hidden_dims,
+        )
+        self.value_head = nn.Linear(emb_dim, 1)
+
+    def forward(self, obs: torch.Tensor, hidden_state=None) -> torch.Tensor:
+        return self.value_head(self._encoder(obs)).squeeze(-1)  # (B,)
+
+    def update_norm(self, obs: torch.Tensor) -> None:
+        enc = self._encoder
+        enc.own_norm.update(obs[:, :enc.own_dim].detach())
+        if enc.N > 1:
+            enc.neigh_norm.update(
+                obs[:, enc.own_dim:].reshape(-1, enc.neigh_dim).detach()
+            )
 
 
 def _extract_actor_obs(obs) -> torch.Tensor:
@@ -743,23 +852,32 @@ def _run_play(
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ Resume helper                                                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-def _reset_critic_weights(critic: "DroneCriticNet") -> None:
-    """Re-initialise critic MLP weights and clear observation normalisation stats.
+def _reset_critic_weights(critic) -> None:
+    """Re-initialise critic weights and clear normalisation stats.
 
-    Called when entering a new curriculum phase so the critic can re-learn the
-    value function under the updated reward/termination structure while the actor
-    (frozen for actor_freeze_iters updates) stays behaviorally stable.
+    Handles both DroneCriticNet (flat MLP) and PerDroneCriticNet (per-drone encoder).
     """
-    for m in critic.mlp.modules():
-        if isinstance(m, nn.Linear):
-            nn.init.orthogonal_(m.weight, gain=1.0)
-            nn.init.constant_(m.bias, 0.0)
-    # Reset running statistics so old phase-1 normalisation doesn't pollute phase-2.
-    norm = critic.obs_norm
-    norm._mean.zero_()
-    norm._var.fill_(1.0)
-    norm._std.fill_(1.0)
-    norm.count.zero_()
+    if isinstance(critic, PerDroneCriticNet):
+        for m in critic.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                nn.init.constant_(m.bias, 0.0)
+        enc = critic._encoder
+        for norm in (enc.own_norm, enc.neigh_norm):
+            norm._mean.zero_()
+            norm._var.fill_(1.0)
+            norm._std.fill_(1.0)
+            norm.count.zero_()
+    else:
+        for m in critic.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                nn.init.constant_(m.bias, 0.0)
+        norm = critic.obs_norm
+        norm._mean.zero_()
+        norm._var.fill_(1.0)
+        norm._std.fill_(1.0)
+        norm.count.zero_()
     print("[Phase-2] Critic weights and obs-norm stats reset.", flush=True)
 
 
@@ -798,7 +916,7 @@ def _load_resume(runner, path: str, device) -> tuple[int, bool]:
             except RuntimeError:
                 print(
                     "[Resume] Critic shape mismatch (num_drones changed) — "
-                    "reinitialising critic. Actor will be frozen for warmup.",
+                    "reinitialising critic. Actor LR warmup will be used.",
                     flush=True,
                 )
                 critic_reinit = True
@@ -839,12 +957,10 @@ def main() -> None:
     env_cfg.terminate_on_oob_rl         = True
     env_cfg.hover_vel_scale             = args_cli.hover_vel_scale
     env_cfg.hover_proximity_dist        = args_cli.hover_proximity_dist
-    env_cfg.dmpc_guide_scale            = env_cfg.dmpc_guide_scale * 0.5
+    env_cfg.dmpc_guide_scale            = env_cfg.dmpc_guide_scale
     env_cfg.dist_to_goal_far_scale      = args_cli.dist_far_scale
     env_cfg.dist_to_goal_far_tanh_scale = args_cli.dist_far_tanh_scale
-    env_cfg.dist_to_goal_near_scale     = args_cli.dist_near_scale
-    env_cfg.dist_to_goal_near_tanh_scale = args_cli.dist_tanh_scale
-    # --curriculum now only controls resume-time critic reset / actor freeze.
+    # --curriculum now only controls resume-time critic reset / actor LR warmup.
     if args_cli.curriculum:
         pass
     env_cfg.__post_init__()           # recompute action_space / observation_space
@@ -905,11 +1021,26 @@ def main() -> None:
         device=device,
     )
 
-    # Wrapper handles B×N reshaping; agent sees (B, N*3) / (B, N*P) interface
-    actor = PerAgentActorWrapper(cnf, N=N, per_drone_obs_dim=per_drone_dim)
-
-    # ── critic ────────────────────────────────────────────────────────────────
-    critic = DroneCriticNet(obs_dim=critic_obs_dim, hidden_dims=hidden_dims).to(device)
+    # ── curriculum2: IPPO — per-drone virtual envs + per-drone critic ────────
+    if args_cli.curriculum2:
+        env_train  = PerDroneEnvWrapper(env, N=N, per_drone_dim=per_drone_dim)
+        actor      = PerAgentActorWrapper(cnf, N=1, per_drone_obs_dim=per_drone_dim)
+        critic     = PerDroneCriticNet(
+            N=N, own_dim=own_dim, neigh_dim=PER_NEIGHBOUR_DIM,
+            emb_dim=emb_dim, hidden_dims=hidden_dims,
+        ).to(device)
+        rl_obs_dim = per_drone_dim
+        rl_act_dim = 3
+        rl_n_envs  = env.num_envs * N
+        print(f"[IPPO] PerDroneEnvWrapper: {env.num_envs}×{N} = {rl_n_envs} virtual envs  "
+              f"obs={rl_obs_dim}  act={rl_act_dim}", flush=True)
+    else:
+        env_train  = env
+        actor      = PerAgentActorWrapper(cnf, N=N, per_drone_obs_dim=per_drone_dim)
+        critic     = DroneCriticNet(obs_dim=critic_obs_dim, hidden_dims=hidden_dims).to(device)
+        rl_obs_dim = critic_obs_dim
+        rl_act_dim = act_dim
+        rl_n_envs  = env.num_envs
 
     # ── agent ─────────────────────────────────────────────────────────────────
     if AGENT_CFG["use_ewma"]:
@@ -917,7 +1048,7 @@ def main() -> None:
 
     replay_buffer = ReplayBuffer(
         memory_size=args_cli.rollouts,
-        num_envs=env.num_envs,
+        num_envs=rl_n_envs,
         device=device,
     )
 
@@ -936,9 +1067,9 @@ def main() -> None:
         cfg=agent_cfg,
     )
     agent.init_replay_buffer(
-        critic_observation_size=critic_obs_dim,
-        actor_observation_size=actor_obs_dim,
-        action_size=act_dim,            # N*3 — env action space
+        critic_observation_size=rl_obs_dim,
+        actor_observation_size=rl_obs_dim if args_cli.curriculum2 else actor_obs_dim,
+        action_size=rl_act_dim,
     )
 
     # ── runner cfg ────────────────────────────────────────────────────────────
@@ -969,7 +1100,7 @@ def main() -> None:
             reinit=False,
         )
 
-    runner = IsaaclabRunner(env=env, agent=agent, cfg=runner_cfg)
+    runner = IsaaclabRunner(env=env_train, agent=agent, cfg=runner_cfg)
 
     # ── checkpoint resume ─────────────────────────────────────────────────────
     start_iteration = 0
@@ -978,48 +1109,53 @@ def main() -> None:
 
         # ── Play mode: eval only, no training ────────────────────────────────
         if args_cli.play:
-            _run_play(env=env, actor=actor, N=N, args_cli=args_cli, device=device)
+            # Play always uses the original (non-wrapped) env with an N-drone actor.
+            play_actor = (PerAgentActorWrapper(cnf, N=N, per_drone_obs_dim=per_drone_dim)
+                          if args_cli.curriculum2 else actor)
+            _run_play(env=env, actor=play_actor, N=N, args_cli=args_cli, device=device)
             env.close()
             simulation_app.close()
             return
 
-        # ── Phase-2: curriculum flag resets critic and freezes actor ─────
+        # ── Phase-2: curriculum flag resets critic and ramps actor LR ─────
         # Takes precedence over the automatic N-change reinit path below.
         if args_cli.curriculum:
             _reset_critic_weights(critic)
-            critic_reinit = True  # triggers actor freeze logic below
-            freeze_iters  = args_cli.actor_freeze_iters
+            critic_reinit = True  # triggers actor LR warmup logic below
+            warmup_iters  = args_cli.actor_lr_warmup_iters
             print(
-                f"[Phase-2] Critic reset. Freezing actor for {freeze_iters} PPO updates.",
+                f"[Phase-2] Critic reset. Ramping actor LR for {warmup_iters} PPO updates.",
                 flush=True,
             )
         else:
-            freeze_iters = args_cli.critic_warmup_iters if critic_reinit else 0
+            warmup_iters = args_cli.critic_warmup_iters if critic_reinit else 0
 
         # When the critic was reinitialised (N changed or --reset_critic),
-        # freeze the actor so the new critic can converge against a stationary
-        # actor before joint training resumes.
-        warmup = freeze_iters if critic_reinit else 0
+        # keep actor updates small while the new critic catches up.
+        warmup = warmup_iters if critic_reinit else 0
         if warmup > 0:
+            actor_warmup_lr = AGENT_CFG["learning_rate"] * args_cli.actor_lr_warmup_start_scale
             print(
-                f"[Resume] Freezing actor for {warmup} PPO updates (critic warmup).",
+                f"[Resume] Actor LR warmup for {warmup} PPO updates "
+                f"({actor_warmup_lr:.2e} -> {AGENT_CFG['learning_rate']:.2e}).",
                 flush=True,
             )
-            for p in cnf.model.parameters():
-                p.requires_grad_(False)
+            agent.set_actor_lr_warmup(warmup, start_lr=actor_warmup_lr)
             runner.train(start_iteration=start_iteration, return_epochs=warmup)
-            for p in cnf.model.parameters():
-                p.requires_grad_(True)
             start_iteration += warmup
-            print("[Resume] Actor unfrozen — starting full RL.", flush=True)
+            agent.set_actor_lr_warmup(0)
+            print("[Resume] Actor LR restored — starting full RL.", flush=True)
     elif args_cli.play:
         print("[Play] --play requires --resume <checkpoint>. Exiting.", flush=True)
         env.close()
         simulation_app.close()
         return
 
-    # ── Phase 1: BC warmup (skipped when --resume is set) ────────────────────
-    if args_cli.bc_iters > 0 and not args_cli.resume:
+    # ── Phase 1: BC warmup (skipped when --resume or --curriculum2) ─────────
+    if args_cli.bc_iters > 0 and args_cli.curriculum2:
+        print("[IPPO] --bc_iters ignored with --curriculum2; use --resume to continue from a checkpoint.",
+              flush=True)
+    if args_cli.bc_iters > 0 and not args_cli.resume and not args_cli.curriculum2:
         run_bc_phase(
             env=env, cnf=cnf, critic=critic,
             N=N, per_drone_dim=per_drone_dim,
@@ -1038,20 +1174,19 @@ def main() -> None:
             flush=True,
         )
 
-        # Critic warmup against a fixed actor before joint PPO updates.
+        # Critic warmup with a slow actor before joint PPO updates.
         if args_cli.bc_critic_warmup_iters > 0:
+            actor_warmup_lr = AGENT_CFG["learning_rate"] * args_cli.actor_lr_warmup_start_scale
             print(
-                f"[BC→RL] Freezing actor for {args_cli.bc_critic_warmup_iters} "
-                "PPO updates for critic warmup.",
+                f"[BC→RL] Actor LR warmup for {args_cli.bc_critic_warmup_iters} "
+                f"PPO updates ({actor_warmup_lr:.2e} -> {AGENT_CFG['learning_rate']:.2e}).",
                 flush=True,
             )
-            for p in cnf.model.parameters():
-                p.requires_grad_(False)
+            agent.set_actor_lr_warmup(args_cli.bc_critic_warmup_iters, start_lr=actor_warmup_lr)
             runner.train(start_iteration=start_iteration, return_epochs=args_cli.bc_critic_warmup_iters)
-            for p in cnf.model.parameters():
-                p.requires_grad_(True)
             start_iteration += args_cli.bc_critic_warmup_iters
-            print("[BC→RL] Actor unfrozen — starting joint PPO with KL anchor.", flush=True)
+            agent.set_actor_lr_warmup(0)
+            print("[BC→RL] Actor LR restored — starting joint PPO with KL anchor.", flush=True)
 
     # ── Phase 2: RL ───────────────────────────────────────────────────────────
     runner.train(start_iteration=start_iteration, return_epochs=args_cli.max_iterations)

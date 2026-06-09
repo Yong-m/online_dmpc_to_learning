@@ -32,6 +32,7 @@ class PPO(ActorCriticBase):
         self._clip_predicted_values = cfg.get("clip_predicted_values", True)
         self._value_clip = cfg.get("value_clip", 0.1)
         self._grad_norm_clip = cfg.get("grad_norm_clip", 1.0)
+        self._action_clip = cfg.get("action_clip", 0.0)
 
         self.optimizer = torch.optim.Adam(
             itertools.chain(
@@ -112,13 +113,17 @@ class PPO(ActorCriticBase):
             compute_std=True,
         )
         action_distribution = torch.distributions.Normal(mean, std)
-        actions = action_distribution.sample().detach()
-        actions_logp = action_distribution.log_prob(actions).sum(-1)
+        actions_raw = action_distribution.sample().detach()
+        actions = actions_raw
+        if self._action_clip > 0:
+            actions = torch.tanh(actions_raw / self._action_clip) * self._action_clip
+        actions_logp = action_distribution.log_prob(actions_raw).sum(-1)
 
         info = {
             "actions_log_prob": actions_logp.detach(),
             "actions_mean": mean.detach(),
             "actions_std": std.detach(),
+            "actions_raw": actions_raw.detach(),
         }
 
         return actions, info
@@ -151,7 +156,7 @@ class PPO(ActorCriticBase):
                 actions_log_prob=actions_info["actions_log_prob"],
                 actions_mean=actions_info["actions_mean"],
                 actions_std=actions_info["actions_std"],
-                actions=actions,
+                actions=actions_info.get("actions_raw", actions),
                 rewards=rewards,
                 terminated=dones,
                 values=values,
@@ -372,6 +377,8 @@ class PPO(ActorCriticBase):
             )
             action_distribution = torch.distributions.Normal(mean, std)
             actions = action_distribution.sample().detach()
+            if self._action_clip > 0:
+                actions = torch.tanh(actions / self._action_clip) * self._action_clip
             return actions
 
         return actor_policy

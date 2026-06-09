@@ -54,16 +54,14 @@ class MultiDroneDmpcRLEnvCfg(MultiDroneDmpcEnvCfg):
     success_hold_s: float = 0.5           # seconds = 10 steps @ 20 Hz
 
     # ── Sparse reward ───────────────────────────────────────────────────
-    goal_reward: float = 10000.0          # all drones simultaneously reach goal
-    per_drone_goal_reward: float = 1000.0  # per drone individually holding goal
+    goal_reward: float = 1000.0          # all drones simultaneously reach goal
+    per_drone_goal_reward: float = 100.0  # per drone individually holding goal
 
     # ── Dense rewards ───────────────────────────────────────────────────
     dmpc_guide_scale: float = 20.0        # DMPC velocity-alignment reward (per drone, *step_dt)
     dmpc_guide_sigma_v: float = 1.0      # velocity bandwidth [m/s]
-    dist_to_goal_far_scale: float = 30.0     # broad goal-attraction shaping (per drone, *step_dt)
-    dist_to_goal_far_tanh_scale: float = 1.2 # larger denominator keeps gradient farther from goal
-    dist_to_goal_near_scale: float = 20.0    # near-goal precision shaping (per drone, *step_dt)
-    dist_to_goal_near_tanh_scale: float = 0.8 # smaller denominator sharpens near-goal gradient
+    dist_to_goal_far_scale: float = 50.0     # goal-attraction shaping (per drone, *step_dt)
+    dist_to_goal_far_tanh_scale: float = 0.8 # tanh denominator [m]
 
     # ang_vel_reward_scale is inherited from parent (-0.01); kept as-is.
 
@@ -98,6 +96,12 @@ class MultiDroneDmpcRLEnvCfg(MultiDroneDmpcEnvCfg):
     hover_vel_scale: float = 0.0        # penalty weight (per drone, *step_dt)
     hover_proximity_dist: float = 0.4   # tanh half-width [m] for proximity gate
 
+    # ── Goal-lock: override control once drone enters success zone ────────
+    # Once a drone gets within goal_lock_dist of its goal, its action is
+    # overridden to hold at the goal position for the rest of the episode.
+    goal_lock_on_success: bool = True
+    goal_lock_dist: float = 0.1         # [m] lock threshold (independent of success_dist_threshold)
+
     # ── N curriculum ─────────────────────────────────────────────────────
     # Static per-env drone count: env e uses (e % num_drones) + 1 active drones.
     # This covers 1..num_drones uniformly across envs.
@@ -123,6 +127,16 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         # Per-drone success already rewarded this episode — prevents repeat firing.
         self._drone_success_rewarded = torch.zeros(
             self.num_envs, self.N, dtype=torch.bool, device=self.device
+        )
+
+        # Goal-lock: True once a drone enters goal_lock_dist; cleared on reset.
+        self._drone_locked = torch.zeros(
+            self.num_envs, self.N, dtype=torch.bool, device=self.device
+        )
+
+        # Per-drone reward cache read by PerDroneEnvWrapper for IPPO.
+        self._per_drone_rewards_last = torch.zeros(
+            self.num_envs, self.N, device=self.device
         )
 
         if cfg.dmpc_guide_enabled:
@@ -158,6 +172,7 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         self._episode_sums["tilt_rl"]         = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums["hover_rl"]        = torch.zeros(self.num_envs, device=self.device)
         self._episode_sums["total_rl"]        = torch.zeros(self.num_envs, device=self.device)
+        self._episode_sums["locked_drones"]   = torch.zeros(self.num_envs, device=self.device)
 
     # ── Curriculum helpers ────────────────────────────────────────────────────
     @property
@@ -203,23 +218,41 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
 
     # ── Action override ───────────────────────────────────────────────────────
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        if self._curriculum_enabled:
-            inactive = ~self._active_mask                              # (E, N)
-            act = actions.view(self.num_envs, self.N, -1)             # (E, N, act_per_drone)
-            inactive3 = inactive.unsqueeze(-1)                         # (E, N, 1)
+        act = actions.view(self.num_envs, self.N, -1)             # (E, N, act_per_drone)
 
+        if self._curriculum_enabled:
+            inactive3 = (~self._active_mask).unsqueeze(-1)            # (E, N, 1)
             if act.shape[-1] == 9:
-                # N×9 full-reference mode: zero-filling ref_pos sends drones to world origin.
-                # Instead keep ref_pos = _last_ref_pos_w (set to park position on reset)
-                # and zero velocity + acceleration.
                 act9 = act.clone()
                 act9[:, :, 0:3] = torch.where(inactive3, self._last_ref_pos_w, act9[:, :, 0:3])
                 act9[:, :, 3:9] = act9[:, :, 3:9].masked_fill(inactive3, 0.0)
-                actions = act9.view(self.num_envs, -1)
+                act = act9
             else:
-                # N×3 v_ref mode: zero velocity → cascade integrates from park position safely.
-                actions = act.masked_fill(inactive3, 0.0).view(self.num_envs, -1)
-        super()._pre_physics_step(actions)
+                act = act.masked_fill(inactive3, 0.0)
+
+        # Goal-lock: override action to zero velocity for drones that have
+        # reached the goal.  The reference position is pinned to goal after
+        # super()._pre_physics_step() so the cascade controller holds position.
+        if self.cfg.goal_lock_on_success and self._drone_locked.any():
+            locked3 = self._drone_locked.unsqueeze(-1)                 # (E, N, 1)
+            if act.shape[-1] == 9:
+                act9 = act.clone()
+                act9[:, :, 0:3] = torch.where(locked3, self._goal_pos_w, act9[:, :, 0:3])
+                act9[:, :, 3:9] = act9[:, :, 3:9].masked_fill(locked3, 0.0)
+                act = act9
+            else:
+                act = act.masked_fill(locked3, 0.0)
+
+        super()._pre_physics_step(act.view(self.num_envs, -1))
+
+        # Pin reference position to goal after the integrator update so the
+        # cascade controller targets goal rather than wherever the ref drifted.
+        if self.cfg.goal_lock_on_success and self._drone_locked.any():
+            self._last_ref_pos_w = torch.where(
+                self._drone_locked.unsqueeze(-1),
+                self._goal_pos_w,
+                self._last_ref_pos_w,
+            )
 
     def _init_dmpc_expert(self) -> None:
         from quadcopter.dmpc_gpu_expert import GPUDMPCExpert
@@ -261,108 +294,106 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         ang_vel_b = st["ang_vel_b"]   # (E, N, 3)
         quat_w    = st["quat_w"]      # (E, N, 4) — [w, x, y, z]
 
-        # Active-drone mask and per-drone normaliser.
-        # When curriculum is off: amask = all-ones, inv_n = 1 (sum, matching original behaviour).
-        # When curriculum is on:  amask zeros inactive slots, inv_n = 1/active_n
-        #                         so each reward term is a per-drone average.
-        if self._curriculum_enabled:
-            amask   = self._active_mask.float()             # (E, N) — 1=active 0=inactive
-            inv_n   = 1.0 / amask.sum(dim=-1).clamp(min=1.0)  # (E,)
-        else:
-            amask   = torch.ones(self.num_envs, self.N, device=self.device)
-            inv_n   = torch.ones(self.num_envs, device=self.device)  # sum unchanged
+        # ── Per-drone quantities (computed once, aggregated below) ──────────
+        active_bool = self._active_mask if self._curriculum_enabled else \
+            torch.ones(self.num_envs, self.N, dtype=torch.bool, device=self.device)
 
-        # ── Dense: DMPC velocity alignment ──────────────────────────────
         if self._expert is not None:
-            vel_err = (lin_vel_w - self._dmpc_ref_vel_w).norm(dim=-1)   # (E, N)
-            r_guide_per = torch.exp(
-                -(vel_err ** 2) / (2.0 * self.cfg.dmpc_guide_sigma_v ** 2)
-            )
-            r_guide = (r_guide_per * amask).sum(dim=-1) * inv_n * self.cfg.dmpc_guide_scale * self.step_dt
+            vel_err     = (lin_vel_w - self._dmpc_ref_vel_w).norm(dim=-1)   # (E, N)
+            r_guide_per = torch.exp(-(vel_err ** 2) / (2.0 * self.cfg.dmpc_guide_sigma_v ** 2))
         else:
-            r_guide = torch.zeros(self.num_envs, device=self.device)
+            r_guide_per = None
 
-        # ── Dense: distance-to-goal shaping ─────────────────────────────
-        # Split into broad far-field attraction and sharper near-goal precision.
-        dist_to_goal = (self._goal_pos_w - pos_w).norm(dim=-1)          # (E, N)
-        r_dist_far_per = 1.0 - torch.tanh(
-            dist_to_goal / self.cfg.dist_to_goal_far_tanh_scale
-        )
-        r_dist_near_per = 1.0 - torch.tanh(
-            dist_to_goal / self.cfg.dist_to_goal_near_tanh_scale
-        )
-        r_dist_per = (
-            self.cfg.dist_to_goal_far_scale * r_dist_far_per
-            + self.cfg.dist_to_goal_near_scale * r_dist_near_per
-        )
-        r_dist = (
-            (r_dist_per * amask).sum(dim=-1)
-            * inv_n
-            * self.step_dt
+        dist_to_goal  = (self._goal_pos_w - pos_w).norm(dim=-1)             # (E, N)
+        r_dist_per    = self.cfg.dist_to_goal_far_scale * (
+            1.0 - torch.tanh(dist_to_goal / self.cfg.dist_to_goal_far_tanh_scale)
         )
 
-        # ── Dense: OOB penalty (graduated by penetration depth) ──────────
-        pos_local = pos_w - self._terrain.env_origins.unsqueeze(1)  # (E, N, 3)
-        viol_lo = (self._pos_min - pos_local).clamp(min=0.0)        # (E, N, 3)
-        viol_hi = (pos_local - self._pos_max).clamp(min=0.0)        # (E, N, 3)
-        viol_dist = torch.maximum(viol_lo, viol_hi).norm(dim=-1)    # (E, N)
-        viol_frac = (viol_dist / self.cfg.oob_ref_dist).clamp(0.0, 1.0)  # (E, N)
-        r_oob = (viol_frac * amask).sum(dim=-1) * inv_n * self.cfg.oob_step_penalty * self.step_dt
+        pos_local     = pos_w - self._terrain.env_origins.unsqueeze(1)      # (E, N, 3)
+        viol_lo       = (self._pos_min - pos_local).clamp(min=0.0)
+        viol_hi       = (pos_local - self._pos_max).clamp(min=0.0)
+        oob_viol_frac = (torch.maximum(viol_lo, viol_hi).norm(dim=-1)
+                         / self.cfg.oob_ref_dist).clamp(0.0, 1.0)           # (E, N)
 
-        # ── Dense: graduated collision penalty ───────────────────────────
-        # Only penalise pairs where BOTH drones are active.
+        ang_sq        = ang_vel_b.square().sum(dim=-1)                       # (E, N)
+
+        w_q = quat_w[..., 0]; x_q = quat_w[..., 1]
+        y_q = quat_w[..., 2]; z_q = quat_w[..., 3]
+        cos_tilt  = w_q*w_q - x_q*x_q - y_q*y_q + z_q*z_q                 # (E, N)
+        tilt_per  = (1.0 - cos_tilt)                                         # (E, N) ≥ 0
+
+        if self.cfg.hover_vel_scale != 0.0:
+            vel_mag   = lin_vel_w.norm(dim=-1)                               # (E, N)
+            hover_per = vel_mag * (1.0 - torch.tanh(
+                dist_to_goal / self.cfg.hover_proximity_dist))               # (E, N)
+        else:
+            hover_per = None
+
+        # ── Mean aggregation over active drones ─────────────────────────────
+        _INF = float("inf")
+        amask = active_bool.float()
+        inv_n = 1.0 / amask.sum(dim=-1).clamp(min=1.0)
+
+        r_guide = ((r_guide_per * amask).sum(dim=-1) * inv_n
+                   * self.cfg.dmpc_guide_scale * self.step_dt
+                   if r_guide_per is not None
+                   else torch.zeros(self.num_envs, device=self.device))
+        r_dist  = (r_dist_per   * amask).sum(dim=-1) * inv_n * self.step_dt
+        r_oob   = (oob_viol_frac * amask).sum(dim=-1) * inv_n * self.cfg.oob_step_penalty * self.step_dt
+        r_ang   = (ang_sq        * amask).sum(dim=-1) * inv_n * self.cfg.ang_vel_reward_scale * self.step_dt
+        r_tilt  = (tilt_per      * amask).sum(dim=-1) * inv_n * self.cfg.tilt_reward_scale * self.step_dt
+        r_hover = (-(hover_per   * amask).sum(dim=-1) * inv_n * self.cfg.hover_vel_scale * self.step_dt
+                   if hover_per is not None
+                   else torch.zeros(self.num_envs, device=self.device))
+
+        # ── Dense: graduated collision penalty ───────────────────────────────
         if self.N > 1:
-            diff      = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)          # (E, N, N, 3)
-            pair_dist = diff.norm(dim=-1)                                  # (E, N, N)
+            diff      = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)             # (E, N, N, 3)
+            pair_dist = diff.norm(dim=-1)                                    # (E, N, N)
             eye_m     = torch.eye(self.N, device=self.device, dtype=torch.bool).unsqueeze(0)
-            pair_dist = pair_dist.masked_fill(eye_m, float("inf"))
+            pair_dist = pair_dist.masked_fill(eye_m, _INF)
             if self._curriculum_enabled:
-                # Mask out pairs involving inactive drones.
-                both_active = amask.unsqueeze(2) * amask.unsqueeze(1)     # (E, N, N)
-                pair_dist   = pair_dist.masked_fill(both_active < 0.5, float("inf"))
-            min_pair  = pair_dist.amin(dim=(1, 2))                        # (E,)
-            viol_frac = (self.cfg.rmin - min_pair).clamp(min=0.0) / self.cfg.rmin
-            r_coll    = viol_frac * self.cfg.collision_step_penalty * self.step_dt
+                both_active = active_bool.unsqueeze(2) & active_bool.unsqueeze(1)
+                pair_dist   = pair_dist.masked_fill(~both_active, _INF)
+            min_pair       = pair_dist.amin(dim=(1, 2))                      # (E,)
+            coll_viol_frac = (self.cfg.rmin - min_pair).clamp(min=0.0) / self.cfg.rmin
+            r_coll         = coll_viol_frac * self.cfg.collision_step_penalty * self.step_dt
+            per_drone_min  = pair_dist.amin(dim=-1)                          # (E, N)
+            r_coll_per     = ((self.cfg.rmin - per_drone_min).clamp(min=0.0)
+                              / self.cfg.rmin * self.cfg.collision_step_penalty * self.step_dt)
         else:
-            r_coll = torch.zeros(self.num_envs, device=self.device)
+            r_coll     = torch.zeros(self.num_envs, device=self.device)
+            r_coll_per = torch.zeros(self.num_envs, self.N, device=self.device)
 
         # ── Sparse: per-drone individual success (fires exactly once per drone) ──
         newly_succeeded = self._drone_just_succeeded & ~self._drone_success_rewarded
         if self._curriculum_enabled:
-            # Only reward active drones.
             newly_succeeded = newly_succeeded & self._active_mask
         self._drone_success_rewarded |= newly_succeeded
-        r_per_drone = (
-            newly_succeeded.float().sum(dim=-1) * self.cfg.per_drone_goal_reward
-        )
+        r_per_drone = newly_succeeded.float().sum(dim=-1) * self.cfg.per_drone_goal_reward
 
-        # ── Sparse: all-drone env-wise success ───────────────────────────
+        # ── Sparse: all-drone success ─────────────────────────────────────────
         r_goal_all = self._just_succeeded.float() * self.cfg.goal_reward
-
-        # ── Dense: angular velocity smoothness ───────────────────────────
-        ang_pen = (ang_vel_b.square().sum(dim=-1) * amask).sum(dim=-1) * inv_n
-        r_ang   = ang_pen * self.cfg.ang_vel_reward_scale * self.step_dt
-
-        # ── Dense: attitude (tilt) penalty ───────────────────────────────
-        # cos(tilt) = body-z · world-z = w²-x²-y²+z² for quat [w,x,y,z].
-        w = quat_w[..., 0]; x = quat_w[..., 1]
-        y = quat_w[..., 2]; z = quat_w[..., 3]
-        cos_tilt = w*w - x*x - y*y + z*z                                  # (E, N)
-        tilt_pen = ((1.0 - cos_tilt) * amask).sum(dim=-1) * inv_n         # (E,)
-        r_tilt   = tilt_pen * self.cfg.tilt_reward_scale * self.step_dt
-
-        # ── Dense: hover incentive (linear velocity near goal) ───────────
-        # Penalises velocity weighted by closeness to goal so the policy learns
-        # to decelerate and hold position once it arrives.
-        if self.cfg.hover_vel_scale != 0.0:
-            proximity = 1.0 - torch.tanh(dist_to_goal / self.cfg.hover_proximity_dist)  # (E, N)
-            vel_mag   = lin_vel_w.norm(dim=-1)                                            # (E, N)
-            r_hover   = -(vel_mag * proximity * amask).sum(dim=-1) * inv_n * self.cfg.hover_vel_scale * self.step_dt
-        else:
-            r_hover = torch.zeros(self.num_envs, device=self.device)
 
         total_unscaled = r_guide + r_dist + r_coll + r_oob + r_per_drone + r_goal_all + r_ang + r_tilt + r_hover
         total = total_unscaled * 0.1
+
+        # ── Per-drone reward cache for IPPO (--curriculum2) ──────────────────
+        r_guide_pdr = (r_guide_per * amask if r_guide_per is not None
+                       else torch.zeros(self.num_envs, self.N, device=self.device)
+                       ) * self.cfg.dmpc_guide_scale * self.step_dt
+        r_dist_pdr  = r_dist_per * amask * self.step_dt
+        r_oob_pdr   = oob_viol_frac * amask * self.cfg.oob_step_penalty * self.step_dt
+        r_ang_pdr   = ang_sq * amask * self.cfg.ang_vel_reward_scale * self.step_dt
+        r_tilt_pdr  = tilt_per * amask * self.cfg.tilt_reward_scale * self.step_dt
+        r_hover_pdr = (-(hover_per * amask) * self.cfg.hover_vel_scale * self.step_dt
+                       if hover_per is not None
+                       else torch.zeros(self.num_envs, self.N, device=self.device))
+        r_sparse_pdr   = newly_succeeded.float() * self.cfg.per_drone_goal_reward
+        r_goal_all_pdr = r_goal_all.unsqueeze(-1) * amask  # each active drone gets full goal_all
+        per_unscaled    = (r_guide_pdr + r_dist_pdr + r_coll_per * amask + r_oob_pdr
+                           + r_sparse_pdr + r_goal_all_pdr + r_ang_pdr + r_tilt_pdr + r_hover_pdr)
+        self._per_drone_rewards_last = per_unscaled * 0.01
 
         self._episode_sums["guide"]           += r_guide
         self._episode_sums["collision_rl"]    += r_coll
@@ -452,6 +483,15 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
         else:
             oob_term = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Goal-lock: latch any active drone that entered goal_lock_dist this step.
+        if self.cfg.goal_lock_on_success:
+            in_zone = (pos_w - self._goal_pos_w).norm(dim=-1) < self.cfg.goal_lock_dist
+            if self._curriculum_enabled:
+                in_zone = in_zone & self._active_mask
+            newly_locked = in_zone & ~self._drone_locked
+            self._drone_locked |= in_zone
+            self._episode_sums["locked_drones"] += newly_locked.float().sum(dim=-1)
+
         return terminated | collision_term | oob_term, time_out | on_ground
 
     # ── Reset ─────────────────────────────────────────────────────────────────
@@ -463,6 +503,7 @@ class MultiDroneDmpcRLEnv(MultiDroneDmpcEnv):
             obstacle_info = self.get_obstacle_info() if hasattr(self, "get_obstacle_info") else None
             self._expert.reset(env_ids, obstacle_info=obstacle_info)
         self._drone_success_rewarded[env_ids] = False
+        self._drone_locked[env_ids] = False
 
         # Fix active drone goals first (before inactive drones are parked).
         self._fix_spawn_collisions(env_ids)

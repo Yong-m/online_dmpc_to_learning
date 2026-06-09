@@ -131,6 +131,34 @@ class PolicyFlow(PolicyFlowBase):
             self.lr_schedule = None
         self._register_serializable("optimizer")
 
+    def set_actor_lr_warmup(self, steps: int, start_lr: float | None = None) -> None:
+        """Start or reset actor LR warmup without freezing actor parameters."""
+        self._actor_lr_warmup_steps = max(0, int(steps))
+        self._actor_lr_update_step = 0
+        if start_lr is not None:
+            self._actor_lr_warmup_start = float(start_lr)
+        if len(self.optimizer.param_groups) > 0:
+            self.optimizer.param_groups[0]["lr"] = (
+                self._actor_lr_warmup_start
+                if self._actor_lr_warmup_steps > 0
+                else self._learning_rate
+            )
+
+    def _apply_actor_lr_warmup(self) -> None:
+        if len(self.optimizer.param_groups) == 0:
+            return
+        if self._actor_lr_warmup_steps <= 0:
+            return
+        if self._actor_lr_update_step >= self._actor_lr_warmup_steps:
+            self.optimizer.param_groups[0]["lr"] = self._learning_rate
+            return
+        denom = max(1, self._actor_lr_warmup_steps - 1)
+        frac = self._actor_lr_update_step / denom
+        warmup_lr = self._actor_lr_warmup_start + (
+            self._learning_rate - self._actor_lr_warmup_start
+        ) * frac
+        self.optimizer.param_groups[0]["lr"] = warmup_lr
+
     def set_bc_ref_model(self, ref_actor: "ContinuousNormalizingFlow") -> None:
         """Attach a frozen reference actor (from warmup checkpoint) for KL regularization.
 
@@ -368,6 +396,7 @@ class PolicyFlow(PolicyFlowBase):
     def update(self) -> Dict[str, Union[float, torch.Tensor]]:
         self.compute_gae()
         self.train_mode()
+        self._apply_actor_lr_warmup()
 
         actor = self.model_dict["actor"]
         use_ewma = self._use_ewma and actor.model_proximal is not None
@@ -755,13 +784,9 @@ class PolicyFlow(PolicyFlowBase):
             if self.lr_schedule is not None:
                 self.lr_schedule.step(kl.item())
 
-            # Actor LR warmup override — applied AFTER KLAdaptiveLR.step() so that
-            # KLAdaptiveLR cannot override the warmup schedule during warmup.
-            # Linear ramp: lr = start + (target - start) * (step / warmup_steps)
-            if self._actor_lr_warmup_steps > 0 and self._actor_lr_update_step < self._actor_lr_warmup_steps:
-                _warmup_frac  = self._actor_lr_update_step / self._actor_lr_warmup_steps
-                _warmup_lr    = self._actor_lr_warmup_start + (self._learning_rate - self._actor_lr_warmup_start) * _warmup_frac
-                self.optimizer.param_groups[0]["lr"] = _warmup_lr
+            # Keep actor LR warmup authoritative during critic warmup, even if
+            # KLAdaptiveLR is enabled for other parameter groups.
+            self._apply_actor_lr_warmup()
 
         # Update model_last (behavior policy for next iteration)
         actor.update()
