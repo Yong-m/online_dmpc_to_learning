@@ -159,6 +159,16 @@ class DMPCParams:
     enable_emergency: bool = True
     emergency_repel_factor: float = 1.5
     emergency_prediction_steps: int = 3
+
+    # Slow potential-field fallback used when OSQP fails and no previous
+    # trajectory can be shifted safely.  Agent repulsion is reserved for a
+    # future fallback interface that passes neighbour state into _fallback_state.
+    fallback_speed_max: float = 0.25
+    fallback_goal_gain: float = 0.35
+    fallback_agent_repel_gain: float = 0.15
+    fallback_agent_repel_radius_factor: float = 2.0
+    fallback_obs_repel_gain: float = 0.20
+    fallback_obs_repel_metric_radius: float = 1.3
     # height_scaling_obs: float = 4.0
 
     # Optional priority metadata. Higher score means the agent has stronger
@@ -769,19 +779,19 @@ class DMPCExpert:
         _tc3 = time.perf_counter()
 
         # ── per-call timing log (every 10 calls) ──────────────────────────
-        self._compute_calls = getattr(self, "_compute_calls", 0) + 1
-        if self._compute_calls % 100 == 1:
-            print(
-                f"[DMPC timing] call={self._compute_calls}"
-                f"  flag={_t_flag*1e3:.1f}ms"
-                f"  nbr={_t_nbr*1e3:.1f}ms"
-                f"  check={_t_check*1e3:.1f}ms"
-                f"  replan={(_tc2-_tc1)*1e3:.1f}ms"
-                f"  phase3={_t_phase3*1e3:.1f}ms"
-                f"  write={_t_write*1e3:.1f}ms"
-                f"  total={(_tc3-_tc0)*1e3:.1f}ms",
-                flush=True,
-            )
+        # self._compute_calls = getattr(self, "_compute_calls", 0) + 1
+        # if self._compute_calls % 100 == 1:
+        #     print(
+        #         f"[DMPC timing] call={self._compute_calls}"
+        #         f"  flag={_t_flag*1e3:.1f}ms"
+        #         f"  nbr={_t_nbr*1e3:.1f}ms"
+        #         f"  check={_t_check*1e3:.1f}ms"
+        #         f"  replan={(_tc2-_tc1)*1e3:.1f}ms"
+        #         f"  phase3={_t_phase3*1e3:.1f}ms"
+        #         f"  write={_t_write*1e3:.1f}ms"
+        #         f"  total={(_tc3-_tc0)*1e3:.1f}ms",
+        #         flush=True,
+        #     )
 
         return ref_pos, ref_vel, ref_acc
 
@@ -1183,7 +1193,7 @@ class DMPCExpert:
                 polish=self.p.osqp_polish,
             )
         except ValueError:
-            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, goal_local, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
@@ -1200,8 +1210,8 @@ class DMPCExpert:
             solver.warm_start(warm)
         res = solver.solve()
         if res.info.status_val not in (1, 2):
-            print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
-            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, prefer_previous=not emergency_mode)
+            # print(f"QP failed for env {env_idx} agent {agent_idx} with status {res.info.status}")
+            self._fallback_state(env_idx, agent_idx, prev, seeds[0], vel, goal_local, prefer_previous=not emergency_mode)
             self._state[(env_idx, agent_idx)]["last_replanned"] = True
             self._state[(env_idx, agent_idx)]["last_reset_mode"] = bool(_reset_mode)
             self._state[(env_idx, agent_idx)]["last_fallback"] = True
@@ -1535,20 +1545,21 @@ class DMPCExpert:
         prev: dict | None,
         pos_seed: np.ndarray,
         vel_seed: np.ndarray,
+        goal_local: np.ndarray,
         prefer_previous: bool = True,
     ) -> None:
-        """If the QP fails, reuse a safe previous plan or brake to hover.
+        """If the QP fails, shift a previous plan or use a slow potential field.
 
         Preferred fallback is the standard MPC choice: shift the previous
         feasible plan forward by one replanning period. If that plan is missing,
         malformed, or immediately enters a static-obstacle guard, fall back to a
-        conservative brake-to-hover reference around ``pos_seed``.
+        conservative potential-field reference from ``pos_seed``.
         """
         K = self.p.k_hor
         h = self.p.h
         U = None
         u_pred = None
-        fallback_type = "brake_hover"
+        fallback_type = "potential"
 
         if prefer_previous and prev is not None:
             U_prev = prev.get("U")
@@ -1566,15 +1577,39 @@ class DMPCExpert:
                         u_pred = None
 
         if U is None or u_pred is None:
-            p_hold = pos_seed.copy()
-            p = pos_seed.copy()
-            v = vel_seed.copy()
-            u_pred = np.zeros((K, 3))
-            for k in range(K):
-                a = np.clip(2.0 * (p_hold - p) - 2.0 * v, np.asarray(self.p.amin), np.asarray(self.p.amax))
-                p = p + v * h + 0.5 * a * h ** 2
-                v = v + a * h
-                u_pred[k] = p
+            fallback_type = "potential"
+
+            # Slow attractive velocity toward the goal.  Keep it proportional
+            # near the goal and cap it below the normal command speed.
+            delta_goal = np.asarray(goal_local, dtype=np.float64) - np.asarray(pos_seed, dtype=np.float64)
+            v_cmd = self.p.fallback_goal_gain * delta_goal
+
+            # Static-obstacle repulsion in the same ellipsoidal metric used by
+            # collision constraints.  This pushes outward along the metric
+            # gradient when the seed is inside or near a covering ellipsoid.
+            if self._num_static_obstacles > 0 and self._obstacle_pos_local is not None:
+                obs_radius = max(float(self.p.fallback_obs_repel_metric_radius), 1.0e-6)
+                for o in range(self._num_static_obstacles):
+                    obs_pos = self._obstacle_pos_local[env_idx, o]
+                    theta_inv = self._obs_theta_inv[env_idx, o]
+                    rel = np.asarray(pos_seed, dtype=np.float64) - obs_pos
+                    metric_vec = theta_inv @ rel
+                    metric = float(np.linalg.norm(metric_vec))
+                    if metric < obs_radius:
+                        grad = theta_inv.T @ metric_vec
+                        grad_norm = float(np.linalg.norm(grad))
+                        if grad_norm < 1.0e-9:
+                            grad = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                            grad_norm = 1.0
+                        repel_scale = self.p.fallback_obs_repel_gain * (obs_radius - metric) / obs_radius
+                        v_cmd += repel_scale * grad / grad_norm
+
+            speed = float(np.linalg.norm(v_cmd))
+            if speed > self.p.fallback_speed_max:
+                v_cmd *= self.p.fallback_speed_max / max(speed, 1.0e-9)
+
+            u_pred = pos_seed.reshape(1, 3) + self._times_hor.reshape(K, 1) * v_cmd.reshape(1, 3)
+            u_pred = np.clip(u_pred, np.asarray(self.p.pmin), np.asarray(self.p.pmax))
             try:
                 U = np.linalg.lstsq(self.M_pos_hor, u_pred.reshape(-1), rcond=None)[0]
             except np.linalg.LinAlgError:
@@ -1597,4 +1632,4 @@ class DMPCExpert:
         }
         self._st_U[env_idx, agent_idx] = U.astype(np.float32)
         self._st_has[env_idx, agent_idx] = True
-        print(f"fallback_type: {fallback_type}")
+        # print(f"fallback_type: {fallback_type}")

@@ -694,8 +694,7 @@ def expert_action(
         goal_w=states["goal_w"], env_origins=env._terrain.env_origins,
     )
     _push_first_env_debug_trajectories(env, expert, states)
-    E, N = ref_pos_w.shape[:2]
-    action_flat = torch.cat([ref_pos_w, ref_vel_w, ref_acc_w], dim=-1).reshape(E, N * 9)
+    action_flat = env.ref_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
     if debug_logger is not None:
         debug_logger.add(debug_step, states, ref_pos_w, ref_vel_w, ref_acc_w, action_flat)
     return action_flat, states

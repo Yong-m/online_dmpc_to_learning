@@ -452,7 +452,7 @@ def run_bc_phase(
                 goal_w=env_uw._goal_pos_w,
                 env_origins=env_uw._terrain.env_origins,
             )
-            env_act = env_uw.reference_to_action(ref_pos, ref_vel, ref_acc)  # (E, N*3)
+            env_act = env_uw.vref_to_action(ref_vel)  # (E, N*3) velocity-reference action
 
             obs_list.append(obs.clone())
             act_list.append(env_act.clone())

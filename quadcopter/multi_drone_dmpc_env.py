@@ -98,7 +98,7 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     reset_sampling_attempts: int = 64
     
     # Static obstacles
-    enable_static_obstacles: bool = False
+    enable_static_obstacles: bool = True
     randomize_static_obstacles: bool = False
     show_static_obstacle_ellipsoid_vis: bool = False
     num_static_obstacles: int = 2
@@ -116,8 +116,8 @@ class MultiDroneDmpcEnvCfg(DirectRLEnvCfg):
     static_obstacle_xy_min: tuple[float, float] = (-1.0, -1.0)
     static_obstacle_xy_max: tuple[float, float] = (1.0, 1.0)
     static_obstacle_z_range: tuple[float, float] = (0.6, 1.4)
-    success_dist_threshold: float = 0.05   # metres; all drones must be within this
-    success_hold_s: float = 1.0            # seconds all drones must hold the threshold
+    success_dist_threshold: float = 0.1 #0.05   # metres; all drones must be within this
+    success_hold_s: float = 0.5 #1.0            # seconds all drones must hold the threshold
     goal_blend_radius: float = 0.5         # metres; blend ref_pos→goal within this radius
 
     # SDF obstacle observations (paper 2309.13285v2 Section III-B)
@@ -1032,49 +1032,30 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         self,
         ref_pos_w: torch.Tensor,
         ref_vel_w: torch.Tensor | None = None,
-        _ref_acc_w: torch.Tensor | None = None,
+        ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Pack world-frame velocity reference into normalised 3-D action.
+        """Pack a full world-frame reference for the ``N*9`` action mode.
 
         Args:
-            ref_pos_w: ``(num_envs, num_drones, 3)`` desired positions (unused,
-                kept for API compatibility with the DMPC expert).
+            ref_pos_w: desired world-frame positions.
             ref_vel_w: desired velocities in m/s; zeros if omitted.
-            _ref_acc_w: ignored (kept for API compatibility).
+            ref_acc_w: desired accelerations in m/s^2; zeros if omitted.
 
         Returns:
-            ``(num_envs, num_drones * 3)`` normalised v_ref in ``[-1, 1]``.
+            ``(num_envs, num_drones * 9)`` containing absolute
+            ``[ref_pos_w, ref_vel_w, ref_acc_w]`` per drone. This is consumed
+            by :meth:`_pre_physics_step`'s full-reference branch.
         """
         if ref_vel_w is None:
             ref_vel_w = torch.zeros_like(ref_pos_w)
-        E, N = ref_pos_w.shape[0], ref_pos_w.shape[1]
-        pos_w = self._stack_drone_state()["pos_w"]
-        R = self._compute_goal_aligned_R(pos_w, self._goal_pos_w)  # (E, N, 3, 3)
-        # Rotate world-frame v_ref into each drone's goal-aligned frame.
-        v_ref_goal = torch.bmm(
-            R.reshape(E * N, 3, 3),
-            ref_vel_w.reshape(E * N, 3, 1),
-        ).reshape(E, N, 3)
-        vel_norm = (v_ref_goal / max(self.cfg.v_max, 1e-6)).clamp(-1.0, 1.0)
-        return vel_norm.reshape(E, N * 3)
+        if ref_acc_w is None:
+            ref_acc_w = torch.zeros_like(ref_pos_w)
+        E, N = ref_pos_w.shape[:2]
+        return torch.cat([ref_pos_w, ref_vel_w, ref_acc_w], dim=-1).reshape(E, N * 9)
 
     def velocity_to_action(self, v_cmd_w: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper: integrate velocity-only commands with zero acceleration."""
-        st = self._stack_drone_state()
-        pos_w = st["pos_w"]
-
-        # init_mask = ~self._vel_action_ref_initialized
-        # if init_mask.any():
-        #     self._vel_action_ref_pos_w[init_mask] = pos_w[init_mask]
-        #     self._vel_action_ref_initialized[init_mask] = True
-
-        # self._vel_action_ref_pos_w = self._vel_action_ref_pos_w + v_cmd_w * self.step_dt
-        # ref_pos_w = self._vel_action_ref_pos_w
-
-        # Previous reconstruction used the current state every step, which makes
-        # the reference position discontinuous when tracking error exists:
-        ref_pos_w = pos_w + v_cmd_w * self.step_dt
-        return self.reference_to_action(ref_pos_w, v_cmd_w, torch.zeros_like(v_cmd_w))
+        """Compatibility helper for velocity-only ``N*3`` commands."""
+        return self.vref_to_action(v_cmd_w)
 
     def ref_to_action(
         self,
@@ -1082,7 +1063,11 @@ class MultiDroneDmpcEnv(DirectRLEnv):
         ref_vel_w: torch.Tensor | None = None,
         ref_acc_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Alias for :meth:`reference_to_action` used by the DMPC expert."""
+        """Alias for full-reference DMPC actions.
+
+        Returns the ``N*9`` action containing absolute world-frame
+        ``[ref_pos_w, ref_vel_w, ref_acc_w]`` per drone.
+        """
         return self.reference_to_action(ref_pos_w, ref_vel_w, ref_acc_w)
 
     def vref_to_action(self, ref_vel_w: torch.Tensor) -> torch.Tensor:
