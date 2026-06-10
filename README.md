@@ -70,11 +70,11 @@ Requires: CMake >= 3.0, Eigen, qpOASES (included as submodule).
 
 ## Training
 
-### Phase 1–2: PolicyFlow with DMPC Guide
+### PolicyFlow with DMPC Guide
 
 Trains a conditional rectified flow actor guided by a GPU-batched DMPC expert.
-`--curriculum` enables soft collision/OOB penalties (Phase 1).
-`--curriculum2` enables hard termination on collision/OOB (Phase 2).
+`--curriculum` enables hard termination on collision/OOB (Phase 2).
+`--curriculum2` enables agent wise critic structure (Phase 3).
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
@@ -100,9 +100,9 @@ python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
     --num_envs 800 --num_drones 10
 ```
 
-### Phase 3: Independent PPO (IPPO, no DMPC guide)
+### Independent PPO (IPPO) (optional)
 
-Vanilla PPO baseline or Phase 3 fine-tuning. No DMPC expert — no solver bottleneck.
+Vanilla PPO baseline. No DMPC expert.
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
@@ -113,7 +113,7 @@ python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
     --log_dir runs/rl_ippo
 ```
 
-### Online Behavioral Cloning
+### Online Behavioral Cloning (optional)
 
 ```bash
 python PolicyFlow/scripts/isaaclab/online_bc_dmpc.py \
