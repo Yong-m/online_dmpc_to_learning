@@ -450,9 +450,9 @@ def main() -> None:
         collided  |= just_collided
         oob_flag  |= just_oob
 
-        # Complete on success, collision, OOB, or env-level termination/timeout
+        # Complete on success or env-level termination/timeout; collision/OOB flagged only
         timeout  = info.get("time_outs", torch.zeros(E, dtype=torch.bool, device=device))
-        completed |= just_succeeded | just_collided | just_oob | (done.bool() & active) | (timeout & active)
+        completed |= just_succeeded | (done.bool() & active) | (timeout & active)
 
         if args_cli.progress_every > 0 and (step + 1) % args_cli.progress_every == 0:
             n_done = int(completed.sum().item())
