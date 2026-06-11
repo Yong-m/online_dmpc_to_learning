@@ -203,6 +203,10 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def main() -> None:
+    # Single-run evaluation: each env runs exactly ONE episode from step 0.
+    # Completed envs (success / collision / OOB) receive zero actions (freeze).
+    # Events are only tracked for still-active envs, so auto-resets of
+    # completed envs do not corrupt metrics.
     if args_cli.seed >= 0:
         torch.manual_seed(args_cli.seed)
         np.random.seed(args_cli.seed)
@@ -213,6 +217,7 @@ def main() -> None:
     E = env.num_envs
     N = env.cfg.num_drones
 
+    # ── Reset — all envs start from step 0 ───────────────────────────────
     if args_cli.seed >= 0:
         env_gym.reset(seed=args_cli.seed)
     else:
@@ -224,244 +229,209 @@ def main() -> None:
         env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
     run_name = args_cli.run_name or time.strftime(f"{args_cli.solver}_E{E}_N{N}_%Y%m%d_%H%M%S")
-    static_obstacle_enabled = env.cfg.enable_static_obstacles
+    static_obstacle_enabled = getattr(env.cfg, "enable_static_obstacles", False)
     log_dir = args_cli.log_dir + ("_obs" if static_obstacle_enabled else "")
     log_dir = Path(log_dir) / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    stop_by_steps = args_cli.steps > 0
-    max_steps = args_cli.steps if stop_by_steps else 10**12
-    target_episodes = args_cli.episodes if args_cli.episodes > 0 else 0
+    max_ep_steps = int(round(env.cfg.episode_length_s / (env.cfg.sim.dt * env.cfg.decimation)))
 
-    episode_returns = torch.zeros(E, device=device)
-    episode_success = torch.zeros(E, dtype=torch.bool, device=device)
-    episode_drone_collision = torch.zeros(E, dtype=torch.bool, device=device)
-    episode_obstacle_collision = torch.zeros(E, dtype=torch.bool, device=device)
-    episode_bounds_failure = torch.zeros(E, dtype=torch.bool, device=device)
-    episode_success_step = torch.full((E,), -1, dtype=torch.long, device=device)
-    episode_start_step = torch.zeros(E, dtype=torch.long, device=device)
-    last_episode_length_buf = env.episode_length_buf.clone()
-
-    step_rows: list[dict] = []
-    episode_rows: list[dict] = []
-    plan_wall_ms: list[float] = []
-    env_step_wall_ms: list[float] = []
-    total_step_wall_ms: list[float] = []
-    success_times_s: list[float] = []
-    task_durations_s: list[float] = []
-
-    total_episodes = 0
-    total_success = 0
-    total_clean_success = 0
-    total_drone_collision = 0
-    total_obstacle_collision = 0
-    total_bounds_failure = 0
-    total_terminated = 0
-    total_truncated = 0
-
-    t_run0 = time.perf_counter()
     print(
-        f"[dmpc_expert_test] solver={args_cli.solver} num_envs={E} num_drones={N} "
-        f"episodes_target={target_episodes} steps_limit={args_cli.steps} seed={args_cli.seed} "
-        f"static_obs={env.cfg.enable_static_obstacles} log_dir={log_dir}",
+        f"[dmpc_expert_test] solver={args_cli.solver}  num_envs={E}  num_drones={N}  "
+        f"max_ep_steps={max_ep_steps}  seed={args_cli.seed}  "
+        f"static_obs={static_obstacle_enabled}  log_dir={log_dir}",
         flush=True,
     )
 
-    step = 0
-    while step < max_steps:
-        if not stop_by_steps and target_episodes > 0 and total_episodes >= target_episodes:
-            break
-        rewound = env.episode_length_buf < last_episode_length_buf
-        if rewound.any():
-            ids = rewound.nonzero(as_tuple=False).flatten()
-            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
-            episode_returns[ids] = 0.0
-            episode_success[ids] = False
-            episode_drone_collision[ids] = False
-            episode_obstacle_collision[ids] = False
-            episode_bounds_failure[ids] = False
-            episode_success_step[ids] = -1
-            episode_start_step[ids] = step
+    # ── Per-env state ─────────────────────────────────────────────────────
+    completed     = torch.zeros(E, dtype=torch.bool, device=device)
+    succeeded     = torch.zeros(E, dtype=torch.bool, device=device)
+    collided      = torch.zeros(E, dtype=torch.bool, device=device)
+    obs_collided  = torch.zeros(E, dtype=torch.bool, device=device)
+    oob_flag      = torch.zeros(E, dtype=torch.bool, device=device)
+    success_step  = torch.full((E,), -1, dtype=torch.long, device=device)
+    returns       = torch.zeros(E, device=device)
+    eye_mask      = torch.eye(N, dtype=torch.bool, device=device) if N > 1 else None
 
-        t_step0 = time.perf_counter()
+    step_rows:   list[dict]  = []
+    plan_ms_log: list[float] = []
+    env_ms_log:  list[float] = []
+
+    t_run0 = time.perf_counter()
+    step   = 0
+
+    for step in range(max_ep_steps):
+        active = ~completed
+        if not active.any():
+            break
+
+        # ── Expert planning ───────────────────────────────────────────────
         _sync_if_cuda(device)
         t_plan0 = time.perf_counter()
         action = _expert_action(env, expert)
         _sync_if_cuda(device)
         t_plan1 = time.perf_counter()
+        plan_ms = (t_plan1 - t_plan0) * 1e3
+        plan_ms_log.append(plan_ms)
+
+        # Zero-out completed envs so their drones stay still
+        action[completed] = 0.0
 
         t_env0 = time.perf_counter()
         _, reward, terminated, truncated, _ = env_gym.step(action)
         _sync_if_cuda(device)
         t_env1 = time.perf_counter()
-        t_step1 = time.perf_counter()
+        env_ms_log.append((t_env1 - t_env0) * 1e3)
 
-        plan_ms = (t_plan1 - t_plan0) * 1e3
-        env_ms = (t_env1 - t_env0) * 1e3
-        step_ms = (t_step1 - t_step0) * 1e3
-        plan_wall_ms.append(plan_ms)
-        env_step_wall_ms.append(env_ms)
-        total_step_wall_ms.append(step_ms)
-        episode_returns += reward
+        # Accumulate return only for active envs
+        returns += reward * active.float()
 
-        st = env.get_world_states()
-        pos_w = st["pos_w"]
-        goal_dist = torch.linalg.norm(pos_w - st["goal_w"], dim=-1)
+        # ── Event detection — active envs only ────────────────────────────
+        just_succeeded = getattr(
+            env, "_just_succeeded", torch.zeros(E, dtype=torch.bool, device=device)
+        ).clone() & active
+
+        st    = env.get_world_states()
+        pos_w = st["pos_w"]   # (E, N, 3)
 
         if N > 1:
             pair_diff = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)
             pair_dist = torch.linalg.norm(pair_diff, dim=-1)
-            eye = torch.eye(N, dtype=torch.bool, device=device)
-            pair_dist = pair_dist.masked_fill(eye, float("inf"))
-            episode_drone_collision |= pair_dist.amin(dim=(1, 2)) < args_cli.rmin_collision_check
-        episode_obstacle_collision |= _static_obstacle_collision_mask(env, pos_w)
-        z = pos_w[..., 2]
-        episode_bounds_failure |= ((z < env.cfg.z_min) | (z > env.cfg.z_max)).any(dim=-1)
+            pair_dist = pair_dist.masked_fill(eye_mask, float("inf"))
+            just_collided = (pair_dist.amin(dim=(1, 2)) < args_cli.rmin_collision_check) & active
+        else:
+            just_collided = torch.zeros(E, dtype=torch.bool, device=device)
 
-        success_done = getattr(env, "_just_succeeded", torch.zeros(E, dtype=torch.bool, device=device)).clone()
-        newly_succeeded = success_done & ~episode_success
-        episode_success_step[newly_succeeded] = step
-        episode_success |= newly_succeeded
+        just_obs_collided = _static_obstacle_collision_mask(env, pos_w) & active
 
+        z        = pos_w[..., 2]
+        just_oob = ((z < env.cfg.z_min) | (z > env.cfg.z_max)).any(dim=-1) & active
+
+        # Record success step on first occurrence
+        new_succ = just_succeeded & (success_step < 0)
+        success_step[new_succ] = step
+
+        succeeded    |= just_succeeded
+        collided     |= just_collided
+        obs_collided |= just_obs_collided
+        oob_flag     |= just_oob
+
+        # Complete on any terminal event
         natural_done = terminated | truncated
-        done = natural_done | success_done
-        if done.any():
-            done_ids = done.nonzero(as_tuple=False).flatten()
-            failure_terminated = terminated & ~success_done
-            clean_success = episode_success & ~(episode_drone_collision | episode_obstacle_collision | episode_bounds_failure | failure_terminated)
-            for env_id_t in done_ids:
-                env_id = int(env_id_t.item())
-                succeeded = bool(episode_success[env_id].item())
-                clean = bool(clean_success[env_id].item())
-                duration_s = float((step - int(episode_start_step[env_id].item()) + 1) * env.step_dt)
-                task_durations_s.append(duration_s)
-                t_success = float("nan")
-                if succeeded and episode_success_step[env_id] >= 0:
-                    t_success = float((episode_success_step[env_id] - episode_start_step[env_id]).item() * env.step_dt)
-                    success_times_s.append(t_success)
-                episode_rows.append({
-                    "episode_index": total_episodes,
-                    "env_id": env_id,
-                    "end_step": step,
-                    "duration_s": duration_s,
-                    "time_to_success_s": t_success,
-                    "success": int(succeeded),
-                    "clean_success": int(clean),
-                    "drone_collision": int(episode_drone_collision[env_id].item()),
-                    "obstacle_collision": int(episode_obstacle_collision[env_id].item()),
-                    "bounds_failure": int(episode_bounds_failure[env_id].item()),
-                    "terminated": int(terminated[env_id].item()),
-                    "truncated": int(truncated[env_id].item()),
-                    "return": float(episode_returns[env_id].item()),
-                    "goal_dist_mean": float(goal_dist[env_id].mean().item()),
-                    "goal_dist_max": float(goal_dist[env_id].max().item()),
-                })
-            total_episodes += int(done_ids.numel())
-            total_success += int(episode_success[done_ids].sum().item())
-            total_clean_success += int(clean_success[done_ids].sum().item())
-            total_drone_collision += int(episode_drone_collision[done_ids].sum().item())
-            total_obstacle_collision += int(episode_obstacle_collision[done_ids].sum().item())
-            total_bounds_failure += int(episode_bounds_failure[done_ids].sum().item())
-            total_terminated += int(failure_terminated[done_ids].sum().item())
-            total_truncated += int(truncated[done_ids].sum().item())
+        completed |= just_succeeded | just_collided | just_obs_collided | just_oob | (natural_done & active)
 
-        reset_env_ids = getattr(env, "_last_reset_env_ids", None)
-        ids = None
-        if reset_env_ids is not None and reset_env_ids.numel() > 0:
-            ids = reset_env_ids
-            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
-            env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
-        elif natural_done.any():
-            ids = natural_done.nonzero(as_tuple=False).flatten()
-            expert.reset(obstacle_info=env.get_obstacle_info(), env_ids=ids)
+        # Reset expert state for auto-reset envs (keeps internal solver clean)
+        reset_ids = getattr(env, "_last_reset_env_ids", None)
+        if reset_ids is None or reset_ids.numel() == 0:
+            if natural_done.any():
+                reset_ids = natural_done.nonzero(as_tuple=False).flatten()
+        if reset_ids is not None and reset_ids.numel() > 0:
+            expert.reset(
+                obstacle_info=env.get_obstacle_info() if hasattr(env, "get_obstacle_info") else None,
+                env_ids=reset_ids,
+            )
+            if hasattr(env, "_last_reset_env_ids"):
+                env._last_reset_env_ids = torch.empty(0, dtype=torch.long, device=device)
 
-        if ids is not None and ids.numel() > 0:
-            episode_returns[ids] = 0.0
-            episode_success[ids] = False
-            episode_drone_collision[ids] = False
-            episode_obstacle_collision[ids] = False
-            episode_bounds_failure[ids] = False
-            episode_success_step[ids] = -1
-            episode_start_step[ids] = step + 1
-
-        qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {}
-        step_rows.append({
-            "step": step,
-            "sim_time_s": float((step + 1) * env.step_dt),
-            "plan_wall_ms_all_envs": plan_ms,
-            "env_step_wall_ms": env_ms,
-            "total_step_wall_ms": step_ms,
-            "completed_episodes": total_episodes,
-            "success_rate_so_far": float(total_success / max(total_episodes, 1)),
-            "clean_success_rate_so_far": float(total_clean_success / max(total_episodes, 1)),
-            "goal_dist_mean": float(goal_dist.max(dim=-1).values.mean().item()),
-            "goal_dist_max": float(goal_dist.max().item()),
-            "expert_qp_avg_ms": float(qp_stats.get("avg_s", 0.0) * 1e3),
-            "expert_qp_max_ms": float(qp_stats.get("max_s", 0.0) * 1e3),
-            "expert_qp_count": float(qp_stats.get("count", 0.0)),
-        })
-
-        if args_cli.progress_every > 0 and ((step + 1) % args_cli.progress_every == 0 or step == 0):
-            denom = max(total_episodes, 1)
+        if args_cli.progress_every > 0 and (step + 1) % args_cli.progress_every == 0:
+            n_done = int(completed.sum().item())
+            n_succ = int(succeeded.sum().item())
             print(
-                f"[dmpc_expert_test] step={step + 1} episodes={total_episodes} "
-                f"success={total_success / denom:.3f} clean={total_clean_success / denom:.3f} "
-                f"plan_ms_mean={np.mean(plan_wall_ms):.2f} plan_ms_last={plan_ms:.2f} "
-                f"goal_max_mean={goal_dist.max(dim=-1).values.mean().item():.3f}",
+                f"[dmpc_expert_test] step={step + 1}/{max_ep_steps}  "
+                f"completed={n_done}/{E}  succeeded={n_succ}/{E}  "
+                f"plan_ms={plan_ms:.2f}",
                 flush=True,
             )
 
-        last_episode_length_buf = env.episode_length_buf.clone()
-        step += 1
+        if not args_cli.no_step_csv:
+            qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {}
+            step_rows.append({
+                "step":             step,
+                "sim_time_s":       float((step + 1) * env.step_dt),
+                "plan_wall_ms":     plan_ms,
+                "env_step_wall_ms": env_ms_log[-1],
+                "active_envs":      int(active.sum().item()),
+                "completed_envs":   int(completed.sum().item()),
+                "succeeded_so_far": int(succeeded.sum().item()),
+                "expert_qp_avg_ms": float(qp_stats.get("avg_s", 0.0) * 1e3),
+                "expert_qp_max_ms": float(qp_stats.get("max_s", 0.0) * 1e3),
+            })
 
+    # ── Per-env results ───────────────────────────────────────────────────
+    env_rows:        list[dict]  = []
+    success_times_s: list[float] = []
+    dt = env.step_dt
+
+    for eid in range(E):
+        succ  = bool(succeeded[eid].item())
+        coll  = bool(collided[eid].item())
+        o_col = bool(obs_collided[eid].item())
+        oob   = bool(oob_flag[eid].item())
+        clean = succ and not coll and not o_col and not oob
+        sst   = int(success_step[eid].item())
+        t_s   = float(sst) * dt if (succ and sst >= 0) else float("nan")
+        if not np.isnan(t_s):
+            success_times_s.append(t_s)
+        env_rows.append({
+            "env_id":             eid,
+            "success":            int(succ),
+            "clean_success":      int(clean),
+            "drone_collision":    int(coll),
+            "obstacle_collision": int(o_col),
+            "oob":                int(oob),
+            "time_to_success_s":  t_s,
+            "return":             float(returns[eid].item()),
+        })
+
+    # ── Summary ───────────────────────────────────────────────────────────
     runtime_s = time.perf_counter() - t_run0
-    denom = max(total_episodes, 1)
+    n_succ  = int(succeeded.sum().item())
+    n_clean = int((succeeded & ~collided & ~obs_collided & ~oob_flag).sum().item())
+    n_coll  = int(collided.sum().item())
+    n_obs   = int(obs_collided.sum().item())
+    n_oob   = int(oob_flag.sum().item())
+    steps_run = step + 1
+
     qp_stats = expert.get_qp_timing_stats() if hasattr(expert, "get_qp_timing_stats") else {
-        "avg_s": 0.0, "max_s": 0.0, "total_s": 0.0, "count": 0.0
+        "avg_s": 0.0, "max_s": 0.0, "total_s": 0.0, "count": 0.0,
     }
     metrics = {
-        "solver": args_cli.solver,
-        "num_envs": E,
-        "num_drones": N,
-        "seed": args_cli.seed,
-        "steps": step,
-        "completed_episodes": total_episodes,
-        "success_rate": float(total_success / denom),
-        "clean_success_rate": float(total_clean_success / denom),
-        "drone_collision_rate": float(total_drone_collision / denom),
-        "obstacle_collision_rate": float(total_obstacle_collision / denom),
-        "bounds_failure_rate": float(total_bounds_failure / denom),
-        "terminated_rate": float(total_terminated / denom),
-        "truncated_rate": float(total_truncated / denom),
-        "runtime_wall_s": float(runtime_s),
-        "steps_per_wall_s": float(step / max(runtime_s, 1e-9)),
-        "episodes_per_wall_s": float(total_episodes / max(runtime_s, 1e-9)),
-        "expert_qp_avg_ms": float(qp_stats.get("avg_s", 0.0) * 1e3),
-        "expert_qp_max_ms": float(qp_stats.get("max_s", 0.0) * 1e3),
-        "expert_qp_total_s": float(qp_stats.get("total_s", 0.0)),
-        "expert_qp_count": float(qp_stats.get("count", 0.0)),
+        "solver":                  args_cli.solver,
+        "num_envs":                E,
+        "num_drones":              N,
+        "seed":                    args_cli.seed,
+        "steps_run":               steps_run,
+        "success_rate":            float(n_succ  / E),
+        "clean_success_rate":      float(n_clean / E),
+        "collision_rate":          float(n_coll  / E),
+        "obstacle_collision_rate": float(n_obs   / E),
+        "oob_rate":                float(n_oob   / E),
+        "runtime_wall_s":          float(runtime_s),
+        "steps_per_wall_s":        float(steps_run / max(runtime_s, 1e-9)),
+        "expert_qp_avg_ms":        float(qp_stats.get("avg_s",   0.0) * 1e3),
+        "expert_qp_max_ms":        float(qp_stats.get("max_s",   0.0) * 1e3),
+        "expert_qp_total_s":       float(qp_stats.get("total_s", 0.0)),
+        "expert_qp_count":         float(qp_stats.get("count",   0.0)),
     }
-    metrics.update(_stats(plan_wall_ms, "plan_wall_ms_all_envs"))
-    metrics.update(_stats(env_step_wall_ms, "env_step_wall_ms"))
-    metrics.update(_stats(total_step_wall_ms, "total_step_wall_ms"))
+    metrics.update(_stats(plan_ms_log,     "plan_wall_ms"))
+    metrics.update(_stats(env_ms_log,      "env_step_wall_ms"))
     metrics.update(_stats(success_times_s, "success_time_sim_s"))
-    metrics.update(_stats(task_durations_s, "episode_duration_sim_s"))
 
     with (log_dir / "summary.json").open("w") as f:
         json.dump(metrics, f, indent=2)
     with (log_dir / "args.json").open("w") as f:
         json.dump(vars(args_cli), f, indent=2)
-    _write_csv(log_dir / "episodes.csv", episode_rows)
+    _write_csv(log_dir / "envs.csv", env_rows)
     if not args_cli.no_step_csv:
         _write_csv(log_dir / "steps.csv", step_rows)
 
     print(
-        "[dmpc_expert_test] done "
-        f"episodes={total_episodes} success={metrics['success_rate']:.3f} "
-        f"clean={metrics['clean_success_rate']:.3f} "
-        f"mean_plan_ms={metrics['plan_wall_ms_all_envs_mean']:.2f} "
-        f"p95_plan_ms={metrics['plan_wall_ms_all_envs_p95']:.2f} "
-        f"mean_success_time={metrics['success_time_sim_s_mean']:.2f}s "
+        f"[dmpc_expert_test] done  envs={E}  "
+        f"success={metrics['success_rate']:.3f}  clean={metrics['clean_success_rate']:.3f}  "
+        f"collision={metrics['collision_rate']:.3f}  oob={metrics['oob_rate']:.3f}  "
+        f"plan_ms_p50={metrics['plan_wall_ms_p50']:.2f}  "
+        f"plan_ms_p95={metrics['plan_wall_ms_p95']:.2f}  "
+        f"mean_success_time={metrics['success_time_sim_s_mean']:.2f}s  "
         f"log_dir={log_dir}",
         flush=True,
     )
