@@ -213,6 +213,7 @@ class PPO(ActorCriticBase):
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
+        cumulative_clip_fraction = 0
 
         # learning epochs
         for _ in range(self._learning_epochs):
@@ -311,20 +312,23 @@ class PPO(ActorCriticBase):
                 cumulative_value_loss += value_loss.item()
                 if self._entropy_loss_scale:
                     cumulative_entropy_loss += entropy_loss.item()
+                with torch.no_grad():
+                    cumulative_clip_fraction += (
+                        (ratio - 1.0).abs().gt(self._ratio_clip).float().mean().item()
+                    )
 
             # update learning rate
             kl = torch.tensor(kl_divergences, device=self.device).mean()
             self.po_lr_schedule.step(kl.item())
 
+        n_updates = self._learning_epochs * self._mini_batches
         output = {
-            "Loss/policy_loss": cumulative_policy_loss
-            / (self._learning_epochs * self._mini_batches),
-            "Loss/entropy_loss": cumulative_entropy_loss
-            / (self._learning_epochs * self._mini_batches),
-            "Loss/value_loss": cumulative_value_loss
-            / (self._learning_epochs * self._mini_batches),
-            "Policy/policy_std": std.mean().item(),
-            "Loss/learning_rate": self.po_lr_schedule.get_last_lr()[0],
+            "Loss/policy_loss":    cumulative_policy_loss    / n_updates,
+            "Loss/entropy_loss":   cumulative_entropy_loss   / n_updates,
+            "Loss/value_loss":     cumulative_value_loss     / n_updates,
+            "Policy/clip_fraction": cumulative_clip_fraction / n_updates,
+            "Policy/policy_std":   std.mean().item(),
+            "Loss/learning_rate":  self.po_lr_schedule.get_last_lr()[0],
         }
 
         return output

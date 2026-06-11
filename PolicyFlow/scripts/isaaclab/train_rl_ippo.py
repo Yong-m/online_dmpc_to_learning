@@ -32,7 +32,7 @@ for _p in (_POLICYFLOW_ROOT, _PROJECT_ROOT):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Vanilla PPO/IPPO for multi-drone (no DMPC guide).")
-parser.add_argument("--num_envs",        type=int,   default=768)
+parser.add_argument("--num_envs",        type=int,   default=800)
 parser.add_argument("--num_drones",      type=int,   default=10)
 parser.add_argument("--max_iterations",  type=int,   default=500000)
 parser.add_argument("--rollouts",        type=int,   default=100)
@@ -48,11 +48,8 @@ parser.add_argument("--hidden_dims", type=int,  nargs="*", default=[256, 256, 25
 parser.add_argument("--n_min", type=int, default=0,
                     help="Min active drones for N curriculum (0=disabled).")
 # Reward / env
-parser.add_argument("--hover_vel_scale",          type=float, default=5.0)
-parser.add_argument("--hover_proximity_dist",     type=float, default=0.4)
-parser.add_argument("--dist_far_scale",           type=float, default=50.0)
-parser.add_argument("--dist_far_tanh_scale",      type=float, default=0.8)
-parser.add_argument("--collision_terminate_dist", type=float, default=0.12)
+parser.add_argument("--dist_far_scale",      type=float, default=50.0)
+parser.add_argument("--dist_far_tanh_scale", type=float, default=0.8)
 # Resume
 parser.add_argument("--reset_critic", action="store_true", default=False,
                     help="On resume: reset critic weights.")
@@ -279,20 +276,21 @@ class PerDroneEnvWrapper:
 # ║ PPO config                                                                 ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 AGENT_CFG: dict = {
-    "desired_kl":           0.01,
-    "discount_factor":      0.995,
-    "lam":                  0.95,
-    "time_limit_bootstrap": True,
-    "ratio_clip":           0.2,
+    "desired_kl":            0.01,
+    "discount_factor":       0.995,
+    "lam":                   0.95,
+    "time_limit_bootstrap":  True,
+    "ratio_clip":            0.2,
     "clip_predicted_values": True,
-    "value_clip":           0.2,
-    "value_loss_scale":     0.5,
-    "grad_norm_clip":       1.0,
-    "action_clip":          1.0,
-    "mini_batches":         4,
-    "learning_epochs":      1,
-    "learning_rate":        3e-4,
-    "entropy_loss_scale":   1e-3,
+    "value_clip":            0.2,
+    "value_loss_scale":      0.5,
+    "grad_norm_clip":        1.0,
+    "action_clip":           1.0,
+    "mini_batches":          4,
+    "learning_epochs":       1,
+    "learning_rate":         3e-4,
+    "critic_learning_rate":  1e-3,   # separate critic LR, matches train_rl_dmpc.py Phase 3
+    "entropy_loss_scale":    1e-4,
 }
 
 
@@ -404,14 +402,17 @@ def main() -> None:
     env_cfg = MultiDroneDmpcRLEnvCfg()
     env_cfg.scene.num_envs            = args_cli.num_envs
     env_cfg.num_drones                = args_cli.num_drones
-    env_cfg.dmpc_guide_enabled        = False   # no DMPC expert, no bottleneck
-    env_cfg.terminate_on_collision_rl  = True
-    env_cfg.collision_terminate_dist   = args_cli.collision_terminate_dist
-    env_cfg.terminate_on_oob_rl        = True
-    env_cfg.hover_vel_scale            = args_cli.hover_vel_scale
-    env_cfg.hover_proximity_dist       = args_cli.hover_proximity_dist
-    env_cfg.dist_to_goal_far_scale     = args_cli.dist_far_scale
-    env_cfg.dist_to_goal_far_tanh_scale = args_cli.dist_far_tanh_scale
+    env_cfg.dmpc_guide_enabled           = False  # no DMPC expert, no bottleneck
+    env_cfg.dist_to_goal_far_scale       = args_cli.dist_far_scale
+    env_cfg.dist_to_goal_far_tanh_scale  = args_cli.dist_far_tanh_scale
+    # Hard termination on collision / OOB (no dense penalty, just episode end)
+    env_cfg.terminate_on_collision_rl    = True
+    env_cfg.terminate_on_oob_rl          = True
+    # Dense penalty terms disabled
+    env_cfg.collision_step_penalty       = 0.0
+    env_cfg.oob_step_penalty             = 0.0
+    env_cfg.tilt_reward_scale            = 0.0
+    env_cfg.hover_vel_scale              = 0.0
     if args_cli.n_min > 0:
         env_cfg.n_curriculum_min = args_cli.n_min
     env_cfg.__post_init__()
@@ -472,6 +473,18 @@ def main() -> None:
         actor_observation_size=per_drone_dim,
         action_size=3,
     )
+
+    # PPO agent uses a single shared optimizer; replace with separate param groups
+    # to match train_rl_dmpc.py Phase 3 (actor 3e-4, critic 1e-3).
+    agent.optimizer = torch.optim.Adam([
+        {"params": list(actor.parameters()),  "lr": AGENT_CFG["learning_rate"]},
+        {"params": list(critic.parameters()), "lr": AGENT_CFG["critic_learning_rate"]},
+    ])
+    _fixed_lr = AGENT_CFG["learning_rate"]
+    agent.po_lr_schedule = type("FixedLR", (), {
+        "step":         staticmethod(lambda *a, **k: None),
+        "get_last_lr":  lambda self: [_fixed_lr],
+    })()  # fixed LR — no KL-adaptive adjustment
 
     # ── runner ────────────────────────────────────────────────────────────────
     run_name   = args_cli.experiment_name or datetime.datetime.now().strftime("%y-%m-%d_%H-%M-%S")

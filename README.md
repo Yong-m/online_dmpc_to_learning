@@ -70,39 +70,48 @@ Requires: CMake >= 3.0, Eigen, qpOASES (included as submodule).
 
 ## Training
 
-### PolicyFlow with DMPC Guide
+Training proceeds in three phases, all using `train_rl_dmpc.py` (PolicyFlow actor + DMPC velocity-alignment reward).
 
-Trains a conditional rectified flow actor guided by a GPU-batched DMPC expert.
-`--curriculum` enables hard termination on collision/OOB (Phase 2).
-`--curriculum2` enables agent wise critic structure (Phase 3).
+### Phase 1: Soft curriculum
+
+Soft collision/OOB penalties; no hard episode termination. Policy learns basic navigation.
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
     --num_envs 800 \
     --num_drones 10 \
     --n_min 1 \
-    --curriculum2 \
-    --max_iterations 500000 \
+    --max_iterations 1800 \
     --log_dir runs/rl_dmpc
 ```
 
-Resume from a pretrained checkpoint (e.g., provided Phase 1/2 checkpoints):
+### Phase 2: Hard termination curriculum
+
+Hard episode reset on collision/OOB. Resume from Phase 1 checkpoint.
+
 ```bash
-# Resume Phase 2 from the provided Phase 1 checkpoint
 python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
     --resume config/phase1.pt \
+    --num_envs 800 --num_drones 10 --n_min 1 \
     --curriculum2 \
-    --num_envs 800 --num_drones 10
-
-# Resume Phase 3 (IPPO) from the provided Phase 2 checkpoint
-python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
-    --resume config/phase2.pt \
-    --num_envs 800 --num_drones 10
+    --log_dir runs/rl_dmpc
 ```
 
-### Independent PPO (IPPO) (optional)
+### Phase 3: Per-drone IPPO critic
 
-Vanilla PPO baseline. No DMPC expert.
+Switches to per-drone independent critic for better credit assignment. Resume from Phase 2 checkpoint.
+
+```bash
+python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
+    --resume config/phase2.pt \
+    --num_envs 800 --num_drones 10 --n_min 1 \
+    --curriculum2 \
+    --log_dir runs/rl_dmpc
+```
+
+### Gaussian PPO baseline (comparison only)
+
+Vanilla PPO with Gaussian policy. No DMPC guide. Trains from scratch independently of the phases above.
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
