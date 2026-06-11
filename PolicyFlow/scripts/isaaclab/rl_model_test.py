@@ -380,13 +380,15 @@ def main() -> None:
     max_ep_steps = int(round(env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation)))
 
     # ── Per-env state ─────────────────────────────────────────────────────
-    completed    = torch.zeros(E, dtype=torch.bool, device=device)
-    succeeded    = torch.zeros(E, dtype=torch.bool, device=device)
-    collided     = torch.zeros(E, dtype=torch.bool, device=device)
-    oob_flag     = torch.zeros(E, dtype=torch.bool, device=device)
-    success_step = torch.full((E,), -1, dtype=torch.long, device=device)
-    returns      = torch.zeros(E, device=device)
-    eye_mask     = torch.eye(N, dtype=torch.bool, device=device) if N > 1 else None
+    completed         = torch.zeros(E, dtype=torch.bool, device=device)
+    succeeded         = torch.zeros(E, dtype=torch.bool, device=device)
+    collided          = torch.zeros(E, dtype=torch.bool, device=device)
+    oob_flag          = torch.zeros(E, dtype=torch.bool, device=device)
+    success_step      = torch.full((E,), -1, dtype=torch.long, device=device)
+    returns           = torch.zeros(E, device=device)
+    eye_mask          = torch.eye(N, dtype=torch.bool, device=device) if N > 1 else None
+    env_min_pair_dist = torch.full((E,), float("inf"), device=device)
+    env_final_goal_dist = torch.full((E,), float("nan"), device=device)
 
     step_rows:    list[dict]  = []
     infer_ms_log: list[float] = []
@@ -435,9 +437,20 @@ def main() -> None:
             diff      = pos_w.unsqueeze(2) - pos_w.unsqueeze(1)
             pair_dist = torch.linalg.norm(diff, dim=-1)
             pair_dist = pair_dist.masked_fill(eye_mask, float("inf"))
-            just_collided = (pair_dist.amin(dim=(1, 2)) < args_cli.rmin_collision_check) & active
+            step_min_dist = pair_dist.amin(dim=(1, 2))
+            env_min_pair_dist = torch.minimum(env_min_pair_dist, step_min_dist)
+            just_collided = (step_min_dist < args_cli.rmin_collision_check) & active
         else:
+            step_min_dist = torch.full((E,), float("inf"), device=device)
             just_collided = torch.zeros(E, dtype=torch.bool, device=device)
+
+        # goal distance per env (max over drones = worst-case drone)
+        goal_pos_w = getattr(env_uw, "_goal_pos_w", None)
+        if goal_pos_w is not None:
+            goal_dist = torch.linalg.norm(pos_w - goal_pos_w, dim=-1)  # (E, N)
+            env_final_goal_dist = goal_dist.max(dim=-1).values.clone()  # updated every step; last write = completion state
+        else:
+            goal_dist = None
 
         z        = pos_w[..., 2]
         just_oob = ((z < env_cfg.z_min) | (z > env_cfg.z_max)).any(dim=-1) & active
@@ -465,14 +478,20 @@ def main() -> None:
             )
 
         if not args_cli.no_step_csv:
+            active_min = step_min_dist[active]
+            valid = active_min < float("inf")
             step_rows.append({
-                "step":             step,
-                "sim_time_s":       float((step + 1) * env_uw.step_dt),
-                "infer_wall_ms":    infer_ms,
-                "env_step_wall_ms": env_ms_log[-1],
-                "active_envs":      int(active.sum().item()),
-                "completed_envs":   int(completed.sum().item()),
-                "succeeded_so_far": int(succeeded.sum().item()),
+                "step":               step,
+                "sim_time_s":         float((step + 1) * env_uw.step_dt),
+                "infer_wall_ms":      infer_ms,
+                "env_step_wall_ms":   env_ms_log[-1],
+                "active_envs":        int(active.sum().item()),
+                "completed_envs":     int(completed.sum().item()),
+                "succeeded_so_far":   int(succeeded.sum().item()),
+                "min_pair_dist_mean": float(active_min[valid].mean().item()) if valid.any() else float("nan"),
+                "min_pair_dist_min":  float(active_min[valid].min().item())  if valid.any() else float("nan"),
+                "goal_dist_mean":     float(goal_dist[active].mean().item()) if goal_dist is not None else float("nan"),
+                "goal_dist_max":      float(goal_dist[active].max().item())  if goal_dist is not None else float("nan"),
             })
 
     # Any envs still active at max_ep_steps → timed out (failure)
@@ -499,6 +518,8 @@ def main() -> None:
             "oob":               int(oob),
             "time_to_success_s": t_s,
             "return":            float(returns[eid].item()),
+            "min_pair_dist":     float(env_min_pair_dist[eid].item()) if env_min_pair_dist[eid] < float("inf") else float("nan"),
+            "goal_dist_final":   float(env_final_goal_dist[eid].item()),
         })
 
     # ── Summary ───────────────────────────────────────────────────────────
