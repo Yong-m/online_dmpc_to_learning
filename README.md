@@ -21,11 +21,8 @@ online_dmpc_to_learning/
 │   ├── dmpc_gpu_expert.py            # GPU-batched DMPC (batched ADMM)
 │   ├── crazyflie.py                  # Crazyflie quadrotor asset and controller
 │   ├── quadcopter_env.py             # Single-drone base environment
-│   ├── agents/                       # RSL-RL agent configs
-│   ├── phase1.pt                     # Phase 1 checkpoint (soft curriculum)
-│   ├── phase2.pt                     # Phase 2 checkpoint (hard termination)
-│   ├── phase3.pt                     # Phase 3 checkpoint (per-drone IPPO, full PPO-DMPC)
-│   └── vanilla_ppo.pt                # Vanilla PPO baseline checkpoint
+│   └── agents/                       # RSL-RL agent configs
+
 ├── PolicyFlow/
 │   ├── policyflow_torch/             # PolicyFlow package (PyTorch)
 │   │   ├── agents/                   # PPO and PolicyFlow agents
