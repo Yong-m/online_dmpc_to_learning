@@ -22,7 +22,6 @@ online_dmpc_to_learning/
 │   ├── crazyflie.py                  # Crazyflie quadrotor asset and controller
 │   ├── quadcopter_env.py             # Single-drone base environment
 │   └── agents/                       # RSL-RL agent configs
-
 ├── PolicyFlow/
 │   ├── policyflow_torch/             # PolicyFlow package (PyTorch)
 │   │   ├── agents/                   # PPO and PolicyFlow agents
@@ -101,7 +100,7 @@ Hard episode reset on collision/OOB. Resume from Phase 1 checkpoint.
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
-    --resume quadcopter/phase1.pt \
+    --resume config/phase1.pt \
     --num_envs 800 --num_drones 10 --n_min 1 \
     --curriculum \
     --max_iterations 5000 \
@@ -114,7 +113,7 @@ Switches to per-drone independent critic for better credit assignment. Resume fr
 
 ```bash
 python PolicyFlow/scripts/isaaclab/train_rl_dmpc.py \
-    --resume quadcopter/phase2.pt \
+    --resume config/phase2.pt \
     --num_envs 800 --num_drones 10 --n_min 1 \
     --curriculum --curriculum2 \
     --max_iterations 2000 \
@@ -143,7 +142,7 @@ python PolicyFlow/scripts/isaaclab/train_rl_ippo.py \
 
 ```bash
 python PolicyFlow/scripts/isaaclab/rl_model_test.py \
-    --checkpoint quadcopter/phase3.pt \
+    --checkpoint config/phase3.pt \
     --num_envs 1000 \
     --num_drones 10
 ```
